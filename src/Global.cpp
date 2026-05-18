@@ -27,8 +27,9 @@ CUSTOMBUFFER_SLOT=31
 DRAWTAG_SLOT=26
 ; Race group definitions exposed to shaders through GFXDrawTag[0].raceGroupMask.
 ; Format: RACE_GROUP_N=PluginName.esm|FormID,... where N is 0-31.
-; Group 0 defaults to Fallout 4 vanilla humanoid races for toon-rim exclusion.
+; Group 0 defaults to Fallout 4 vanilla humanoid races for toon exclusion.
 RACE_GROUP_0=Fallout4.esm|0x13746,Fallout4.esm|0x1A009,Fallout4.esm|0xEAFB6,Fallout4.esm|0x11D83F,Fallout4.esm|0x11EB96,Fallout4.esm|0x2261A4,Fallout4.esm|0x10BD65,Fallout4.esm|0xE8D09
+RACE_GROUP_1=Fallout4.esm|0x1A009
 ; G-buffer normal target index (into RendererData.renderTargets[]).
 ; Default 20 = kGbufferNormal for the OG runtime; override only if the
 ; deferred renderer layout differs on your runtime. -1 disables the
