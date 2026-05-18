@@ -24,9 +24,6 @@ namespace Hooks
         extern REL::Relocation<std::uintptr_t> ProcessCommandBuffer;
         extern REL::Relocation<std::uintptr_t> RenderPassImpl;
         extern REL::Relocation<std::uintptr_t> RegisterObjectShadowMapOrMask;
-        extern REL::Relocation<std::uintptr_t> RegisterObjectStandard;
-        extern REL::Relocation<std::uintptr_t> AccumulatePassesFromCullerArena;
-        extern REL::Relocation<std::uintptr_t> AccumulatePassesFromSubGroupArena;
         extern REL::Relocation<std::uintptr_t> RegisterPassGeometryGroup;
         extern REL::Relocation<std::uintptr_t> BuildCommandBuffer;
         extern REL::Relocation<std::uintptr_t> BSLightTestFrustumCull;

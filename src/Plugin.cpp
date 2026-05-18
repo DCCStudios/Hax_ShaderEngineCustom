@@ -1887,12 +1887,6 @@ namespace
     using Reset3D_t = void (*)(RE::Actor* actor, bool a_reloadAll, std::uint32_t a_additionalFlags, bool a_queueReset, std::uint32_t a_excludeFlags);
     Reset3D_t OriginalReset3D = nullptr;
 
-    // Script::ModifyFaceGen::ReplaceHeadTask::Run ? fires for LooksMenu apply,
-    // SexChange, RegenerateHead Papyrus calls. Vtable available for OG only in
-    // the commonlibf4 we ship; AE install is skipped until we have the address.
-    using ReplaceHeadTaskRun_t = void (*)(void* this_);
-    ReplaceHeadTaskRun_t OriginalReplaceHeadTaskRun = nullptr;
-
     // BSBatchRenderer::RenderCommandBufferPassesImpl - drives the command-buffer
     // replay path. We hook entry to scan the pass list and decide between two
     // strategies (see HookedRenderCommandBufferPassesImpl for the full story).
@@ -1923,16 +1917,6 @@ namespace
     using RenderPassImpl_t = void (*)(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha);
     RenderPassImpl_t OriginalRenderPassImpl = nullptr;
 
-    using RegisterObjectShadowMapOrMask_t = bool (*)(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty);
-    RegisterObjectShadowMapOrMask_t OriginalRegisterObjectShadowMapOrMask = nullptr;
-
-    using RegisterObjectStandard_t = bool (*)(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty);
-    RegisterObjectStandard_t OriginalRegisterObjectStandard = nullptr;
-
-    using AccumulatePassesFromArena_t = void* (*)(void* arena, void* accumulator);
-    AccumulatePassesFromArena_t OriginalAccumulatePassesFromCullerArena = nullptr;
-    AccumulatePassesFromArena_t OriginalAccumulatePassesFromSubGroupArena = nullptr;
-
     using RegisterPassGeometryGroup_t = void (*)(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk);
     RegisterPassGeometryGroup_t OriginalRegisterPassGeometryGroup = nullptr;
 
@@ -1952,7 +1936,11 @@ namespace
     // platform-tail shifting, no lifetime tracking.
     //
     // Mangled: ?BuildCommandBuffer@BSShader@@QEAAPEAXAEAUBuildCommandBufferParam@1@@Z
-    using BuildCommandBuffer_t = char* (*)(void* this_, void* param);
+    // Ghidra shows OG BuildCommandBuffer consumes the incoming R8 value when
+    // touching the engine memory-manager init state. Preserve it across the
+    // hook even though the public mangled signature only exposes one explicit
+    // BuildCommandBufferParam reference.
+    using BuildCommandBuffer_t = char* (*)(void* this_, void* param, void* memoryContext);
     BuildCommandBuffer_t OriginalBuildCommandBuffer = nullptr;
 
     // BSLight::TestFrustumCull ? engine's per-light frustum cull. We wrap it
@@ -3076,52 +3064,6 @@ namespace
         OriginalRenderPersistentPassListImpl(persistentPassList, allowAlpha);
     }
 
-    bool HookedRegisterObjectShadowMapOrMask(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty)
-    {
-        if constexpr (ShadowTelemetry::kDetailedShadowCacheLogging) {
-            const bool active = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-                ShadowTelemetry::IsShadowCacheRegistrationFilterActive(accumulator, geometry);
-            if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
-                ShadowTelemetry::NoteShadowCacheShadowMapOrMaskHookDetail(active, accumulator);
-            }
-        }
-
-        return OriginalRegisterObjectShadowMapOrMask(accumulator, geometry, shaderProperty);
-    }
-
-    bool HookedRegisterObjectStandard(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty)
-    {
-        return OriginalRegisterObjectStandard(accumulator, geometry, shaderProperty);
-    }
-
-    void* HookedAccumulatePassesFromArenaImpl(
-        AccumulatePassesFromArena_t original,
-        void* arena,
-        void* accumulator)
-    {
-        if (!original) {
-            return nullptr;
-        }
-
-        return original(arena, accumulator);
-    }
-
-    void* HookedAccumulatePassesFromCullerArena(void* arena, void* accumulator)
-    {
-        return HookedAccumulatePassesFromArenaImpl(
-            OriginalAccumulatePassesFromCullerArena,
-            arena,
-            accumulator);
-    }
-
-    void* HookedAccumulatePassesFromSubGroupArena(void* arena, void* accumulator)
-    {
-        return HookedAccumulatePassesFromArenaImpl(
-            OriginalAccumulatePassesFromSubGroupArena,
-            arena,
-            accumulator);
-    }
-
     void HookedRegisterPassGeometryGroup(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk)
     {
         if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && batchRenderer && pass) {
@@ -3285,10 +3227,10 @@ namespace
         return true;
     }
 
-    char* HookedBuildCommandBuffer(void* this_, void* param)
+    char* HookedBuildCommandBuffer(void* this_, void* param, void* memoryContext)
     {
         if (!param) {
-            return OriginalBuildCommandBuffer(this_, param);
+            return OriginalBuildCommandBuffer(this_, param, memoryContext);
         }
 
         // Field offsets in BuildCommandBufferParam (verified in IDA):
@@ -3312,7 +3254,7 @@ namespace
 
         if (!g_anyReplacementShaderUsesDrawTag.load(std::memory_order_acquire) ||
             !EnsureDrawTagWrapperResources()) {
-            return OriginalBuildCommandBuffer(this_, param);
+            return OriginalBuildCommandBuffer(this_, param, memoryContext);
         }
 
         DrawTagClassification classification{};
@@ -3337,14 +3279,14 @@ namespace
         const std::uint32_t origCount = srvCount;
         const auto* origSrc = srvSrc;
         if (origCount && !origSrc) {
-            return OriginalBuildCommandBuffer(this_, param);
+            return OriginalBuildCommandBuffer(this_, param, memoryContext);
         }
 
         // Fall back if the pass already has more SRVs than our scratch can hold.
         // F4 shaders we've seen have 0?8 SRV records; 32 is generous headroom.
         constexpr std::size_t kMaxSRV = 32;
         if (origCount >= kMaxSRV) {
-            return OriginalBuildCommandBuffer(this_, param);
+            return OriginalBuildCommandBuffer(this_, param, memoryContext);
         }
 
         std::array<CommandBufferShaderResource, kMaxSRV + 1> tempArr{};
@@ -3361,7 +3303,7 @@ namespace
         srvCount = origCount + 1;
         srvSrc   = tempArr.data();
 
-        char* result = OriginalBuildCommandBuffer(this_, param);
+        char* result = OriginalBuildCommandBuffer(this_, param, memoryContext);
 
         // Restore. The engine memcpy'd our extended array into the cb already,
         // so the temp stack data is no longer referenced after this point.
@@ -3433,14 +3375,6 @@ namespace
         RefreshActorDrawTaggedGeometry(actor);
     }
 
-    // Script::ModifyFaceGen::ReplaceHeadTask::Run ? Papyrus-driven head swap
-    // (LooksMenu apply, SexChange, etc.). The task's actor handle isn't
-    // exposed via commonlibf4 yet, so this is log-only for now; once we know
-    // which actor was reloaded, route it through the head refresh.
-    void HookedReplaceHeadTaskRun(void* this_)
-    {
-        OriginalReplaceHeadTaskRun(this_);
-    }
 }
 
 
@@ -3812,14 +3746,9 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalRenderCommandBufferPassesImpl &&
         OriginalRenderPersistentPassListImpl &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalProcessCommandBuffer) &&
-        OriginalRegisterObjectShadowMapOrMask &&
-        (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterObjectStandard) &&
-        OriginalAccumulatePassesFromCullerArena &&
-        OriginalAccumulatePassesFromSubGroupArena &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterPassGeometryGroup) &&
         OriginalRenderPassImpl &&
         OriginalBuildCommandBuffer &&
-        OriginalReplaceHeadTaskRun &&
         OriginalBSLightTestFrustumCull &&
         OriginalBSDFTiledLightingAddLight &&
         OriginalSetupPointLightGeometry) {
@@ -4093,70 +4022,6 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSGraphics::Renderer::ProcessCommandBuffer hook installed");
     }
 
-    if (!OriginalRegisterObjectShadowMapOrMask) {
-
-        constexpr std::size_t kRegisterObjectShadowMapOrMaskPrologueSize = 15;
-        OriginalRegisterObjectShadowMapOrMask = Hooks::CreateBranchGateway5<RegisterObjectShadowMapOrMask_t>(
-            Hooks::Addresses::RegisterObjectShadowMapOrMask,
-            kRegisterObjectShadowMapOrMaskPrologueSize,
-            reinterpret_cast<void*>(&HookedRegisterObjectShadowMapOrMask));
-
-        if (!OriginalRegisterObjectShadowMapOrMask) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install RegisterObject_ShadowMapOrMask hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: RegisterObject_ShadowMapOrMask hook installed");
-    }
-
-    if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG && !OriginalRegisterObjectStandard) {
-
-        constexpr std::size_t kRegisterObjectStandardPrologueSize = 15;
-        OriginalRegisterObjectStandard = Hooks::CreateBranchGateway5<RegisterObjectStandard_t>(
-            Hooks::Addresses::RegisterObjectStandard,
-            kRegisterObjectStandardPrologueSize,
-            reinterpret_cast<void*>(&HookedRegisterObjectStandard));
-
-        if (!OriginalRegisterObjectStandard) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install RegisterObject_Standard hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: RegisterObject_Standard hook installed");
-    }
-
-    if (!OriginalAccumulatePassesFromCullerArena) {
-
-        constexpr std::size_t kAccumulatePassesFromArenaPrologueSize = 17;
-        OriginalAccumulatePassesFromCullerArena = Hooks::CreateBranchGateway5<AccumulatePassesFromArena_t>(
-            Hooks::Addresses::AccumulatePassesFromCullerArena,
-            kAccumulatePassesFromArenaPrologueSize,
-            reinterpret_cast<void*>(&HookedAccumulatePassesFromCullerArena));
-
-        if (!OriginalAccumulatePassesFromCullerArena) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install AccumulatePassesFromArena<CullerArena> hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<CullerArena> hook installed");
-    }
-
-    if (!OriginalAccumulatePassesFromSubGroupArena) {
-
-        constexpr std::size_t kAccumulatePassesFromSubGroupArenaPrologueSize = 17;
-        OriginalAccumulatePassesFromSubGroupArena = Hooks::CreateBranchGateway5<AccumulatePassesFromArena_t>(
-            Hooks::Addresses::AccumulatePassesFromSubGroupArena,
-            kAccumulatePassesFromSubGroupArenaPrologueSize,
-            reinterpret_cast<void*>(&HookedAccumulatePassesFromSubGroupArena));
-
-        if (!OriginalAccumulatePassesFromSubGroupArena) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install AccumulatePassesFromArena<SubGroupArena> hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<SubGroupArena> hook installed");
-    }
-
     if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG && !OriginalRegisterPassGeometryGroup) {
 
         const std::uintptr_t callSite =
@@ -4391,22 +4256,6 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: Actor::Reset3D hook installed");
-    }
-
-    if (!OriginalReplaceHeadTaskRun) {
-        // VTABLE::Script__ModifyFaceGen__29__ReplaceHeadTask only has an OG
-        // entry in the bundled commonlibf4. AE install is intentionally
-        // skipped until we find the AE vtable address.
-        REL::Relocation<std::uintptr_t> taskVTable{ RE::VTABLE::Script__ModifyFaceGen__29__ReplaceHeadTask[0] };
-        OriginalReplaceHeadTaskRun = reinterpret_cast<ReplaceHeadTaskRun_t>(
-            taskVTable.write_vfunc(1, reinterpret_cast<void*>(&HookedReplaceHeadTaskRun)));
-
-        if (!OriginalReplaceHeadTaskRun) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install Script::ModifyFaceGen::ReplaceHeadTask::Run hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: Script::ModifyFaceGen::ReplaceHeadTask::Run hook installed");
     }
 
     if (!OriginalBSLightTestFrustumCull) {

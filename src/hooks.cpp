@@ -23,9 +23,6 @@ namespace Hooks
         REL::Relocation<std::uintptr_t> ProcessCommandBuffer{ REL::ID{ 673619, 0 } }; // OG 1.10.163: 0x141D13A10
         REL::Relocation<std::uintptr_t> RenderPassImpl{ REL::ID{ 1543785, 2318710 } };
         REL::Relocation<std::uintptr_t> RegisterObjectShadowMapOrMask{ REL::ID{ 1071289, 2317861 } };
-        REL::Relocation<std::uintptr_t> RegisterObjectStandard{ REL::ID{ 289935, 0 } };
-        REL::Relocation<std::uintptr_t> AccumulatePassesFromCullerArena{ REL::ID{ 962984, 2275945 } };
-        REL::Relocation<std::uintptr_t> AccumulatePassesFromSubGroupArena{ REL::ID{ 389706, 2275946 } };
         REL::Relocation<std::uintptr_t> RegisterPassGeometryGroup{ REL::ID{ 197098, 0 } };
         REL::Relocation<std::uintptr_t> BuildCommandBuffer{ REL::ID{ 833764, 2318870 } };
         REL::Relocation<std::uintptr_t> BSLightTestFrustumCull{ REL::ID{ 1440624, 0 } };
