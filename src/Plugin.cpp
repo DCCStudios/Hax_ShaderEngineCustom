@@ -2143,11 +2143,16 @@ namespace
         std::unordered_set<std::string> keys;
         auto* base = ref ? ref->GetObjectReference() : nullptr;
         auto* npc = base ? base->As<RE::TESNPC>() : nullptr;
-        if (!npc) {
+        if (!npc || npc->numHeadParts <= 0 || !npc->headParts) {
             return keys;
         }
 
-        for (auto* headPart : npc->GetHeadParts(true)) {
+        // Race changes can leave the player alternate-head-part state transient
+        // while Reset3D/head tagging runs. Avoid TESNPC::GetHeadParts(true)
+        // here because it consults that global alternate map and has crashed
+        // in UsingAlternateHeadPartList during race-change resets.
+        const std::span headParts{ npc->headParts, static_cast<std::size_t>(npc->numHeadParts) };
+        for (auto* headPart : headParts) {
             if (!headPart ||
                 headPart->type.get() != RE::BGSHeadPart::HeadPartType::kHair) {
                 continue;
