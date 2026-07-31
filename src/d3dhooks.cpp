@@ -51,6 +51,7 @@ RE::Sky* g_sky = nullptr;
 
 static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
 static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
+static std::atomic_bool g_customBufferRefreshedBeforePresent{ false };
 
 namespace
 {
@@ -413,7 +414,9 @@ void UpdateCustomBuffer_Internal() {
     // forward vector -> yaw/pitch
     auto vd = camView.viewDir;
     float vx = vd.m128_f32[0], vy = vd.m128_f32[1], vz = vd.m128_f32[2];
-    // world-space camera position from the inverse game view matrix
+    // BGS builds a rotation-only view matrix. Its inverse translation is the
+    // camera-relative origin; absolute translation lives in CameraStateData's
+    // *PosAdjust fields and is injected separately below.
     auto& VM = camView.viewMat; // __m128 viewMat[4]
     DirectX::XMMATRIX view = DirectX::XMMATRIX(VM[0], VM[1], VM[2], VM[3]);
     DirectX::XMMATRIX invView = DirectX::XMMatrixInverse(nullptr, view);
@@ -473,6 +476,16 @@ void UpdateCustomBuffer_Internal() {
     // Use the game-provided view-projection matrix directly.
     auto& VPM = camView.viewProjMat;
     DirectX::XMMATRIX viewProj = DirectX::XMMATRIX(VPM[0], VPM[1], VPM[2], VPM[3]);
+    // BSGraphics::ViewData+0x190 is the renderer-maintained previous
+    // unjittered view-projection. It is paired with
+    // CameraStateData::previousPosAdjust (+0x228). Live OG 1.10.163 memory
+    // confirms both fields for the selected gameplay camera.
+    auto& previousVPM = camView.previousViewProjUnjittered;
+    DirectX::XMMATRIX previousViewProj = DirectX::XMMATRIX(
+        previousVPM[0],
+        previousVPM[1],
+        previousVPM[2],
+        previousVPM[3]);
     float timeOfDay = 0.0f;
     float weatherTransition = 0.0f;
     uint32_t currentWeatherID = 0;
@@ -665,6 +678,18 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_SH_R = shR;
     g_customBufferData.g_SH_G = shG;
     g_customBufferData.g_SH_B = shB;
+    g_customBufferData.g_CurrentCameraPositionAdjust = {
+        camState.currentPosAdjust.x,
+        camState.currentPosAdjust.y,
+        camState.currentPosAdjust.z,
+        0.0f
+    };
+    g_customBufferData.g_PreviousCameraPositionAdjust = {
+        camState.previousPosAdjust.x,
+        camState.previousPosAdjust.y,
+        camState.previousPosAdjust.z,
+        0.0f
+    };
 
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow0, invProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow1, invProj.r[1]);
@@ -678,13 +703,18 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.inCombat = g_inCombat ? 1.0f : 0.0f;
     g_customBufferData.inInterior = g_inInterior ? 1.0f : 0.0f;
     g_customBufferData._padding = 0.0f; // just in case, to avoid any potential uninitialized data issues in shaders
-    // Snapshot the previous frame's ViewProj BEFORE writing the new one. The
-    // very first frame snapshots zeros (CB is zero-initialized), which the
-    // shader detects via the all-zero matrix and falls back to non-temporal.
-    g_customBufferData.g_PrevViewProjRow0 = g_customBufferData.g_ViewProjRow0;
-    g_customBufferData.g_PrevViewProjRow1 = g_customBufferData.g_ViewProjRow1;
-    g_customBufferData.g_PrevViewProjRow2 = g_customBufferData.g_ViewProjRow2;
-    g_customBufferData.g_PrevViewProjRow3 = g_customBufferData.g_ViewProjRow3;
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow0,
+        previousViewProj.r[0]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow1,
+        previousViewProj.r[1]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow2,
+        previousViewProj.r[2]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow3,
+        previousViewProj.r[3]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow0, viewProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow1, viewProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow2, viewProj.r[2]);
@@ -753,6 +783,21 @@ void UpdateCustomBuffer_Internal() {
     ShaderResources::UpdateInjectedShaderResourceViews(g_rendererData->context);
 }
 
+void RefreshCustomBufferForCustomPass()
+{
+    if (!CUSTOMBUFFER_ON) {
+        return;
+    }
+
+    bool expected = false;
+    if (!g_customBufferRefreshedBeforePresent.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_relaxed)) {
+        return;
+    }
+    UpdateCustomBuffer_Internal();
+}
 
 // --- D3D11 hook handlers ---
 
@@ -766,7 +811,11 @@ void D3D11OnPresent_Internal()
     // poll Numpad * for new arms, open the next capture file. No-op when
     // DEVELOPMENT is off.
     LightTracker::Tick();
-    if (CUSTOMBUFFER_ON) {
+    const bool refreshedAtCustomPass =
+        g_customBufferRefreshedBeforePresent.exchange(
+            false,
+            std::memory_order_relaxed);
+    if (CUSTOMBUFFER_ON && !refreshedAtCustomPass) {
         UpdateCustomBuffer_Internal();
     }
     // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
@@ -1497,6 +1546,11 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
         if (g_ShaderDB.IsEntryMatched(pixelShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(pixelShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pixelShader);
+            if (matchedDefinition &&
+                matchedDefinition->shadowUpgrade &&
+                !SHADOW_UPGRADE_ON) {
+                return result;
+            }
             // If the HLSL watcher flagged a disk change for this definition,
             // drop the cached compiled shader + replacement pointers BEFORE we
             // read them below. Done here on the render thread so the D3D11
@@ -1505,7 +1559,10 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
             auto* replacementPixelShader = g_ShaderDB.GetReplacementShader(pixelShader);
             if (replacementPixelShader) {
                 if (DEBUGGING) {
-                    REX::INFO("MyPSSetShader: Replacing pixel shader with matched replacement for definition '{}'", matchedDefinition ? matchedDefinition->id : "Unknown");
+                    REX::INFO(
+                        "MyPSSetShader: Replacing pixel shader with matched "
+                        "replacement for definition '{}'",
+                        matchedDefinition ? matchedDefinition->id : "Unknown");
                 }
                 result.shader = replacementPixelShader;
                 result.usingReplacementPixelShader = true;
@@ -1519,11 +1576,17 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
                         g_ShaderDB.SetReplacementShader(pixelShader, matchedDefinition->loadedPixelShader);
                         if (DEBUGGING) {
                             REX::INFO("MyPSSetShader: Compiled replacement shader for definition '{}'", matchedDefinition->id);
-                            REX::INFO("MyPSSetShader: Replacing pixel shader with newly compiled replacement for definition '{}'", matchedDefinition->id);
+                            REX::INFO(
+                                "MyPSSetShader: Replacing pixel shader with "
+                                "newly compiled replacement for definition '{}'",
+                                matchedDefinition->id);
                         }
                         result.shader = g_ShaderDB.GetReplacementShader(pixelShader);
                         result.usingReplacementPixelShader = result.shader != nullptr;
-                        result.activeReplacementDef = result.usingReplacementPixelShader ? matchedDefinition : nullptr;
+                        result.activeReplacementDef =
+                            result.usingReplacementPixelShader ?
+                                matchedDefinition :
+                                nullptr;
                     } else {
                         REX::WARN("MyPSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true;

@@ -7,6 +7,13 @@ const char* defaultIni = R"(
 DEBUGGING=false
 ; Master kill switch for shader replacements and custom passes.
 SHADERENGINE_EFFECTS_ON=true
+; Enables the validated OG deferred-light scope and directional-cascade patch.
+; Traced deferred lighting is independently gated by ps_GIEnabled.
+SHADOW_UPGRADE_ON=false
+; End distance of the highest-detail directional-shadow cascade, in game units.
+; Applied after game data is ready when SHADOW_UPGRADE_ON=true. Restart after
+; changing it. Must remain below both 3000 and the live fDirShadowDistance.
+DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE=1600.0
 ; Enable/disable custom resource view updates and bindings for replaced shaders
 ; This setting applies to all replaced shaders
 ; Shaders with #include "common.inc" have access to ingame data like FPS, Camera position and shader settings
@@ -90,6 +97,7 @@ LIGHT_SORTER_MODE=off
 ; Example shader definition in /F4SE/Plugins/ShaderEngine/<ShaderDefinitionName>/Shader.ini
 ;[loadingScreen]             ; unique ShaderDefinition ID for this replacement rule, whitespace is removed for parsing
 ;active=true                 ; whether this shader replacement rule is active
+;shadowUpgrade=false         ; group this rule under the SHADOW_UPGRADE_ON feature switch
 ;priority=0                  ; priority of this rule for matching when multiple rules could apply (lower number = higher priority)
 ;type=ps                     ; shader type (vs=vertex, ps=pixel) defaults to ps if not specified
 ;shaderUID=PS1A2B3C4DI3O2    ; Unique identifier for the shader, used for matching and logging, can be more than one comma separated values
@@ -186,6 +194,8 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_SH_R; // L1 SH for R channel (.xyz=dir bands, .w=DC). From RE::Sky 6-axis ambient cube.
 ;    float4   GFXInjected[0].g_SH_G; // L1 SH for G channel.
 ;    float4   GFXInjected[0].g_SH_B; // L1 SH for B channel.
+;    float4   GFXInjected[0].g_CurrentCameraPositionAdjust; // absolute BGS camera translation for the current frame
+;    float4   GFXInjected[0].g_PreviousCameraPositionAdjust; // translation paired with g_PrevViewProjRow*
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -355,6 +365,12 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_SH_R;
             float4 g_SH_G;
             float4 g_SH_B;
+
+            // Exact BSGraphics::CameraStateData translation paired with the
+            // current and previous view-projection matrices. BGS keeps this
+            // translation outside its rotation-only view matrix.
+            float4 g_CurrentCameraPositionAdjust;
+            float4 g_PreviousCameraPositionAdjust;
         };
 
         struct DrawTagData

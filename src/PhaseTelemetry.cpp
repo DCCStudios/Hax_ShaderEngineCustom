@@ -3,7 +3,6 @@
 
 #if SHADERENGINE_ENABLE_PHASE_TELEMETRY
 
-#include "LightSorter.h"
 #include "hooks.h"
 
 #include <chrono>
@@ -59,7 +58,8 @@ std::atomic<bool> s_forceHooks{ false };
 //   DeferredPrePass      56596   E9-5  15B   stack save mov [rsp+disp8],reg
 //   DeferredDecals      631771   E9-5  17B   mov [rsp+0x18],rbx + 5 pushes + lea rbp
 //   NvidiaHBAO          253972   E9-5  15B   mov rax,rsp + 3 saves
-//   DeferredLightsImpl 1108521   E9-5  18B   mov rax,rsp; push rbp; lea rbp; sub rsp
+//   DeferredLightsImpl is owned by ShadowUpgrade and reported through
+//   BeginDeferredLightsImpl/EndDeferredLightsImpl.
 //   DeferredComposite   728427   E9-5  15B   mov rax,rsp + 2 saves + 5 pushes
 //   Forward             656535   CALL-5 from Render_PreUI+0x1C9
 //                                            (avoids detouring the Forward prologue,
@@ -72,7 +72,6 @@ REL::Relocation<std::uintptr_t> ptr_MainRenderSetup    { REL::ID{  339369, 0 } }
 REL::Relocation<std::uintptr_t> ptr_DeferredPrePass    { REL::ID{   56596, 0 } };
 REL::Relocation<std::uintptr_t> ptr_DeferredDecals     { REL::ID{  631771, 0 } };
 REL::Relocation<std::uintptr_t> ptr_NvidiaHBAO         { REL::ID{  253972, 0 } };
-REL::Relocation<std::uintptr_t> ptr_DeferredLightsImpl { REL::ID{ 1108521, 0 } };
 REL::Relocation<std::uintptr_t> ptr_DeferredComposite  { REL::ID{  728427, 0 } };
 REL::Relocation<std::uintptr_t> ptr_Forward            { REL::ID{  656535, 0 } };
 // Tier 0: the five "skipped" phases, hooked via relocating gateway.
@@ -91,7 +90,6 @@ constexpr std::size_t kPrologueMainRenderSetup     =  6;  // E9-5 patch
 constexpr std::size_t kPrologueDeferredPrePass     = 15;  // E9-5 patch
 constexpr std::size_t kPrologueDeferredDecals      = 17;  // E9-5 patch
 constexpr std::size_t kPrologueNvidiaHBAO          = 15;  // E9-5 patch
-constexpr std::size_t kPrologueDeferredLightsImpl  = 18;  // E9-5 patch
 constexpr std::size_t kPrologueDeferredComposite   = 15;  // E9-5 patch
 constexpr std::size_t kPrologueTier0_SubAndRipRel  = 11;  // E9-5 + relocator
 constexpr std::uintptr_t kRenderPreUIForwardCallOffsetOG = 0x1C9; // call DrawWorld::Forward @ 0x142857649
@@ -105,7 +103,6 @@ VoidVoid_t s_origMainRenderSetup    = nullptr;
 VoidVoid_t s_origDeferredPrePass    = nullptr;
 VoidVoid_t s_origDeferredDecals     = nullptr;
 VoidVoid_t s_origNvidiaHBAO         = nullptr;
-VoidVoid_t s_origDeferredLightsImpl = nullptr;
 VoidVoid_t s_origDeferredComposite  = nullptr;
 VoidVoid_t s_origForward            = nullptr;
 VoidVoid_t s_origLightUpdate        = nullptr;
@@ -545,17 +542,6 @@ void HookedDeferredPrePassCore()
 void HookedDeferredPrePass()    { HookedSubPhase<SubPhase::DeferredPrePass   >(&HookedDeferredPrePassCore); }
 void HookedDeferredDecals()     { HookedSubPhase<SubPhase::DeferredDecals    >(s_origDeferredDecals); }
 void HookedNvidiaHBAO()         { HookedSubPhase<SubPhase::NvidiaHBAO        >(s_origNvidiaHBAO); }
-// Special-cased: wrap the original with LightSorter::OnEnter/OnExit so the
-// point-light array is stable-partitioned by stencil flag before the engine
-// iterates it, then restored after. LightSorter is a no-op when its mode is
-// Off, so this adds ~one atomic-load worth of overhead in that case.
-void HookedDeferredLightsImplCore()
-{
-    LightSorter::OnEnter();
-    s_origDeferredLightsImpl();
-    LightSorter::OnExit();
-}
-void HookedDeferredLightsImpl() { HookedSubPhase<SubPhase::DeferredLightsImpl>(&HookedDeferredLightsImplCore); }
 void HookedDeferredComposite()  { HookedSubPhase<SubPhase::DeferredComposite >(s_origDeferredComposite); }
 void HookedForwardCore()
 {
@@ -738,6 +724,73 @@ bool IsInDeferredLightsImpl()
 }
 
 namespace {
+struct DeferredLightsObserverScope {
+    SubPhase previous = SubPhase::None;
+    std::chrono::steady_clock::time_point start{};
+    bool active = false;
+    bool telemetry = false;
+};
+
+thread_local std::array<DeferredLightsObserverScope, 2> tl_deferredLightsObserverScopes{};
+thread_local std::size_t tl_deferredLightsObserverDepth = 0;
+thread_local std::size_t tl_deferredLightsObserverOverflowDepth = 0;
+}  // namespace
+
+void BeginDeferredLightsImpl()
+{
+    if (!tl_inFrame) {
+        return;
+    }
+    if (tl_deferredLightsObserverDepth >= tl_deferredLightsObserverScopes.size()) {
+        ++tl_deferredLightsObserverOverflowDepth;
+        return;
+    }
+
+    auto& scope = tl_deferredLightsObserverScopes[tl_deferredLightsObserverDepth++];
+    scope = {};
+    scope.previous = tl_subphase;
+    scope.telemetry = g_mode.load(std::memory_order_relaxed) == Mode::On;
+    scope.active = true;
+    tl_subphase = SubPhase::DeferredLightsImpl;
+
+    if (scope.telemetry) {
+        if (!s_firstSubLogged[static_cast<std::size_t>(SubPhase::DeferredLightsImpl)]
+                 .exchange(true, std::memory_order_relaxed)) {
+            REX::INFO("PhaseTelemetry: first DrawWorld::DeferredLightsImpl call observed");
+        }
+        scope.start = std::chrono::steady_clock::now();
+    }
+}
+
+void EndDeferredLightsImpl()
+{
+    if (tl_deferredLightsObserverOverflowDepth > 0) {
+        --tl_deferredLightsObserverOverflowDepth;
+        return;
+    }
+    if (tl_deferredLightsObserverDepth == 0) {
+        return;
+    }
+
+    auto& scope = tl_deferredLightsObserverScopes[--tl_deferredLightsObserverDepth];
+    if (!scope.active) {
+        return;
+    }
+
+    tl_subphase = scope.previous;
+    if (scope.telemetry) {
+        const auto elapsed = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - scope.start)
+                .count());
+        RecordBucket(
+            s_subBuckets[static_cast<std::size_t>(SubPhase::DeferredLightsImpl)],
+            elapsed);
+    }
+    scope = {};
+}
+
+namespace {
 int DeferredDetailIndex(DeferredPrePassDetailKind kind, std::uint32_t key)
 {
     if (key >= kDeferredDetailGroups) {
@@ -851,24 +904,16 @@ bool Initialize()
     }
     const auto mode = g_mode.load(std::memory_order_relaxed);
 
-    // The DrawWorld:: hooks aren't owned by PhaseTelemetry alone ??LightSorter
-    // runs its OnEnter/OnExit logic from inside our HookedDeferredLightsImpl
-    // wrapper, and renderer hooks can request phase context without enabling
-    // telemetry logging. If either piggy-back consumer is on but
-    // PhaseTelemetry itself is Off, we still install the hooks. Each per-call
-    // check inside HookedSubPhase / the wrappers is a single relaxed atomic
-    // load when disabled.
-    const bool lightSorterOn = LightSorter::g_mode.load(std::memory_order_relaxed)
-                               != LightSorter::Mode::Off;
+    // Renderer features no longer piggy-back on these telemetry hooks.
+    // ShadowUpgrade owns DeferredLightsImpl and reports it through observer
+    // callbacks above.
     const bool forced = s_forceHooks.load(std::memory_order_relaxed);
-    const bool needHooks = (mode == Mode::On) || lightSorterOn || forced;
+    const bool needHooks = (mode == Mode::On) || forced;
 
-    REX::INFO("PhaseTelemetry::Initialize: mode={} (hooks {} ??telemetry={}, "
-              "LightSorter={}, forced={})",
+    REX::INFO("PhaseTelemetry::Initialize: mode={} (hooks {}; telemetry={}, forced={})",
               mode == Mode::On ? "on" : "off",
               needHooks ? "installing" : "skipped",
               mode == Mode::On ? "on" : "off",
-              lightSorterOn ? "on" : "off",
               forced ? "on" : "off");
     if (!needHooks) {
         return true;
@@ -901,10 +946,6 @@ bool Initialize()
                      ptr_NvidiaHBAO, kPrologueNvidiaHBAO, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedNvidiaHBAO),
                      reinterpret_cast<void**>(&s_origNvidiaHBAO));
-    ok &= InstallOne("DrawWorld::DeferredLightsImpl",
-                     ptr_DeferredLightsImpl, kPrologueDeferredLightsImpl, HookFlavor::E9_5,
-                     reinterpret_cast<void*>(&HookedDeferredLightsImpl),
-                     reinterpret_cast<void**>(&s_origDeferredLightsImpl));
     ok &= InstallOne("DrawWorld::DeferredComposite",
                      ptr_DeferredComposite, kPrologueDeferredComposite, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredComposite),

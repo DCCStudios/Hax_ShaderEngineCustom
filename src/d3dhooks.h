@@ -5,6 +5,11 @@
 
 #include <PCH.h>
 
+// Refreshes GFXInjected once at the first custom-pass draw boundary between
+// two Presents. This gives screen-space tracing the camera matrices that
+// produced the current depth buffer instead of the preceding frame's data.
+void RefreshCustomBufferForCustomPass();
+
 namespace D3D11Hooks
 {
     using D3D11CreateDeviceAndSwapChain_t = HRESULT(WINAPI*)(

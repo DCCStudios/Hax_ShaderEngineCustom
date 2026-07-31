@@ -1,5 +1,6 @@
 #include <PCH.h>
 #include "ShadowTelemetry.h"
+#include "ShadowUpgrade.h"
 
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY || SHADERENGINE_ENABLE_SHADOW_CACHE
 
@@ -1418,7 +1419,7 @@ Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
     scope.key.viewport.d8 = ReadField<std::uint32_t>(shadowMapData, 0xD8);
     scope.key.viewport.dc = ReadField<std::uint32_t>(shadowMapData, 0xDC);
     scope.cullingProcess = ReadField<void*>(shadowMapData, 0xE0);
-    scope.inDeferredLights = PhaseTelemetry::IsInDeferredLightsImpl();
+    scope.inDeferredLights = ShadowUpgrade::IsInDeferredLighting();
     scope.start = std::chrono::steady_clock::now();
     return scope;
 }

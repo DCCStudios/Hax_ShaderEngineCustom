@@ -4,6 +4,25 @@
 #include <ShaderPipeline.h>
 
 std::atomic_bool g_anyReplacementShaderUsesDrawTag{ false };
+
+// A definition may have been precompiled before the engine creates the
+// matching vanilla shader. Seed that new entry from the already-created
+// replacement while holding the definition's compile lock. Compile completion
+// handles the opposite ordering by publishing to entries already in ShaderDB.
+static void AttachCompiledReplacementToEntry(
+    ShaderDBEntry& entry,
+    ShaderDefinition* def)
+{
+    if (!def) return;
+    if (!def->compileMutex) def->compileMutex = std::make_unique<std::mutex>();
+    std::lock_guard compileLock(*def->compileMutex);
+    if (def->type == ShaderType::Pixel) {
+        entry.SetReplacementPixelShader(def->loadedPixelShader);
+    } else {
+        entry.SetReplacementVertexShader(def->loadedVertexShader);
+    }
+}
+
 // Analyze the shader bytecode to extract info for matching and potential replacement.
 ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, REX::W32::ID3D11VertexShader* vertexShader, std::vector<uint8_t> bytecode, SIZE_T BytecodeLength) {
     ShaderDBEntry entry{};
@@ -46,6 +65,7 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
         if (def->active && DoesEntryMatchDefinition_Internal(entry, def)) {
             entry.SetMatched(true);
             entry.matchedDefinition = def; // Store the matched definition for later use during shader compilation
+            AttachCompiledReplacementToEntry(entry, def);
             if (DEVELOPMENT && def->log) {
                 REX::INFO("AnalyzeShader_Internal: ------------------------------------------------");
                     REX::INFO("RematchAllShaders_Internal: Found matching shader definition '{}' for {} shader with ShaderUID '{}'.", def->id, entry.type == ShaderType::Vertex ? "Vertex" : "Pixel", entry.shaderUID);
@@ -158,6 +178,10 @@ bool CompileShader_Internal(ShaderDefinition* def) {
     // Check if already compiled (re-checked under the lock so a concurrent
     // compile that finished while we were waiting is observed correctly).
     if (def->loadedPixelShader || def->loadedVertexShader) {
+        // Repair entries matched after an earlier precompile. This is cheap in
+        // the normal path and keeps the Shader Monitor tied to actual object
+        // readiness instead of whether the permutation has executed yet.
+        g_ShaderDB.PublishReplacementForDefinition(def);
         if (DEBUGGING)
             REX::INFO("CompileShader_Internal: Shader '{}' is already compiled. Skipping compilation.", def->id);
         return true;
@@ -280,6 +304,7 @@ bool CompileShader_Internal(ShaderDefinition* def) {
         }
         return false;
     }
+    g_ShaderDB.PublishReplacementForDefinition(def);
     return true;
 }
 

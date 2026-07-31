@@ -61,6 +61,12 @@ bool IsInMainAccum();
 bool IsInDeferredPrePass();
 bool IsInDeferredLightsImpl();
 
+// DeferredLightsImpl hook ownership lives in ShadowUpgrade. These observer
+// callbacks preserve telemetry attribution without making telemetry a
+// prerequisite for renderer features.
+void BeginDeferredLightsImpl();
+void EndDeferredLightsImpl();
+
 enum class DeferredPrePassDetailKind : std::uint8_t {
     RenderBatches,
     RenderGeometryGroup,
@@ -137,6 +143,8 @@ inline bool IsInRenderPreUI() { return false; }
 inline bool IsInMainAccum() { return false; }
 inline bool IsInDeferredPrePass() { return false; }
 inline bool IsInDeferredLightsImpl() { return false; }
+inline void BeginDeferredLightsImpl() {}
+inline void EndDeferredLightsImpl() {}
 inline void BeginDeferredPrePassDetail(DeferredPrePassDetailKind, std::uint32_t) {}
 inline void EndDeferredPrePassDetail(DeferredPrePassDetailKind, std::uint32_t) {}
 inline bool GetCurrentDeferredPrePassDetail(DeferredPrePassDetailKind&, std::uint32_t&) { return false; }
