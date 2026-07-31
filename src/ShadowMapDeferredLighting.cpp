@@ -1,4 +1,4 @@
-#include <InteriorDeferredLighting.h>
+#include <ShadowMapDeferredLighting.h>
 
 #include <Global.h>
 #include <Plugin.h>
@@ -10,16 +10,17 @@
 #include <cstring>
 #include <fstream>
 
-namespace InteriorDeferredLighting {
+namespace ShadowMapDeferredLighting {
 namespace {
 
 // The original pixel-shader assembly identities below are the complete OG
-// local-shadow contract set found in the shipped ShaderDB:
+// shadowed-local-light contract set found in the shipped ShaderDB:
 //
 //   planar/projector: single compare, 3x3 PCF, 16-tap disk PCF
 //   dual paraboloid:  single compare, 3x3 PCF, 16-tap disk PCF
 //
-// Directional/cascade permutations deliberately do not enter this path.
+// The local-light path runs in both interiors and exteriors. Directional
+// exterior sunlight remains owned by pixelShadowVisibilityOG.
 enum class Contract : std::uint32_t
 {
     kPlanarSingle = 0,
@@ -31,19 +32,63 @@ enum class Contract : std::uint32_t
     kCount
 };
 
-constexpr std::array<std::pair<std::uint32_t, Contract>, 7> kContracts{ {
+constexpr std::array<std::pair<std::uint32_t, Contract>, 51> kContracts{ {
     { 0xA111C744u, Contract::kPlanarSingle },
+    { 0x0F2D4202u, Contract::kPlanarSingle },
+    { 0x1F61FA95u, Contract::kPlanarSingle },
+    { 0x465890EEu, Contract::kPlanarSingle },
+    { 0x719281FBu, Contract::kPlanarSingle },
+    { 0x88C450BFu, Contract::kPlanarSingle },
+    { 0xC4B36E5Du, Contract::kPlanarSingle },
+    { 0xFC2CE83Fu, Contract::kPlanarSingle },
     { 0x4E6D6ED4u, Contract::kPlanarGrid3 },
+    { 0x28435829u, Contract::kPlanarGrid3 },
+    { 0x2973F143u, Contract::kPlanarGrid3 },
+    { 0x2D5E329Bu, Contract::kPlanarGrid3 },
+    { 0x42C2755Eu, Contract::kPlanarGrid3 },
+    { 0xA4719509u, Contract::kPlanarGrid3 },
+    { 0xDBDA6EAFu, Contract::kPlanarGrid3 },
+    { 0xE044A69Eu, Contract::kPlanarGrid3 },
     { 0xE1814A65u, Contract::kPlanarDisk16 },
     { 0x70426686u, Contract::kPlanarDisk16 },
+    { 0x256D2BBAu, Contract::kPlanarDisk16 },
+    { 0x3AE2D61Du, Contract::kPlanarDisk16 },
+    { 0x7F898813u, Contract::kPlanarDisk16 },
+    { 0xB776A216u, Contract::kPlanarDisk16 },
+    { 0xFB1B3AB0u, Contract::kPlanarDisk16 },
     { 0x5B279219u, Contract::kPointSingle },
+    { 0x009E3E8Au, Contract::kPointSingle },
+    { 0x05362F69u, Contract::kPointSingle },
+    { 0x123371C1u, Contract::kPointSingle },
+    { 0x13807EACu, Contract::kPointSingle },
+    { 0x3CB47781u, Contract::kPointSingle },
+    { 0x58FF71B4u, Contract::kPointSingle },
+    { 0x7A9B8CA4u, Contract::kPointSingle },
+    { 0x93E6F049u, Contract::kPointSingle },
     { 0xA905C891u, Contract::kPointGrid3 },
+    { 0x583F47B9u, Contract::kPointGrid3 },
+    { 0x64528CC3u, Contract::kPointGrid3 },
+    { 0x64AB165Eu, Contract::kPointGrid3 },
+    { 0x77FC526Au, Contract::kPointGrid3 },
+    { 0x78B42621u, Contract::kPointGrid3 },
+    { 0xA71E4470u, Contract::kPointGrid3 },
+    { 0xE2277D0Cu, Contract::kPointGrid3 },
+    { 0xE66FCA31u, Contract::kPointGrid3 },
+    { 0xF586DEE1u, Contract::kPointGrid3 },
+    { 0xF72B8744u, Contract::kPointGrid3 },
     { 0x0BF3C87Eu, Contract::kPointDisk16 },
+    { 0x04A6CA90u, Contract::kPointDisk16 },
+    { 0x0C99D3E6u, Contract::kPointDisk16 },
+    { 0x1C573857u, Contract::kPointDisk16 },
+    { 0x24551FFCu, Contract::kPointDisk16 },
+    { 0x784A2D42u, Contract::kPointDisk16 },
+    { 0x914F6F21u, Contract::kPointDisk16 },
+    { 0xCD03DFFDu, Contract::kPointDisk16 },
 } };
 
 constexpr UINT kScratchSrvSlot = 28;
 constexpr UINT kModeConstantSlot = 13;
-constexpr char kShaderFile[] = "InteriorDeferredShadow.hlsl";
+constexpr char kShaderFile[] = "ShadowMapDeferredLighting.hlsl";
 
 template <class T>
 void Release(T*& value) noexcept
@@ -316,7 +361,7 @@ bool EnsureShader(REX::W32::ID3D11Device* device)
     std::ifstream file(path, std::ios::binary);
     if (!file.good()) {
         REX::WARN(
-            "InteriorDeferredLighting: shader file not found: {}",
+            "ShadowMapDeferredLighting: shader file not found: {}",
             path.string());
         s_compileFailed = true;
         return false;
@@ -342,7 +387,7 @@ bool EnsureShader(REX::W32::ID3D11Device* device)
         const HRESULT hr = D3DCompile(
             source.data(),
             source.size(),
-            "InteriorDeferredLighting",
+            "ShadowMapDeferredLighting",
             nullptr,
             includeHandler,
             "main",
@@ -356,11 +401,11 @@ bool EnsureShader(REX::W32::ID3D11Device* device)
         if (!REX::W32::SUCCESS(hr) || !blob) {
             if (errors) {
                 REX::WARN(
-                    "InteriorDeferredLighting: compile failed: {}",
+                    "ShadowMapDeferredLighting: compile failed: {}",
                     static_cast<const char*>(errors->GetBufferPointer()));
             } else {
                 REX::WARN(
-                    "InteriorDeferredLighting: compile failed 0x{:08X}",
+                    "ShadowMapDeferredLighting: compile failed 0x{:08X}",
                     static_cast<unsigned>(hr));
             }
             Release(errors);
@@ -385,14 +430,14 @@ bool EnsureShader(REX::W32::ID3D11Device* device)
 
     if (!REX::W32::SUCCESS(hr) || !s_filterShader) {
         REX::WARN(
-            "InteriorDeferredLighting: CreatePixelShader failed 0x{:08X}",
+            "ShadowMapDeferredLighting: CreatePixelShader failed 0x{:08X}",
             static_cast<unsigned>(hr));
         s_compileFailed = true;
         return false;
     }
 
     REX::INFO(
-        "InteriorDeferredLighting: compiled map-space PCSS composite "
+        "ShadowMapDeferredLighting: compiled map-space PCSS composite "
         "({} bytes)",
         byteCount);
     return true;
@@ -412,7 +457,7 @@ bool EnsureFixedStates(REX::W32::ID3D11Device* device)
         hr = device->CreateBlendState(&desc, &s_opaqueBlend);
         if (!REX::W32::SUCCESS(hr)) {
             REX::WARN(
-                "InteriorDeferredLighting: opaque blend creation failed "
+                "ShadowMapDeferredLighting: opaque blend creation failed "
                 "0x{:08X}",
                 static_cast<unsigned>(hr));
             return false;
@@ -434,7 +479,7 @@ bool EnsureFixedStates(REX::W32::ID3D11Device* device)
         hr = device->CreateBlendState(&desc, &s_additiveBlend);
         if (!REX::W32::SUCCESS(hr)) {
             REX::WARN(
-                "InteriorDeferredLighting: additive blend creation failed "
+                "ShadowMapDeferredLighting: additive blend creation failed "
                 "0x{:08X}",
                 static_cast<unsigned>(hr));
             return false;
@@ -458,7 +503,7 @@ bool EnsureFixedStates(REX::W32::ID3D11Device* device)
             &desc, &initial, &s_modeConstants[i]);
         if (!REX::W32::SUCCESS(hr)) {
             REX::WARN(
-                "InteriorDeferredLighting: mode constant {} creation "
+                "ShadowMapDeferredLighting: mode constant {} creation "
                 "failed 0x{:08X}",
                 i,
                 static_cast<unsigned>(hr));
@@ -543,7 +588,7 @@ bool EnsureScratchTargets(REX::W32::ID3D11Device* device)
             g_rendererData->renderTargets[specular],
             s_scratch[1])) {
         REX::WARN(
-            "InteriorDeferredLighting: failed to mirror BGS deferred MRTs");
+            "ShadowMapDeferredLighting: failed to mirror BGS deferred MRTs");
         return false;
     }
     return true;
@@ -681,7 +726,7 @@ bool TryRender(
     if (!ScratchSlotsAreAvailable()) {
         if (!s_slotConflictLogged) {
             REX::WARN(
-                "InteriorDeferredLighting: scratch SRV slots t28/t29 "
+                "ShadowMapDeferredLighting: scratch SRV slots t28/t29 "
                 "conflict with configured ShaderEngine resource slots; "
                 "vanilla draws retained");
             s_slotConflictLogged = true;
@@ -701,7 +746,7 @@ bool TryRender(
     if (!liveContract) {
         if (!s_contractSkipLogged) {
             REX::WARN(
-                "InteriorDeferredLighting: recognized local-shadow shader "
+                "ShadowMapDeferredLighting: recognized local-shadow shader "
                 "rejected live BGS contract (MRTs={}, SRVs={}, "
                 "shadowViews={}, CBs={}, sampler={}, readOnlyDS={}); "
                 "vanilla draw retained",
@@ -771,7 +816,7 @@ bool TryRender(
 
     if (!s_firstFireLogged) {
         REX::INFO(
-            "InteriorDeferredLighting: first shadowed local light isolated "
+            "ShadowMapDeferredLighting: first shadowed local light isolated "
             "and recomposited (contract={})",
             static_cast<std::uint32_t>(*contract));
         s_firstFireLogged = true;
@@ -806,4 +851,4 @@ void Shutdown() noexcept
     }
 }
 
-}  // namespace InteriorDeferredLighting
+}  // namespace ShadowMapDeferredLighting

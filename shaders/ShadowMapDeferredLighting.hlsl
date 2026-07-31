@@ -1,8 +1,9 @@
-// Per-shadowed-light deferred composite for Fallout 4 OG.
+// Per-shadowed-local-light deferred composite for Fallout 4 OG.
 //
-// The C++ pass first isolates one vanilla/HachiToon light into t28/t29, then
-// repeats the same light-volume raster with this shader. t4/t5 and b2/b12 are
-// the still-live BGS shadow-map, projection, light and camera contracts.
+// The pass runs for local lights in both interiors and exteriors. It first
+// isolates one vanilla/HachiToon light into t28/t29, then repeats the same
+// light-volume raster with this shader. t4/t5 and b2/b12 are the still-live
+// BGS shadow-map, projection, light and camera contracts.
 
 Texture2D<float4> t2 : register(t2);
 Texture2D<float4> t3 : register(t3);
@@ -25,9 +26,9 @@ cbuffer cb12 : register(b12)
     float4 cb12[30];
 }
 
-cbuffer InteriorShadowMode : register(b13)
+cbuffer ShadowMapDeferredMode : register(b13)
 {
-    uint4 seInteriorShadowMode;
+    uint4 seShadowMapDeferredMode;
 }
 
 // Keep this renderer-side pass usable when HachiToon is absent while allowing
@@ -381,7 +382,7 @@ DeferredOutput main(float4 svPosition : SV_POSITION0)
     float3 worldPosition =
         ReconstructBGSWorldPosition(svPosition, rawDepth);
 
-    uint contract = seInteriorShadowMode.x;
+    uint contract = seShadowMapDeferredMode.x;
     bool pointProjection = contract >= 3;
     uint filterMode = pointProjection ? contract - 3 : contract;
     ShadowProjection projection =

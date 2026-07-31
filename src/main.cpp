@@ -1,6 +1,6 @@
 #include <Global.h>
 #include <CustomPass.h>
-#include <InteriorDeferredLighting.h>
+#include <ShadowMapDeferredLighting.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
@@ -1489,7 +1489,7 @@ void ReloadAllShaderDefinitions_Internal() {
     // ComputeKey / D3DCompile picks up any include edits the user made
     // alongside their Shader.ini change.
     ShaderCache::InvalidateIncludeMemo();
-    InteriorDeferredLighting::InvalidateShader();
+    ShadowMapDeferredLighting::InvalidateShader();
     // Remove all connections ShaderDB <> ShaderDefDB
     g_ShaderDB.UnmatchAll();
     // STOP and destroy all file watchers BEFORE processing new INI files
@@ -1747,7 +1747,7 @@ extern "C"
         LightCullPolicy::Shutdown();
         // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
         GpuScalar::Shutdown();
-        InteriorDeferredLighting::Shutdown();
+        ShadowMapDeferredLighting::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }

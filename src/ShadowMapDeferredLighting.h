@@ -4,7 +4,7 @@
 
 struct BSRenderPassLayout;
 
-namespace InteriorDeferredLighting {
+namespace ShadowMapDeferredLighting {
 
 using Draw_t = void (*)(
     BSRenderPassLayout* pass,
@@ -29,4 +29,4 @@ void InvalidateShader() noexcept;
 // Releases all D3D11 objects owned by the interior deferred-light pass.
 void Shutdown() noexcept;
 
-}  // namespace InteriorDeferredLighting
+}  // namespace ShadowMapDeferredLighting

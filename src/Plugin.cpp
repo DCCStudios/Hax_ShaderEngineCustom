@@ -1,7 +1,7 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
-#include <InteriorDeferredLighting.h>
+#include <ShadowMapDeferredLighting.h>
 #include "d3dhooks.h"
 #include <hooks.h>
 #include <PhaseTelemetry.h>
@@ -2766,7 +2766,7 @@ namespace
             }
         }
 
-        if (!InteriorDeferredLighting::TryRender(
+        if (!ShadowMapDeferredLighting::TryRender(
                 pass,
                 unk2,
                 unk3,
