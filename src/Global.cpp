@@ -196,6 +196,7 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_SH_B; // L1 SH for B channel.
 ;    float4   GFXInjected[0].g_CurrentCameraPositionAdjust; // absolute BGS camera translation for the current frame
 ;    float4   GFXInjected[0].g_PreviousCameraPositionAdjust; // translation paired with g_PrevViewProjRow*
+;    float4   GFXInjected[0].g_RenderInfo; // xy=logical render extent, zw=display extent
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -371,6 +372,11 @@ std::string GetCommonShaderHeaderHLSLTop()
             // translation outside its rotation-only view matrix.
             float4 g_CurrentCameraPositionAdjust;
             float4 g_PreviousCameraPositionAdjust;
+
+            // Logical projection extent and physical display extent. External
+            // upscalers may keep some engine resources display-sized while
+            // rendering the G-buffer through reduced proxy allocations.
+            float4 g_RenderInfo; // xy=render, zw=display
         };
 
         struct DrawTagData

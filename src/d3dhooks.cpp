@@ -11,7 +11,9 @@
 #include <RenderTargets.h>
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
+#include <ShadowMapDeferredLighting.h>
 #include <ShadowTelemetry.h>
+#include <TiledDeferredLighting.h>
 
 extern HWND g_outputWindow;
 extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
@@ -58,6 +60,90 @@ namespace
     constexpr UINT kReplaySRVCacheSlots = 128;
     constexpr UINT kReplayVertexBufferSlots = 32;
     constexpr std::chrono::seconds kReplayMapTelemetryInterval{ 2 };
+
+    struct DrawIndexedPayload
+    {
+        UINT indexCount;
+        UINT startIndexLocation;
+        INT baseVertexLocation;
+    };
+
+    struct DrawPayload
+    {
+        UINT vertexCount;
+        UINT startVertexLocation;
+    };
+
+    struct DrawIndexedInstancedPayload
+    {
+        UINT indexCountPerInstance;
+        UINT instanceCount;
+        UINT startIndexLocation;
+        INT baseVertexLocation;
+        UINT startInstanceLocation;
+    };
+
+    struct DrawInstancedPayload
+    {
+        UINT vertexCountPerInstance;
+        UINT instanceCount;
+        UINT startVertexLocation;
+        UINT startInstanceLocation;
+    };
+
+    void ReplayDrawIndexed(
+        REX::W32::ID3D11DeviceContext* context,
+        const void* rawPayload) noexcept
+    {
+        const auto& args =
+            *static_cast<const DrawIndexedPayload*>(rawPayload);
+        D3D11Hooks::OriginalDrawIndexed(
+            context,
+            args.indexCount,
+            args.startIndexLocation,
+            args.baseVertexLocation);
+    }
+
+    void ReplayDraw(
+        REX::W32::ID3D11DeviceContext* context,
+        const void* rawPayload) noexcept
+    {
+        const auto& args =
+            *static_cast<const DrawPayload*>(rawPayload);
+        D3D11Hooks::OriginalDraw(
+            context,
+            args.vertexCount,
+            args.startVertexLocation);
+    }
+
+    void ReplayDrawIndexedInstanced(
+        REX::W32::ID3D11DeviceContext* context,
+        const void* rawPayload) noexcept
+    {
+        const auto& args =
+            *static_cast<const DrawIndexedInstancedPayload*>(rawPayload);
+        D3D11Hooks::OriginalDrawIndexedInstanced(
+            context,
+            args.indexCountPerInstance,
+            args.instanceCount,
+            args.startIndexLocation,
+            args.baseVertexLocation,
+            args.startInstanceLocation);
+    }
+
+    void ReplayDrawInstanced(
+        REX::W32::ID3D11DeviceContext* context,
+        const void* rawPayload) noexcept
+    {
+        const auto& args =
+            *static_cast<const DrawInstancedPayload*>(rawPayload);
+        D3D11Hooks::OriginalDrawInstanced(
+            context,
+            args.vertexCountPerInstance,
+            args.instanceCount,
+            args.startVertexLocation,
+            args.startInstanceLocation);
+    }
 
     struct ReplaySRVCallCache
     {
@@ -689,6 +775,121 @@ void UpdateCustomBuffer_Internal() {
         camState.previousPosAdjust.y,
         camState.previousPosAdjust.z,
         0.0f
+    };
+
+    // Resolve the projection domain using the same precedence as the
+    // upscaler-aware deferred shadow path:
+    //   physical proxy allocation > native DRS ratio > reduced viewport.
+    // Fallout's depth pyramid (RT39) is not proxy-swapped by the upscaler, so
+    // shaders need this extent separately from any individual texture size.
+    const float displayW = gfxState.screenWidth > 0
+        ? static_cast<float>(gfxState.screenWidth)
+        : resX;
+    const float displayH = gfxState.screenHeight > 0
+        ? static_cast<float>(gfxState.screenHeight)
+        : resY;
+    const auto renderTargetManager =
+        RE::BSGraphics::RenderTargetManager::GetSingleton();
+    const float dynamicWidthRatio =
+        renderTargetManager.dynamicWidthRatio > 0.0f &&
+        renderTargetManager.dynamicWidthRatio <= 1.0f
+            ? renderTargetManager.dynamicWidthRatio
+            : 1.0f;
+    const float dynamicHeightRatio =
+        renderTargetManager.dynamicHeightRatio > 0.0f &&
+        renderTargetManager.dynamicHeightRatio <= 1.0f
+            ? renderTargetManager.dynamicHeightRatio
+            : 1.0f;
+    constexpr float kMinimumRenderExtent = 16.0f;
+    const bool physicalExtentValid =
+        std::isfinite(resX) &&
+        std::isfinite(resY) &&
+        resX >= kMinimumRenderExtent &&
+        resY >= kMinimumRenderExtent;
+    const bool viewportExtentValid =
+        std::isfinite(vpW) &&
+        std::isfinite(vpH) &&
+        vpW >= kMinimumRenderExtent &&
+        vpH >= kMinimumRenderExtent &&
+        vpW <= displayW + 1.0f &&
+        vpH <= displayH + 1.0f;
+    const bool proxyAllocation =
+        physicalExtentValid &&
+        (resX + 0.5f < displayW || resY + 0.5f < displayH);
+    const bool dynamicRatio =
+        dynamicWidthRatio < 0.999f || dynamicHeightRatio < 0.999f;
+    const bool reducedViewport =
+        viewportExtentValid &&
+        (vpW + 0.5f < displayW || vpH + 0.5f < displayH);
+    struct StableRenderDomain
+    {
+        float renderW = 0.0f;
+        float renderH = 0.0f;
+        float displayW = 0.0f;
+        float displayH = 0.0f;
+    };
+    static StableRenderDomain stableRenderDomain{};
+    float renderW = resX;
+    float renderH = resY;
+    if (proxyAllocation) {
+        renderW = resX;
+        renderH = resY;
+    } else if (dynamicRatio) {
+        renderW = (std::max)(
+            1.0f, std::floor(displayW * dynamicWidthRatio));
+        renderH = (std::max)(
+            1.0f, std::floor(displayH * dynamicHeightRatio));
+    } else if (reducedViewport) {
+        renderW = std::round(vpW);
+        renderH = std::round(vpH);
+    } else if (!viewportExtentValid) {
+        // Loading screens and image-space transitions can publish a camera
+        // viewport with one zero-sized axis while the upscaler temporarily
+        // forces the DRS ratios to 1.0. Treating that as a reduced viewport
+        // collapsed render-domain custom resources to 1x1. Retain the last
+        // trustworthy domain for the same display instead.
+        const bool sameDisplay =
+            std::abs(stableRenderDomain.displayW - displayW) < 0.5f &&
+            std::abs(stableRenderDomain.displayH - displayH) < 0.5f;
+        if (sameDisplay &&
+            stableRenderDomain.renderW >= kMinimumRenderExtent &&
+            stableRenderDomain.renderH >= kMinimumRenderExtent) {
+            renderW = stableRenderDomain.renderW;
+            renderH = stableRenderDomain.renderH;
+        } else {
+            renderW = physicalExtentValid ? resX : displayW;
+            renderH = physicalExtentValid ? resY : displayH;
+        }
+    }
+    if (renderW < kMinimumRenderExtent ||
+        renderH < kMinimumRenderExtent ||
+        !std::isfinite(renderW) ||
+        !std::isfinite(renderH)) {
+        const bool sameDisplay =
+            std::abs(stableRenderDomain.displayW - displayW) < 0.5f &&
+            std::abs(stableRenderDomain.displayH - displayH) < 0.5f;
+        if (sameDisplay &&
+            stableRenderDomain.renderW >= kMinimumRenderExtent &&
+            stableRenderDomain.renderH >= kMinimumRenderExtent) {
+            renderW = stableRenderDomain.renderW;
+            renderH = stableRenderDomain.renderH;
+        } else {
+            renderW = physicalExtentValid ? resX : displayW;
+            renderH = physicalExtentValid ? resY : displayH;
+        }
+    }
+    if (renderW >= kMinimumRenderExtent &&
+        renderH >= kMinimumRenderExtent) {
+        stableRenderDomain.renderW = renderW;
+        stableRenderDomain.renderH = renderH;
+        stableRenderDomain.displayW = displayW;
+        stableRenderDomain.displayH = displayH;
+    }
+    g_customBufferData.g_RenderInfo = {
+        renderW,
+        renderH,
+        displayW,
+        displayH
     };
 
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow0, invProj.r[0]);
@@ -1941,10 +2142,18 @@ namespace
         INT baseVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexed");
+        const DrawIndexedPayload payload{
+            indexCount, startIndexLocation, baseVertexLocation
+        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawIndexed(context, indexCount, startIndexLocation, baseVertexLocation);
+                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
+                        context, ReplayDrawIndexed, &payload) &&
+                    !TiledDeferredLighting::TryRenderLiveComposite(
+                        context, ReplayDrawIndexed, &payload)) {
+                    ReplayDrawIndexed(context, &payload);
+                }
             });
     }
 
@@ -1954,10 +2163,16 @@ namespace
         UINT startVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-Draw");
+        const DrawPayload payload{ vertexCount, startVertexLocation };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDraw(context, vertexCount, startVertexLocation);
+                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
+                        context, ReplayDraw, &payload) &&
+                    !TiledDeferredLighting::TryRenderLiveComposite(
+                        context, ReplayDraw, &payload)) {
+                    ReplayDraw(context, &payload);
+                }
             });
     }
 
@@ -1970,16 +2185,22 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexedInstanced");
+        const DrawIndexedInstancedPayload payload{
+            indexCountPerInstance,
+            instanceCount,
+            startIndexLocation,
+            baseVertexLocation,
+            startInstanceLocation
+        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawIndexedInstanced(
-                    context,
-                    indexCountPerInstance,
-                    instanceCount,
-                    startIndexLocation,
-                    baseVertexLocation,
-                    startInstanceLocation);
+                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
+                        context, ReplayDrawIndexedInstanced, &payload) &&
+                    !TiledDeferredLighting::TryRenderLiveComposite(
+                        context, ReplayDrawIndexedInstanced, &payload)) {
+                    ReplayDrawIndexedInstanced(context, &payload);
+                }
             });
     }
 
@@ -1991,15 +2212,21 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawInstanced");
+        const DrawInstancedPayload payload{
+            vertexCountPerInstance,
+            instanceCount,
+            startVertexLocation,
+            startInstanceLocation
+        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawInstanced(
-                    context,
-                    vertexCountPerInstance,
-                    instanceCount,
-                    startVertexLocation,
-                    startInstanceLocation);
+                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
+                        context, ReplayDrawInstanced, &payload) &&
+                    !TiledDeferredLighting::TryRenderLiveComposite(
+                        context, ReplayDrawInstanced, &payload)) {
+                    ReplayDrawInstanced(context, &payload);
+                }
             });
     }
 

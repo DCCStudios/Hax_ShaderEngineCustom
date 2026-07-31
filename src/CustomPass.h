@@ -56,6 +56,7 @@ struct ResourceSpec {
     uint32_t                                scaleDiv = 1;       // Screen/N
     uint32_t                                absWidth = 0;       // Absolute
     uint32_t                                absHeight = 0;      // Absolute
+    bool                                    renderDomain = false; // scale relative to logical render extent
     uint32_t                                mipLevels = 1;
     int                                     srvSlot = -1;       // Preferred/requested SRV slot for INI consumers.
     bool                                    globalBind = false; // true publishes srvSlot without an explicit request.

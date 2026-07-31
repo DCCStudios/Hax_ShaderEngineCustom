@@ -1,6 +1,7 @@
 #include <Global.h>
 #include <CustomPass.h>
 #include <ShadowMapDeferredLighting.h>
+#include <TiledDeferredLighting.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
@@ -1490,6 +1491,7 @@ void ReloadAllShaderDefinitions_Internal() {
     // alongside their Shader.ini change.
     ShaderCache::InvalidateIncludeMemo();
     ShadowMapDeferredLighting::InvalidateShader();
+    TiledDeferredLighting::InvalidateShader();
     // Remove all connections ShaderDB <> ShaderDefDB
     g_ShaderDB.UnmatchAll();
     // STOP and destroy all file watchers BEFORE processing new INI files
@@ -1748,6 +1750,7 @@ extern "C"
         // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
         GpuScalar::Shutdown();
         ShadowMapDeferredLighting::Shutdown();
+        TiledDeferredLighting::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }

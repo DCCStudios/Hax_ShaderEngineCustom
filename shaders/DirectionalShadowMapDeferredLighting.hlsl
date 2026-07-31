@@ -1,15 +1,15 @@
-// Per-shadowed-local-light deferred composite for Fallout 4 OG.
+// Full-screen cascaded directional-shadow upgrade for Fallout 4 OG.
 //
-// The pass runs for local lights in both interiors and exteriors. It first
-// isolates one vanilla/HachiToon light into t28/t29, then repeats the same
-// light-volume raster with this shader. t5 and b2/b12 are the still-live BGS
-// shadow-map, projection, light and camera contracts. D3D11 comparison
-// sampling and raw Load() both use the same float shadow-map SRV; the shipped
-// local-light contract never binds a separate t4 raw-depth view.
+// Contract 6 reweights the isolated output from pixelDeferredLightOG.
+// Contract 7 writes the upgraded visibility emitted by
+// pixelShadowVisibilityOG. Both paths consume the shipped t5 shadow-map SRV
+// directly for comparison sampling and raw blocker-depth reads.
 
 Texture2D<float4> t2 : register(t2);
 Texture2D<float4> t3 : register(t3);
 Texture2DArray<float> t5 : register(t5);
+Texture2D<float4> t26 : register(t26);
+Texture2D<float4> t27 : register(t27);
 Texture2D<float4> t28 : register(t28);
 Texture2D<float4> t29 : register(t29);
 
@@ -19,12 +19,12 @@ SamplerComparisonState s5_s : register(s5);
 
 cbuffer cb2 : register(b2)
 {
-    float4 cb2[23];
+    float4 cb2[28];
 }
 
 cbuffer cb12 : register(b12)
 {
-    float4 cb12[30];
+    float4 cb12[31];
 }
 
 cbuffer ShadowMapDeferredMode : register(b13)
@@ -36,8 +36,6 @@ cbuffer ShadowMapDeferredMode : register(b13)
     float4 seShadowMapDeferredViewport;
 }
 
-// Keep this renderer-side pass usable when HachiToon is absent while allowing
-// ShaderEngine's generated value macros to remain authoritative when present.
 #ifndef ps_ToonSkinEnabled
 #define ps_ToonSkinEnabled false
 #endif
@@ -68,8 +66,8 @@ cbuffer ShadowMapDeferredMode : register(b13)
 #ifndef ps_TraceMaxCorrection
 #define ps_TraceMaxCorrection 1.0
 #endif
-#ifndef ps_TraceLocalFilterScale
-#define ps_TraceLocalFilterScale 1.0
+#ifndef ps_TraceDirectionalFilterScale
+#define ps_TraceDirectionalFilterScale 1.0
 #endif
 
 #include "deferredLightSkinCommon.inc"
@@ -113,7 +111,7 @@ float2 ScreenUV(float4 svPosition)
     // Fallout's native DRS keeps a render-sized viewport in a native-sized
     // allocation, while external upscalers can replace that allocation with a
     // physically render-sized proxy. Deriving UVs from the live t3 allocation
-    // is correct for both domains; cb2[22] is not when a proxy is installed
+    // is correct for both domains; cb2[27] is not when a proxy is installed
     // after Bethesda prepared its deferred constants.
     uint width;
     uint height;
@@ -128,13 +126,15 @@ float2 RasterUV(float4 svPosition)
         seShadowMapDeferredViewport.zw;
 }
 
-float3 ReconstructBGSWorldPosition(float4 svPosition, float rawDepth)
+float3 ReconstructBGSWorldPosition(
+    float4 svPosition,
+    float rawDepth,
+    out float projectionDepth)
 {
     float4 row0;
     float4 row1;
     float4 row2;
     float4 row3;
-    float projectionDepth;
 
     if (rawDepth <= 0.01)
     {
@@ -166,61 +166,47 @@ float3 ReconstructBGSWorldPosition(float4 svPosition, float rawDepth)
     return world.xyz / max(abs(world.w), 1e-6) * sign(world.w);
 }
 
-ShadowProjection ProjectPlanar(float3 worldPosition)
+ShadowProjection ProjectMainCascade(
+    float3 worldPosition,
+    uint cascade)
 {
     float4 world = float4(worldPosition, 1.0);
-    float4 lightClip;
-    lightClip.x = dot(cb2[11], world);
-    lightClip.y = dot(cb2[12], world);
-    lightClip.z = dot(cb2[13], world);
-    lightClip.w = dot(cb2[14], world);
+    uint row = cascade == 0 ? 11u : 14u;
+    float span =
+        cb2[21u + cascade].w - cb2[21u + cascade].z;
+    float bias = (cascade == 0 ? 0.275 : 1.0) /
+        max(abs(span), 1e-5);
 
     ShadowProjection result;
-    float inverseW = rcp(max(abs(lightClip.w), 1e-6)) * sign(lightClip.w);
-    float3 projected = lightClip.xyz * inverseW;
-    result.uv = projected.xy * 0.5 + 0.5;
-    result.receiverDepth = projected.z - cb2[15].x;
-    result.slice = 0;
+    result.uv.x = dot(cb2[row], world);
+    result.uv.y = dot(cb2[row + 1u], world);
+    result.receiverDepth = dot(cb2[row + 2u], world) - bias;
+    result.slice = cascade;
     result.valid =
-        step(1e-6, abs(lightClip.w)) *
         step(0.0, result.uv.x) * step(result.uv.x, 1.0) *
         step(0.0, result.uv.y) * step(result.uv.y, 1.0);
     return result;
 }
 
-ShadowProjection ProjectPoint(float3 worldPosition)
+ShadowProjection ProjectVisibilityCascade(
+    float3 worldPosition,
+    float materialTag)
 {
     float4 world = float4(worldPosition, 1.0);
-    float3 lightVector;
-    lightVector.x = dot(cb2[11], world);
-    lightVector.y = dot(cb2[12], world);
-    lightVector.z = dot(cb2[13], world);
-    float lightW = dot(cb2[14], world);
-
-    bool backHemisphere = (lightVector.z * 0.5 + 0.5) < 0.0;
-    float inverseW = rcp(max(abs(lightW), 1e-6)) * sign(lightW);
-    lightVector *= inverseW;
-    float projectedLength = length(lightVector);
-    float3 direction = lightVector / max(projectedLength, 1e-6);
-    direction += backHemisphere ? float3(0.0, 0.0, -1.0)
-                                : float3(0.0, 0.0, 1.0);
-    direction = normalize(direction);
-
-    float2 paraboloid = direction.xy / max(abs(direction.z), 1e-6) *
-                        sign(direction.z);
-    paraboloid = paraboloid * 0.5 + 0.5;
-    float selectedY = backHemisphere ? paraboloid.y : 1.0 - paraboloid.y;
-    float atlasScale = cb2[20].z;
+    uint cascade = min((uint)cb2[9].y, 1u);
+    float span =
+        cb2[21u + cascade].w - cb2[21u + cascade].z;
+    float normalBias =
+        abs(materialTag - 1.0) < 0.25 ? 0.08 : 0.275;
 
     ShadowProjection result;
-    result.uv = float2(
-        atlasScale * paraboloid.x,
-        1.0 - atlasScale * selectedY);
+    result.uv.x = dot(cb2[11], world);
+    result.uv.y = dot(cb2[12], world);
     result.receiverDepth =
-        saturate(projectedLength / max(cb2[1].w, 1e-6)) - cb2[15].x;
-    result.slice = backHemisphere ? 1u : 0u;
+        min(0.999999, dot(cb2[13], world)) -
+        normalBias / max(abs(span), 1e-5);
+    result.slice = cascade;
     result.valid =
-        step(1e-6, abs(lightW)) *
         step(0.0, result.uv.x) * step(result.uv.x, 1.0) *
         step(0.0, result.uv.y) * step(result.uv.y, 1.0);
     return result;
@@ -236,43 +222,23 @@ float CompareShadow(
         projection.receiverDepth);
 }
 
-float VanillaVisibility(
-    ShadowProjection projection,
-    uint filterMode)
+float VanillaVisibility(ShadowProjection projection)
 {
-    float resultVisibility =
-        CompareShadow(projection, float2(0.0, 0.0));
+    if (projection.valid < 0.5)
+    {
+        return 1.0;
+    }
 
-    if (filterMode == 1)
+    float visibility = 0.0;
+    float radius = 6.0 * cb2[20].z;
+    [unroll(16)]
+    for (int i = 0; i < 16; ++i)
     {
-        float gridVisibility = 0.0;
-        [unroll(3)]
-        for (int y = -1; y <= 1; ++y)
-        {
-            [unroll(3)]
-            for (int x = -1; x <= 1; ++x)
-            {
-                gridVisibility += CompareShadow(
-                    projection,
-                    float2(x, y) * cb2[15].zw);
-            }
-        }
-        resultVisibility = gridVisibility / 9.0;
+        visibility += CompareShadow(
+            projection,
+            (kDisk[i] - 0.5) * radius);
     }
-    else if (filterMode >= 2)
-    {
-        float diskVisibility = 0.0;
-        float radius = 6.0 * cb2[15].z;
-        [unroll(16)]
-        for (int diskIndex = 0; diskIndex < 16; ++diskIndex)
-        {
-            diskVisibility += CompareShadow(
-                projection,
-                (kDisk[diskIndex] - 0.5) * radius);
-        }
-        resultVisibility = diskVisibility / 16.0;
-    }
-    return resultVisibility;
+    return visibility / 16.0;
 }
 
 float RawShadowDepth(
@@ -287,24 +253,13 @@ float RawShadowDepth(
     return t5.Load(int4(texel, projection.slice, 0));
 }
 
-float2 BGSFilterRadius(uint filterMode, uint2 dimensions)
+float PCSSVisibility(ShadowProjection projection)
 {
-    float2 texel = rcp(float2(dimensions));
-    if (filterMode == 0)
+    if (projection.valid < 0.5)
     {
-        return texel * 2.0;
+        return 1.0;
     }
-    if (filterMode == 1)
-    {
-        return max(abs(cb2[15].zw) * 2.0, texel * 2.0);
-    }
-    return max(abs(cb2[15].zz) * 6.0, texel * 2.0);
-}
 
-float PCSSVisibility(
-    ShadowProjection projection,
-    uint filterMode)
-{
     uint width;
     uint height;
     uint layers;
@@ -315,9 +270,12 @@ float PCSSVisibility(
     }
 
     uint2 dimensions = uint2(width, height);
+    float2 texel = rcp(float2(dimensions));
     float2 sourceRadius =
-        BGSFilterRadius(filterMode, dimensions) *
-        max(ps_TraceLocalFilterScale, 0.0);
+        max(
+            abs(cb2[20].zz) * 6.0 *
+                max(ps_TraceDirectionalFilterScale, 0.0),
+            texel);
     float blockerDepth = 0.0;
     float blockerCount = 0.0;
 
@@ -328,7 +286,8 @@ float PCSSVisibility(
             projection,
             (kDisk[blockerIndex] - 0.5) * sourceRadius,
             dimensions);
-        float isBlocker = step(depth + 1e-5, projection.receiverDepth);
+        float isBlocker =
+            step(depth + 1e-5, projection.receiverDepth);
         blockerDepth += depth * isBlocker;
         blockerCount += isBlocker;
     }
@@ -342,10 +301,9 @@ float PCSSVisibility(
     float penumbra =
         max(projection.receiverDepth - blockerDepth, 0.0) /
         max(abs(blockerDepth), 1e-4);
-    float2 texel = rcp(float2(dimensions));
     float2 filterRadius = clamp(
-        sourceRadius * max(penumbra, 0.25),
-        max(sourceRadius * 0.5, texel),
+        sourceRadius * max(penumbra, 0.20),
+        max(sourceRadius * 0.75, texel),
         max(sourceRadius * 4.0, texel));
 
     float visibility = 0.0;
@@ -357,6 +315,37 @@ float PCSSVisibility(
             (kDisk[filterIndex] - 0.5) * filterRadius);
     }
     return visibility / 16.0;
+}
+
+float BlendCascades(
+    float projectionDepth,
+    float nearVisibility,
+    float farVisibility)
+{
+    if (projectionDepth < cb2[10].x)
+    {
+        return nearVisibility;
+    }
+    if (projectionDepth > cb2[10].y)
+    {
+        return farVisibility;
+    }
+
+    float range = max(cb2[10].y - cb2[10].x, 1e-5);
+    float blend = saturate(
+        (projectionDepth - cb2[10].x) / range);
+    blend = blend * blend * (3.0 - 2.0 * blend);
+    return lerp(nearVisibility, farVisibility, blend);
+}
+
+float DistanceFade(float3 worldPosition)
+{
+    float fade = saturate(
+        dot(worldPosition, worldPosition) /
+        max(cb2[24].x, 1e-5));
+    fade *= fade;
+    fade *= fade;
+    return 1.0 - fade * fade;
 }
 
 float MaterialAdjustedVisibility(
@@ -386,85 +375,119 @@ float MaterialAdjustedVisibility(
     return saturate(visibility);
 }
 
+float CorrectedVisibility(
+    float vanillaVisibility,
+    float upgradedVisibility)
+{
+    float strength = max(0.0, ps_TraceDirectStrength);
+    float targetVisibility = saturate(
+        vanillaVisibility +
+        (upgradedVisibility - vanillaVisibility) * strength);
+    float maximumCorrection = saturate(ps_TraceMaxCorrection);
+    return clamp(
+        targetVisibility,
+        vanillaVisibility - maximumCorrection,
+        vanillaVisibility + maximumCorrection);
+}
+
 DeferredOutput main(float4 svPosition : SV_POSITION0)
 {
     DeferredOutput output;
     int2 pixel = int2(svPosition.xy);
+    float4 unshadowedDiffuse = t26.Load(int3(pixel, 0));
+    float4 unshadowedSpecular = t27.Load(int3(pixel, 0));
     float4 isolatedDiffuse = t28.Load(int3(pixel, 0));
     float4 isolatedSpecular = t29.Load(int3(pixel, 0));
-
-    if (all(isolatedDiffuse == 0.0) && all(isolatedSpecular == 0.0))
-    {
-        output.diffuse = 0.0;
-        output.specular = 0.0;
-        return output;
-    }
-
     float2 screenUV = ScreenUV(svPosition);
     float rawDepth = t3.SampleGrad(
         s3_s,
         screenUV,
         ddx_coarse(screenUV),
         ddy_coarse(screenUV)).x;
+    float projectionDepth;
     float3 worldPosition =
-        ReconstructBGSWorldPosition(svPosition, rawDepth);
+        ReconstructBGSWorldPosition(
+            svPosition, rawDepth, projectionDepth);
+    float materialTag =
+        t2.SampleLevel(s2_s, screenUV, 0).w * 255.0;
 
     uint contract = seShadowMapDeferredMode.x;
-    bool pointProjection = contract >= 3;
-    uint filterMode = pointProjection ? contract - 3 : contract;
-    ShadowProjection projection;
-    if (pointProjection)
+    float vanillaRaw;
+    float upgradedRaw;
+    if (contract == 7u)
     {
-        projection = ProjectPoint(worldPosition);
+        ShadowProjection projection =
+            ProjectVisibilityCascade(worldPosition, materialTag);
+        vanillaRaw = VanillaVisibility(projection);
+        upgradedRaw = PCSSVisibility(projection);
     }
     else
     {
-        projection = ProjectPlanar(worldPosition);
-    }
-    if (projection.valid < 0.5)
-    {
-        output.diffuse = isolatedDiffuse;
-        output.specular = isolatedSpecular;
-        return output;
+        ShadowProjection nearProjection =
+            ProjectMainCascade(worldPosition, 0u);
+        ShadowProjection farProjection =
+            ProjectMainCascade(worldPosition, 1u);
+        vanillaRaw = BlendCascades(
+            projectionDepth,
+            VanillaVisibility(nearProjection),
+            VanillaVisibility(farProjection));
+        upgradedRaw = BlendCascades(
+            projectionDepth,
+            PCSSVisibility(nearProjection),
+            PCSSVisibility(farProjection));
     }
 
-    float vanillaRaw = VanillaVisibility(projection, filterMode);
-    float upgradedRaw = PCSSVisibility(projection, filterMode);
-    float materialTag = t2.SampleLevel(s2_s, screenUV, 0).w * 255.0;
-
-    // The isolated source already contains the maintained HachiToon equipment
-    // and character lifts. Reproduce that exact denominator, then add the
-    // face-specific lift only to the upgraded numerator.
+    float fade = DistanceFade(worldPosition);
+    vanillaRaw = 1.0 + fade * (vanillaRaw - 1.0);
+    upgradedRaw = 1.0 + fade * (upgradedRaw - 1.0);
     float vanillaVisibility =
         MaterialAdjustedVisibility(vanillaRaw, materialTag, false);
     float upgradedVisibility =
         MaterialAdjustedVisibility(upgradedRaw, materialTag, true);
+    float targetVisibility =
+        CorrectedVisibility(vanillaVisibility, upgradedVisibility);
 
-    float strength = max(0.0, ps_TraceDirectStrength);
-    float targetVisibility = saturate(
-        vanillaVisibility +
-        (upgradedVisibility - vanillaVisibility) * strength);
-    float maximumCorrection = saturate(ps_TraceMaxCorrection);
-    targetVisibility = clamp(
-        targetVisibility,
-        vanillaVisibility - maximumCorrection,
-        vanillaVisibility + maximumCorrection);
-
-    float ratio;
-    if (vanillaVisibility > 1e-4)
+    if (contract == 7u)
     {
-        ratio = targetVisibility / vanillaVisibility;
+        output.diffuse = targetVisibility.xxxx;
+        output.specular = float4(targetVisibility.xxx, 1.0);
+        return output;
+    }
+
+    // The directional lighting permutation is not a pure direct-light buffer:
+    //
+    //   shadowed   = ambient + direct * vanillaVisibility
+    //   unshadowed = ambient + direct
+    //
+    // The CPU replay supplies both observations. Solve for direct radiance and
+    // change only its visibility, preserving ambient/SH rather than multiplying
+    // the entire deferred result by target/vanilla. At full visibility the two
+    // observations are degenerate, so retain the original instead of inventing
+    // a direct/ambient split.
+    if (vanillaVisibility < 1.0 - 1e-4)
+    {
+        float denominator = max(1.0 - vanillaVisibility, 1e-4);
+        float3 diffuseDirect =
+            max(unshadowedDiffuse.rgb - isolatedDiffuse.rgb, 0.0) /
+            denominator;
+        float3 specularDirect =
+            max(unshadowedSpecular.rgb - isolatedSpecular.rgb, 0.0) /
+            denominator;
+        output.diffuse = isolatedDiffuse;
+        output.specular = isolatedSpecular;
+        output.diffuse.rgb = max(
+            isolatedDiffuse.rgb +
+                diffuseDirect * (targetVisibility - vanillaVisibility),
+            0.0);
+        output.specular.rgb = max(
+            isolatedSpecular.rgb +
+                specularDirect * (targetVisibility - vanillaVisibility),
+            0.0);
     }
     else
     {
-        // Scratch contains only the already shaded light. With no measurable
-        // source visibility there is no validated unshadowed radiance to
-        // reconstruct, so preserve the isolated result instead of inventing
-        // energy through an arbitrary amplification factor.
-        ratio = 1.0;
+        output.diffuse = isolatedDiffuse;
+        output.specular = isolatedSpecular;
     }
-
-    output.diffuse = isolatedDiffuse * ratio;
-    output.specular = isolatedSpecular * ratio;
     return output;
 }

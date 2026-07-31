@@ -156,6 +156,10 @@ struct alignas(16) GFXBoosterAccessData
     // camera-relative contract of ReconstructWorldPos.
     DirectX::XMFLOAT4 g_CurrentCameraPositionAdjust;
     DirectX::XMFLOAT4 g_PreviousCameraPositionAdjust;
+
+    // xy is the logical projection/render extent. zw is the display extent.
+    // They differ under native dynamic resolution and external upscalers.
+    DirectX::XMFLOAT4 g_RenderInfo;
 };
 
 struct alignas(16) DrawTagData

@@ -199,6 +199,22 @@ ThreadGroupDim ParseThreadGroupDim(const std::string& s) {
 bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
                                uint32_t backbufferW, uint32_t backbufferH) {
     if (!device) return false;
+    if (spec.renderDomain) {
+        constexpr float kMinimumRenderExtent = 16.0f;
+        const bool renderExtentValid =
+            std::isfinite(g_customBufferData.g_RenderInfo.x) &&
+            std::isfinite(g_customBufferData.g_RenderInfo.y) &&
+            g_customBufferData.g_RenderInfo.x >= kMinimumRenderExtent &&
+            g_customBufferData.g_RenderInfo.y >= kMinimumRenderExtent;
+        if (renderExtentValid) {
+            const auto renderW = static_cast<uint32_t>(
+                std::round(g_customBufferData.g_RenderInfo.x));
+            const auto renderH = static_cast<uint32_t>(
+                std::round(g_customBufferData.g_RenderInfo.y));
+            backbufferW = renderW;
+            backbufferH = renderH;
+        }
+    }
     uint32_t targetW = 0, targetH = 0;
     ResolveScale(spec.scaleMode, spec.scaleDiv, spec.absWidth, spec.absHeight,
                  backbufferW, backbufferH, targetW, targetH);
@@ -255,6 +271,12 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
             Release(); return false;
         }
     }
+    REX::INFO(
+        "CustomPass::Resource[{}]: allocated {}x{} (domain={})",
+        spec.name,
+        width,
+        height,
+        spec.renderDomain ? "render" : "allocation");
     return true;
 }
 
@@ -426,6 +448,7 @@ bool Registry::ParseResourceSection(const std::string& name,
 
         if      (lk == "format")          res->spec.format = ParseFormat(value);
         else if (lk == "scale")           ParseScale(value, res->spec.scaleMode, res->spec.scaleDiv, res->spec.absWidth, res->spec.absHeight);
+        else if (lk == "domain")          res->spec.renderDomain = (ToLower(value) == "render");
         else if (lk == "miplevels")       { try { res->spec.mipLevels = static_cast<uint32_t>(std::stoul(value)); } catch (...) {} }
         else if (lk == "srvslot")         { try { res->spec.srvSlot = std::stoi(value); } catch (...) {} }
         else if (lk == "global" || lk == "globalbind") res->spec.globalBind = (ToLower(value) == "true" || value == "1");
@@ -452,8 +475,11 @@ bool Registry::ParseResourceSection(const std::string& name,
         hasGlobalResourceBindings.store(true, std::memory_order_release);
     }
     resources.push_back(std::move(res));
-    REX::INFO("CustomPass: registered customResource '{}' (slot t{}, global={})",
-        name, raw->spec.srvSlot, raw->spec.globalBind ? "true" : "false");
+    REX::INFO("CustomPass: registered customResource '{}' (slot t{}, global={}, domain={})",
+        name,
+        raw->spec.srvSlot,
+        raw->spec.globalBind ? "true" : "false",
+        raw->spec.renderDomain ? "render" : "allocation");
     return true;
 }
 

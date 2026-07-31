@@ -27,7 +27,8 @@ first use and survive across frames.
 ; --- Format & geometry ---
 format=R11G11B10_FLOAT      ; DXGI_FORMAT_*; R11G11B10_FLOAT, R16G16B16A16_FLOAT,
                             ;                R8G8B8A8_UNORM, R32_FLOAT, etc.
-scale=screen/2              ; "screen" | "screen/N" | "WxH"   (relative to renderTargets[3])
+scale=screen/2              ; "screen" | "screen/N" | "WxH"
+domain=allocation           ; "allocation" (default) | "render"
 mipLevels=1                 ; default 1
 ; --- Bindings ---
 srvSlot=40                  ; t-slot bound globally to replacement PS/VS shaders.
@@ -43,6 +44,13 @@ copyAt=                     ; "present" | "" (none)
 persistent=true             ; if false, resource is recreated on each pass fire
 [/customResource:giCurrent]
 ```
+
+`domain=allocation` resolves `screen` against the currently available
+`renderTargets[3]` allocation. `domain=render` instead resolves it against the
+logical projection extent injected by ShaderEngine. Use the render domain for
+screen-space history and ray-tracing fields: under an external upscaler some
+engine textures (notably RT39, the depth pyramid) retain display-sized
+allocations even though the G-buffer projection is reduced.
 
 ### `pingpong` rule
 
