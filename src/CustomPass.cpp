@@ -211,8 +211,12 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
                 std::round(g_customBufferData.g_RenderInfo.x));
             const auto renderH = static_cast<uint32_t>(
                 std::round(g_customBufferData.g_RenderInfo.y));
-            backbufferW = renderW;
-            backbufferH = renderH;
+            // The injected domain is renderer telemetry, not permission to
+            // allocate beyond the live kMain contract. This also makes a mode
+            // transition fail safely if the injected buffer and the renderer
+            // briefly disagree for one frame.
+            backbufferW = (std::min)(renderW, backbufferW);
+            backbufferH = (std::min)(renderH, backbufferH);
         }
     }
     uint32_t targetW = 0, targetH = 0;

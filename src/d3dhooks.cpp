@@ -436,10 +436,11 @@ void UpdateCustomBuffer_Internal() {
     auto gfxState = RE::BSGraphics::State::GetSingleton();
     auto& camState = *SelectGameplayCameraState(gfxState); // CameraStateData
     auto& camView  = camState.camViewData;        // viewMat, viewDir, viewUp, viewRight, viewPort
-    // viewport
+    // Camera viewport. This is exposed to shaders for camera-space effects,
+    // but it is not a reliable render-domain authority: external upscalers can
+    // leave it at their previous reduced resolution when switching to a
+    // native-resolution AA mode.
     auto vp = camView.viewPort;
-    float vpX = vp.left, vpY = vp.top;
-    float vpW = vp.right - vp.left, vpH = vp.bottom - vp.top;
     // forward vector -> yaw/pitch
     auto vd = camView.viewDir;
     float vx = vd.m128_f32[0], vy = vd.m128_f32[1], vz = vd.m128_f32[2];
@@ -720,9 +721,16 @@ void UpdateCustomBuffer_Internal() {
         0.0f
     };
 
-    // Resolve the projection domain using the same precedence as the
-    // upscaler-aware deferred shadow path:
-    //   physical proxy allocation > native DRS ratio > reduced viewport.
+    // Resolve the projection domain from renderer-owned contracts:
+    //   physical proxy allocation > active native DRS ratio > allocation.
+    //
+    // Do not infer it from CameraStateData::viewPort. The upscaler can retain
+    // a Quality-mode camera viewport (for example 1280x720) after switching to
+    // DLAA while kMain and the depth target are already native 1920x1080.
+    // Treating that stale viewport as the projection domain clipped custom
+    // composites to the top-left 2/3 of the frame. BGS explicitly publishes
+    // whether its dynamic-resolution ratio is active; only consume the ratio
+    // under that contract.
     // Fallout's depth pyramid (RT39) is not proxy-swapped by the upscaler, so
     // shaders need this extent separately from any individual texture size.
     const float displayW = gfxState.screenWidth > 0
@@ -743,37 +751,22 @@ void UpdateCustomBuffer_Internal() {
         renderTargetManager.dynamicHeightRatio <= 1.0f
             ? renderTargetManager.dynamicHeightRatio
             : 1.0f;
+    const bool dynamicResolutionActive =
+        renderTargetManager.isDynamicResolutionCurrentlyActivated;
     constexpr float kMinimumRenderExtent = 16.0f;
     const bool physicalExtentValid =
         std::isfinite(resX) &&
         std::isfinite(resY) &&
         resX >= kMinimumRenderExtent &&
         resY >= kMinimumRenderExtent;
-    const bool viewportExtentValid =
-        std::isfinite(vpW) &&
-        std::isfinite(vpH) &&
-        vpW >= kMinimumRenderExtent &&
-        vpH >= kMinimumRenderExtent &&
-        vpW <= displayW + 1.0f &&
-        vpH <= displayH + 1.0f;
     const bool proxyAllocation =
         physicalExtentValid &&
         (resX + 0.5f < displayW || resY + 0.5f < displayH);
     const bool dynamicRatio =
-        dynamicWidthRatio < 0.999f || dynamicHeightRatio < 0.999f;
-    const bool reducedViewport =
-        viewportExtentValid &&
-        (vpW + 0.5f < displayW || vpH + 0.5f < displayH);
-    struct StableRenderDomain
-    {
-        float renderW = 0.0f;
-        float renderH = 0.0f;
-        float displayW = 0.0f;
-        float displayH = 0.0f;
-    };
-    static StableRenderDomain stableRenderDomain{};
-    float renderW = resX;
-    float renderH = resY;
+        dynamicResolutionActive &&
+        (dynamicWidthRatio < 0.999f || dynamicHeightRatio < 0.999f);
+    float renderW = physicalExtentValid ? resX : displayW;
+    float renderH = physicalExtentValid ? resY : displayH;
     if (proxyAllocation) {
         renderW = resX;
         renderH = resY;
@@ -782,51 +775,13 @@ void UpdateCustomBuffer_Internal() {
             1.0f, std::floor(displayW * dynamicWidthRatio));
         renderH = (std::max)(
             1.0f, std::floor(displayH * dynamicHeightRatio));
-    } else if (reducedViewport) {
-        renderW = std::round(vpW);
-        renderH = std::round(vpH);
-    } else if (!viewportExtentValid) {
-        // Loading screens and image-space transitions can publish a camera
-        // viewport with one zero-sized axis while the upscaler temporarily
-        // forces the DRS ratios to 1.0. Treating that as a reduced viewport
-        // collapsed render-domain custom resources to 1x1. Retain the last
-        // trustworthy domain for the same display instead.
-        const bool sameDisplay =
-            std::abs(stableRenderDomain.displayW - displayW) < 0.5f &&
-            std::abs(stableRenderDomain.displayH - displayH) < 0.5f;
-        if (sameDisplay &&
-            stableRenderDomain.renderW >= kMinimumRenderExtent &&
-            stableRenderDomain.renderH >= kMinimumRenderExtent) {
-            renderW = stableRenderDomain.renderW;
-            renderH = stableRenderDomain.renderH;
-        } else {
-            renderW = physicalExtentValid ? resX : displayW;
-            renderH = physicalExtentValid ? resY : displayH;
-        }
     }
     if (renderW < kMinimumRenderExtent ||
         renderH < kMinimumRenderExtent ||
         !std::isfinite(renderW) ||
         !std::isfinite(renderH)) {
-        const bool sameDisplay =
-            std::abs(stableRenderDomain.displayW - displayW) < 0.5f &&
-            std::abs(stableRenderDomain.displayH - displayH) < 0.5f;
-        if (sameDisplay &&
-            stableRenderDomain.renderW >= kMinimumRenderExtent &&
-            stableRenderDomain.renderH >= kMinimumRenderExtent) {
-            renderW = stableRenderDomain.renderW;
-            renderH = stableRenderDomain.renderH;
-        } else {
-            renderW = physicalExtentValid ? resX : displayW;
-            renderH = physicalExtentValid ? resY : displayH;
-        }
-    }
-    if (renderW >= kMinimumRenderExtent &&
-        renderH >= kMinimumRenderExtent) {
-        stableRenderDomain.renderW = renderW;
-        stableRenderDomain.renderH = renderH;
-        stableRenderDomain.displayW = displayW;
-        stableRenderDomain.displayH = displayH;
+        renderW = displayW;
+        renderH = displayH;
     }
     g_customBufferData.g_RenderInfo = {
         renderW,
