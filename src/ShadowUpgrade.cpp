@@ -5,7 +5,6 @@
 #include <Global.h>
 #include <LightSorter.h>
 #include <PhaseTelemetry.h>
-#include <TiledDeferredLighting.h>
 #include <hooks.h>
 
 #include <array>
@@ -66,7 +65,6 @@ struct ScopedDeferredLighting
     ScopedDeferredLighting() noexcept
     {
         ++s_deferredLightingDepth;
-        TiledDeferredLighting::BeginDeferredLights();
         PhaseTelemetry::BeginDeferredLightsImpl();
         LightSorter::OnEnter();
     }
@@ -75,7 +73,6 @@ struct ScopedDeferredLighting
     {
         LightSorter::OnExit();
         PhaseTelemetry::EndDeferredLightsImpl();
-        TiledDeferredLighting::EndDeferredLights();
         if (s_deferredLightingDepth > 0) {
             --s_deferredLightingDepth;
         }

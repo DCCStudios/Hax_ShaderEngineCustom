@@ -1,8 +1,6 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
-#include <ShadowMapDeferredLighting.h>
-#include <TiledDeferredLighting.h>
 #include "d3dhooks.h"
 #include <hooks.h>
 #include <PhaseTelemetry.h>
@@ -2767,8 +2765,6 @@ namespace
             }
         }
 
-        ShadowMapDeferredLighting::ObservePass(pass);
-        TiledDeferredLighting::ObserveComposite(pass);
         OriginalBSBatchRendererDraw(
             pass, unk2, unk3, dynamicDrawData);
         if (needsDrawTag) {
@@ -3697,16 +3693,6 @@ void HookedBSDFTiledLightingAddLight(std::uint32_t id,
     }
     OriginalBSDFTiledLightingAddLight(id, pos, adjusted, color, dir,
                                       flagA, flagB, flagC, flagD);
-    TiledDeferredLighting::RecordLight(
-        id,
-        pos,
-        adjusted,
-        color,
-        dir,
-        flagA,
-        flagB,
-        flagC,
-        flagD);
 }
 
 // Engine entry to BSDFLightShader::SetupPointLightGeometry. Transiently scales

@@ -103,6 +103,8 @@ LIGHT_SORTER_MODE=off
 ;shaderUID=PS1A2B3C4DI3O2    ; Unique identifier for the shader, used for matching and logging, can be more than one comma separated values
 ;hash=0x8D118ECC             ; vector of exact match of expected hash of the original shader bytecode for detection (can be obtained from logs or dumps)
 ;asmHash=0x12345678          ; vector of exact match of expected hash of the original shader assembly for detection (can be obtained from logs or dumps)
+;fxpShaderType=4             ; exact native BSShader family (OG: 4=DFLight, 6=DFComposite)
+;fxpPixelShaderID=0x00200220 ; exact permutation key selected from Shaders011.fxp; comma separated values are accepted
 ;size=(>1024), (<4096)       ; size definitions for the shader bytecode, can specify multiple separated by commas for multiple acceptable sizes (e.g. (512), (>1024), (<4096)), or leave empty to ignore size check
 ;buffersize=368@2            ; exact match of expected buffer size for the shader (size@slot), can specify multiple separated by commas for multiple buffers
 ;textures=2,4                ; list of texture register slots used by the shader (e.g. 0,1,2 or 4,5 for t0,t1,t2 or t4,t5)
@@ -917,7 +919,19 @@ void IncludeDirWatcher::Check() {
     if (now == snapshot) return;
     snapshot = std::move(now);
     ShaderCache::InvalidateIncludeMemo();
-    REX::INFO("IncludeDirWatcher: detected change under '{}', invalidated include memo", dir.string());
+    std::size_t reloadCount = 0;
+    {
+        std::shared_lock lock(g_shaderDefinitions.mutex);
+        for (auto* def : g_shaderDefinitions.definitions) {
+            if (def && def->active && def->hlslFileWatcher) {
+                def->hlslFileWatcher->RequestReload();
+                ++reloadCount;
+            }
+        }
+    }
+    REX::INFO(
+        "IncludeDirWatcher: detected change under '{}', invalidated include memo and marked {} replacement shader(s) for reload",
+        dir.string(), reloadCount);
 }
 
 // --- PrecompileWorker implementation ------------------------------------

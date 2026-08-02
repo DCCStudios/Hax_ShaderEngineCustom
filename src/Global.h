@@ -248,6 +248,9 @@ public:
     bool ConsumeReloadRequest() {
         return reloadRequested.exchange(false, std::memory_order_acq_rel);
     }
+    void RequestReload() {
+        reloadRequested.store(true, std::memory_order_release);
+    }
     void Check() {
         try {
             if (!std::filesystem::exists(filePath)) return;

@@ -26,6 +26,7 @@ namespace Hooks
         extern REL::Relocation<std::uintptr_t> RegisterObjectShadowMapOrMask;
         extern REL::Relocation<std::uintptr_t> RegisterPassGeometryGroup;
         extern REL::Relocation<std::uintptr_t> BuildCommandBuffer;
+        extern REL::Relocation<std::uintptr_t> BSShaderLoad;
         extern REL::Relocation<std::uintptr_t> BSLightTestFrustumCull;
         extern REL::Relocation<std::uintptr_t> TryAddTiledLightLambda;
         extern REL::Relocation<std::uintptr_t> SetupPointLightGeometry;

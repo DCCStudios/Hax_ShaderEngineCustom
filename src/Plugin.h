@@ -486,6 +486,8 @@ struct ShaderDefinition {
         , shaderUID(std::move(other.shaderUID))
         , hash(std::move(other.hash))
         , asmHash(std::move(other.asmHash))
+        , fxpPixelShaderID(std::move(other.fxpPixelShaderID))
+        , fxpShaderType(std::move(other.fxpShaderType))
         , sizeRequirements(std::move(other.sizeRequirements))
         , bufferSizes(std::move(other.bufferSizes))
         , textureSlots(std::move(other.textureSlots))
@@ -537,6 +539,10 @@ struct ShaderDefinition {
     std::vector<std::string> shaderUID = {};
     std::vector<std::uint32_t> hash = {};
     std::vector<std::uint32_t> asmHash = {};
+    // Exact native FXP identity. Unlike bytecode hashes, these are the keys
+    // BGS itself uses to select a permutation from a BSShader family.
+    std::vector<std::uint32_t> fxpPixelShaderID = {};
+    std::vector<std::uint32_t> fxpShaderType = {};
     std::vector<SizeRequirement> sizeRequirements;
     std::vector<std::pair<int, int>> bufferSizes;
     std::vector<int> textureSlots;
@@ -633,6 +639,10 @@ struct ShaderDBEntry {
         , shaderUID(other.shaderUID)
         , hash(other.hash)
         , asmHash(other.asmHash)
+        , fxpPixelShaderID(other.fxpPixelShaderID)
+        , hasFxpPixelShaderID(other.hasFxpPixelShaderID)
+        , fxpShaderType(other.fxpShaderType)
+        , hasFxpShaderType(other.hasFxpShaderType)
         , size(other.size)
         , textureSlots(std::move(other.textureSlots))
         , textureDimensions(std::move(other.textureDimensions))
@@ -663,6 +673,10 @@ struct ShaderDBEntry {
             shaderUID = std::move(other.shaderUID);
             hash = other.hash;
             asmHash = other.asmHash;
+            fxpPixelShaderID = other.fxpPixelShaderID;
+            hasFxpPixelShaderID = other.hasFxpPixelShaderID;
+            fxpShaderType = other.fxpShaderType;
+            hasFxpShaderType = other.hasFxpShaderType;
             size = other.size;
             textureSlots = std::move(other.textureSlots);
             textureDimensions = std::move(other.textureDimensions);
@@ -693,6 +707,14 @@ struct ShaderDBEntry {
     std::string shaderUID = "";
     std::uint32_t hash = 0;
     std::uint32_t asmHash = 0;
+    // Native Shaders011.fxp lookup key read from BSGraphics::PixelShader+0.
+    // Zero for non-pixel shaders and pixel shaders not loaded by BGS FXP.
+    std::uint32_t fxpPixelShaderID = 0;
+    bool hasFxpPixelShaderID = false;
+    // Owning BSShader table. FXP permutation keys are only unique inside this
+    // family (4=DFLight, 6=DFComposite on OG).
+    std::uint32_t fxpShaderType = 0;
+    bool hasFxpShaderType = false;
     std::size_t size = 0;
     std::uint32_t expectedCBSizes[14] = {0};
     std::vector<int> textureSlots = {};
@@ -968,7 +990,15 @@ static_assert(offsetof(BSRenderPassLayout, listNext) == 0x38);
 static_assert(offsetof(BSRenderPassLayout, passGroupNext) == 0x40);
 static_assert(offsetof(BSRenderPassLayout, techniqueID) == 0x48);
 
-ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, REX::W32::ID3D11VertexShader* vertexShader, std::vector<uint8_t> bytecode, SIZE_T BytecodeLength);
+ShaderDBEntry AnalyzeShader_Internal(
+    REX::W32::ID3D11PixelShader* pixelShader,
+    REX::W32::ID3D11VertexShader* vertexShader,
+    std::vector<uint8_t> bytecode,
+    SIZE_T bytecodeLength,
+    std::uint32_t fxpPixelShaderID = 0,
+    bool hasFxpPixelShaderID = false,
+    std::uint32_t fxpShaderType = 0,
+    bool hasFxpShaderType = false);
 bool CompileShader_Internal(ShaderDefinition* def);
 bool DoesEntryMatchDefinition_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);
 void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);

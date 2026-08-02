@@ -11,9 +11,7 @@
 #include <RenderTargets.h>
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
-#include <ShadowMapDeferredLighting.h>
 #include <ShadowTelemetry.h>
-#include <TiledDeferredLighting.h>
 
 extern HWND g_outputWindow;
 extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
@@ -61,88 +59,33 @@ namespace
     constexpr UINT kReplayVertexBufferSlots = 32;
     constexpr std::chrono::seconds kReplayMapTelemetryInterval{ 2 };
 
-    struct DrawIndexedPayload
-    {
-        UINT indexCount;
-        UINT startIndexLocation;
-        INT baseVertexLocation;
-    };
+    using BSShaderLoad_t = void (*)(void* shader, void* stream);
+    BSShaderLoad_t s_originalBSShaderLoad = nullptr;
+    thread_local std::uint32_t s_loadingFxpShaderType = 0;
+    thread_local bool s_hasLoadingFxpShaderType = false;
 
-    struct DrawPayload
+    void HookedBSShaderLoad(void* shader, void* stream)
     {
-        UINT vertexCount;
-        UINT startVertexLocation;
-    };
+        const auto previousType = s_loadingFxpShaderType;
+        const auto previousValid = s_hasLoadingFxpShaderType;
+        if (shader) {
+            // IDA-derived BSShader layout on OG: every concrete constructor
+            // writes its ShaderEnum to this+0x18 after BSShader(name). Examples:
+            // BSDFLightShader @ 0x1428C020F writes 4; BSDFCompositeShader
+            // @ 0x142876299 writes 6.
+            std::memcpy(
+                &s_loadingFxpShaderType,
+                static_cast<const std::byte*>(shader) + 0x18,
+                sizeof(s_loadingFxpShaderType));
+            s_hasLoadingFxpShaderType = true;
+        } else {
+            s_loadingFxpShaderType = 0;
+            s_hasLoadingFxpShaderType = false;
+        }
 
-    struct DrawIndexedInstancedPayload
-    {
-        UINT indexCountPerInstance;
-        UINT instanceCount;
-        UINT startIndexLocation;
-        INT baseVertexLocation;
-        UINT startInstanceLocation;
-    };
-
-    struct DrawInstancedPayload
-    {
-        UINT vertexCountPerInstance;
-        UINT instanceCount;
-        UINT startVertexLocation;
-        UINT startInstanceLocation;
-    };
-
-    void ReplayDrawIndexed(
-        REX::W32::ID3D11DeviceContext* context,
-        const void* rawPayload) noexcept
-    {
-        const auto& args =
-            *static_cast<const DrawIndexedPayload*>(rawPayload);
-        D3D11Hooks::OriginalDrawIndexed(
-            context,
-            args.indexCount,
-            args.startIndexLocation,
-            args.baseVertexLocation);
-    }
-
-    void ReplayDraw(
-        REX::W32::ID3D11DeviceContext* context,
-        const void* rawPayload) noexcept
-    {
-        const auto& args =
-            *static_cast<const DrawPayload*>(rawPayload);
-        D3D11Hooks::OriginalDraw(
-            context,
-            args.vertexCount,
-            args.startVertexLocation);
-    }
-
-    void ReplayDrawIndexedInstanced(
-        REX::W32::ID3D11DeviceContext* context,
-        const void* rawPayload) noexcept
-    {
-        const auto& args =
-            *static_cast<const DrawIndexedInstancedPayload*>(rawPayload);
-        D3D11Hooks::OriginalDrawIndexedInstanced(
-            context,
-            args.indexCountPerInstance,
-            args.instanceCount,
-            args.startIndexLocation,
-            args.baseVertexLocation,
-            args.startInstanceLocation);
-    }
-
-    void ReplayDrawInstanced(
-        REX::W32::ID3D11DeviceContext* context,
-        const void* rawPayload) noexcept
-    {
-        const auto& args =
-            *static_cast<const DrawInstancedPayload*>(rawPayload);
-        D3D11Hooks::OriginalDrawInstanced(
-            context,
-            args.vertexCountPerInstance,
-            args.instanceCount,
-            args.startVertexLocation,
-            args.startInstanceLocation);
+        s_originalBSShaderLoad(shader, stream);
+        s_loadingFxpShaderType = previousType;
+        s_hasLoadingFxpShaderType = previousValid;
     }
 
     struct ReplaySRVCallCache
@@ -1883,7 +1826,11 @@ void D3D11OnCreatePixelShader_Internal(
     HRESULT hr,
     const void* shaderBytecode,
     SIZE_T bytecodeLength,
-    REX::W32::ID3D11PixelShader** pixelShader)
+    REX::W32::ID3D11PixelShader** pixelShader,
+    std::uint32_t fxpPixelShaderID,
+    bool hasFxpPixelShaderID,
+    std::uint32_t fxpShaderType,
+    bool hasFxpShaderType)
 {
     if (REX::W32::SUCCESS(hr) && pixelShader && *pixelShader) {
         std::vector<uint8_t> bytecode(bytecodeLength);
@@ -1891,8 +1838,27 @@ void D3D11OnCreatePixelShader_Internal(
         if (g_ShaderDB.HasEntry(*pixelShader)) {
             return;
         }
-        ShaderDBEntry entry = AnalyzeShader_Internal(*pixelShader, nullptr, std::move(bytecode), bytecodeLength);
+        ShaderDBEntry entry = AnalyzeShader_Internal(
+            *pixelShader,
+            nullptr,
+            std::move(bytecode),
+            bytecodeLength,
+            fxpPixelShaderID,
+            hasFxpPixelShaderID,
+            fxpShaderType,
+            hasFxpShaderType);
         g_ShaderDB.AddShaderEntry(std::move(entry));
+        if (hasFxpPixelShaderID) {
+            static std::atomic_bool loggedFxpCapture{ false };
+            if (!loggedFxpCapture.exchange(
+                    true, std::memory_order_relaxed)) {
+                REX::INFO(
+                    "ShaderEngine: captured native Shaders011.fxp pixel "
+                    "shader IDs (first family={}, key=0x{:08X})",
+                    hasFxpShaderType ? fxpShaderType : 0xFFFFFFFFu,
+                    fxpPixelShaderID);
+            }
+        }
     }
 }
 
@@ -2142,18 +2108,14 @@ namespace
         INT baseVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexed");
-        const DrawIndexedPayload payload{
-            indexCount, startIndexLocation, baseVertexLocation
-        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
-                        context, ReplayDrawIndexed, &payload) &&
-                    !TiledDeferredLighting::TryRenderLiveComposite(
-                        context, ReplayDrawIndexed, &payload)) {
-                    ReplayDrawIndexed(context, &payload);
-                }
+                D3D11Hooks::OriginalDrawIndexed(
+                    context,
+                    indexCount,
+                    startIndexLocation,
+                    baseVertexLocation);
             });
     }
 
@@ -2163,16 +2125,11 @@ namespace
         UINT startVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-Draw");
-        const DrawPayload payload{ vertexCount, startVertexLocation };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
-                        context, ReplayDraw, &payload) &&
-                    !TiledDeferredLighting::TryRenderLiveComposite(
-                        context, ReplayDraw, &payload)) {
-                    ReplayDraw(context, &payload);
-                }
+                D3D11Hooks::OriginalDraw(
+                    context, vertexCount, startVertexLocation);
             });
     }
 
@@ -2185,22 +2142,16 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexedInstanced");
-        const DrawIndexedInstancedPayload payload{
-            indexCountPerInstance,
-            instanceCount,
-            startIndexLocation,
-            baseVertexLocation,
-            startInstanceLocation
-        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
-                        context, ReplayDrawIndexedInstanced, &payload) &&
-                    !TiledDeferredLighting::TryRenderLiveComposite(
-                        context, ReplayDrawIndexedInstanced, &payload)) {
-                    ReplayDrawIndexedInstanced(context, &payload);
-                }
+                D3D11Hooks::OriginalDrawIndexedInstanced(
+                    context,
+                    indexCountPerInstance,
+                    instanceCount,
+                    startIndexLocation,
+                    baseVertexLocation,
+                    startInstanceLocation);
             });
     }
 
@@ -2212,21 +2163,15 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawInstanced");
-        const DrawInstancedPayload payload{
-            vertexCountPerInstance,
-            instanceCount,
-            startVertexLocation,
-            startInstanceLocation
-        };
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                if (!ShadowMapDeferredLighting::TryRenderLiveDraw(
-                        context, ReplayDrawInstanced, &payload) &&
-                    !TiledDeferredLighting::TryRenderLiveComposite(
-                        context, ReplayDrawInstanced, &payload)) {
-                    ReplayDrawInstanced(context, &payload);
-                }
+                D3D11Hooks::OriginalDrawInstanced(
+                    context,
+                    vertexCountPerInstance,
+                    instanceCount,
+                    startVertexLocation,
+                    startInstanceLocation);
             });
     }
 
@@ -2449,8 +2394,47 @@ namespace
             return D3D11Hooks::OriginalCreatePixelShader(device, shaderBytecode, bytecodeLength, classLinkage, pixelShader);
         }
 
+        std::uint32_t fxpPixelShaderID = 0;
+        bool hasFxpPixelShaderID = false;
+        std::uint32_t fxpShaderType = 0;
+        bool hasFxpShaderType = false;
+        // IDA, Fallout 4 OG 1.10.163:
+        // Renderer::CreatePixelShaderFromStream @ 0x141D10D40 reads the FXP
+        // key into BSGraphics::PixelShader+0, then calls ID3D11Device::
+        // CreatePixelShader at 0x141D10EA0 with the output pointer set to
+        // wrapper+8. The indirect call returns at +0x164. Limit the wrapper
+        // read to that exact, version-checked call; custom/Shader.ini shader
+        // creation keeps the zero non-FXP identity.
+        if (REX::FModule::IsRuntimeOG() &&
+            REX::FModule::GetExecutingModule().GetFileVersion() ==
+                REL::Version{ 1, 10, 163, 0 }) {
+            static REL::Relocation<std::uintptr_t>
+                createPixelShaderFromStream{ REL::ID{ 957517, 0 } };
+            const auto returnAddress =
+                reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+            if (returnAddress ==
+                    createPixelShaderFromStream.address() + 0x164 &&
+                pixelShader) {
+                std::memcpy(
+                    &fxpPixelShaderID,
+                    reinterpret_cast<const std::byte*>(pixelShader) - 8,
+                    sizeof(fxpPixelShaderID));
+                hasFxpPixelShaderID = true;
+                fxpShaderType = s_loadingFxpShaderType;
+                hasFxpShaderType = s_hasLoadingFxpShaderType;
+            }
+        }
+
         const HRESULT hr = D3D11Hooks::OriginalCreatePixelShader(device, shaderBytecode, bytecodeLength, classLinkage, pixelShader);
-        D3D11OnCreatePixelShader_Internal(hr, shaderBytecode, bytecodeLength, pixelShader);
+        D3D11OnCreatePixelShader_Internal(
+            hr,
+            shaderBytecode,
+            bytecodeLength,
+            pixelShader,
+            fxpPixelShaderID,
+            hasFxpPixelShaderID,
+            fxpShaderType,
+            hasFxpShaderType);
         return hr;
     }
 
@@ -2660,6 +2644,54 @@ bool InstallShaderCreationHooks_Internal()
     D3D11Hooks::OriginalClipCursor =
         *reinterpret_cast<D3D11Hooks::ClipCursor_t*>(Hooks::Addresses::ClipCursor.address());
     Hooks::Addresses::ClipCursor.write_vfunc(0, &HookedClipCursor);
+
+    if (REX::FModule::IsRuntimeOG() && !s_originalBSShaderLoad) {
+        // IDA, Fallout 4 OG 1.10.163:
+        // BSShader::Load(BSIStream*) @ 0x142891450, REL ID 101507.
+        // ABI: this=RCX, stream=RDX. The first 14 bytes contain no RIP-
+        // relative operands and end exactly after `sub rsp,68h`:
+        //   48 8B C4             mov rax,rsp
+        //   48 89 48 08          mov [rax+8],rcx
+        //   57                   push rdi
+        //   41 55                push r13
+        //   48 83 EC 68          sub rsp,68h
+        // The hook is observe-only: it publishes this+0x18 as TLS context
+        // while the original synchronously creates this family's shaders.
+        constexpr std::array<std::uint8_t, 14> expectedPrologue{
+            0x48, 0x8B, 0xC4,
+            0x48, 0x89, 0x48, 0x08,
+            0x57,
+            0x41, 0x55,
+            0x48, 0x83, 0xEC, 0x68
+        };
+        const auto address = Hooks::Addresses::BSShaderLoad.address();
+        if (std::memcmp(
+                reinterpret_cast<const void*>(address),
+                expectedPrologue.data(),
+                expectedPrologue.size()) != 0) {
+            REX::WARN(
+                "InstallShaderCreationHooks_Internal: BSShader::Load @ "
+                "{:#x} failed expected-byte validation; FXP family "
+                "identity unavailable",
+                address);
+            return false;
+        }
+
+        s_originalBSShaderLoad =
+            Hooks::CreateBranchGateway5<BSShaderLoad_t>(
+                Hooks::Addresses::BSShaderLoad,
+                expectedPrologue.size(),
+                reinterpret_cast<void*>(&HookedBSShaderLoad));
+        if (!s_originalBSShaderLoad) {
+            REX::WARN(
+                "InstallShaderCreationHooks_Internal: failed to install "
+                "BSShader::Load identity hook");
+            return false;
+        }
+        REX::INFO(
+            "InstallShaderCreationHooks_Internal: BSShader::Load FXP "
+            "family identity hook installed");
+    }
 
     return true;
 }

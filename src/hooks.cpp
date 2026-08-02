@@ -25,6 +25,7 @@ namespace Hooks
         REL::Relocation<std::uintptr_t> RegisterObjectShadowMapOrMask{ REL::ID{ 1071289, 2317861 } };
         REL::Relocation<std::uintptr_t> RegisterPassGeometryGroup{ REL::ID{ 197098, 0 } };
         REL::Relocation<std::uintptr_t> BuildCommandBuffer{ REL::ID{ 833764, 2318870 } };
+        REL::Relocation<std::uintptr_t> BSShaderLoad{ REL::ID{ 101507, 0 } }; // OG 1.10.163: 0x142891450; AE unconfirmed
         REL::Relocation<std::uintptr_t> BSLightTestFrustumCull{ REL::ID{ 1440624, 0 } };
         REL::Relocation<std::uintptr_t> TryAddTiledLightLambda{ REL::ID{ 999390, 0 } };
         REL::Relocation<std::uintptr_t> SetupPointLightGeometry{ REL::ID{ 212931, 0 } };

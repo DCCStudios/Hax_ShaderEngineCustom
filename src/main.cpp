@@ -1,7 +1,5 @@
 #include <Global.h>
 #include <CustomPass.h>
-#include <ShadowMapDeferredLighting.h>
-#include <TiledDeferredLighting.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
@@ -661,6 +659,39 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                             def.asmHash.push_back(ParseHexFormID(segment));
                         } catch (...) {
                             REX::WARN("LoadShaderDefinitionsFromFile: Invalid asmHash for {}: {}", shaderId, segment);
+                        }
+                    }
+                }
+                else if (lowerKey == "fxppixelshaderid" ||
+                         lowerKey == "fxpshaderid") {
+                    std::stringstream ss(value);
+                    std::string segment;
+                    while (std::getline(ss, segment, ',')) {
+                        try {
+                            def.fxpPixelShaderID.push_back(
+                                ParseHexFormID(segment));
+                        } catch (...) {
+                            REX::WARN(
+                                "LoadShaderDefinitionsFromFile: Invalid "
+                                "fxpPixelShaderID for {}: {}",
+                                shaderId,
+                                segment);
+                        }
+                    }
+                }
+                else if (lowerKey == "fxpshadertype") {
+                    std::stringstream ss(value);
+                    std::string segment;
+                    while (std::getline(ss, segment, ',')) {
+                        try {
+                            def.fxpShaderType.push_back(
+                                ParseHexFormID(segment));
+                        } catch (...) {
+                            REX::WARN(
+                                "LoadShaderDefinitionsFromFile: Invalid "
+                                "fxpShaderType for {}: {}",
+                                shaderId,
+                                segment);
                         }
                     }
                 }
@@ -1490,8 +1521,6 @@ void ReloadAllShaderDefinitions_Internal() {
     // ComputeKey / D3DCompile picks up any include edits the user made
     // alongside their Shader.ini change.
     ShaderCache::InvalidateIncludeMemo();
-    ShadowMapDeferredLighting::InvalidateShader();
-    TiledDeferredLighting::InvalidateShader();
     // Remove all connections ShaderDB <> ShaderDefDB
     g_ShaderDB.UnmatchAll();
     // STOP and destroy all file watchers BEFORE processing new INI files
@@ -1749,8 +1778,6 @@ extern "C"
         LightCullPolicy::Shutdown();
         // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
         GpuScalar::Shutdown();
-        ShadowMapDeferredLighting::Shutdown();
-        TiledDeferredLighting::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }
