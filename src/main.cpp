@@ -2,6 +2,7 @@
 #include <CustomPass.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
+#include <LocalLightBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
@@ -1672,6 +1673,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // the user presses Numpad *; D3D resources are allocated lazily on first
     // capture, so it's safe to call this before the renderer is up.
     LightTracker::Initialize();
+    LocalLightBridge::Initialize();
     // Cull-policy module: arms BSLight::TestFrustumCull to consult active
     // shader rules for an optional bound-radius scale value. Side-effect-free
     // until a Shader.ini block sets `lightCullRadiusScaleValue` AND that
@@ -1773,6 +1775,7 @@ extern "C"
         }
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
+        LocalLightBridge::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
         // during teardown bails out of the slow path cheaply.
         LightCullPolicy::Shutdown();

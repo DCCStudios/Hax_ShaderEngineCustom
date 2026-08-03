@@ -6,6 +6,7 @@
 #include <GpuScalar.h>
 #include <hooks.h>
 #include <ImguiMenu.h>
+#include <LocalLightBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <RenderTargets.h>
@@ -928,6 +929,9 @@ void D3D11OnPresent_Internal()
         // probes see the same per-frame data as regular customPass shaders.
         GpuScalar::OnFramePresent(g_rendererData->context);
     }
+    // AtPresent passes consume the completed frame's list above. Clear the
+    // tiled records and age the retained non-tiled BSLight cache.
+    LocalLightBridge::OnFramePresent();
     UIRenderFrame();
 }
 
@@ -1628,7 +1632,7 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
 
     // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
     // scissor / cb2 / SRVs before PSSetShader, so all the per-pass state
-    // we want is live at this moment. Cheap no-op when not capturing.
+    // it wants is live at this moment.
     LightTracker::OnPSBind(context, pixelShader);
     if (!SHADERENGINE_EFFECTS_ON) {
         return result;
@@ -2139,10 +2143,12 @@ namespace
         REX::W32::D3D11_MAPPED_SUBRESOURCE* mappedResource)
     {
 #if !SHADERENGINE_ENABLE_PHASE_TELEMETRY
-        return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+        return D3D11Hooks::OriginalMap(
+            context, resource, subresource, mapType, mapFlags, mappedResource);
 #else
         if (!PhaseTelemetry::IsInCommandBufferReplay()) {
-            return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+            return D3D11Hooks::OriginalMap(
+                context, resource, subresource, mapType, mapFlags, mappedResource);
         }
 
         const auto t0 = std::chrono::steady_clock::now();

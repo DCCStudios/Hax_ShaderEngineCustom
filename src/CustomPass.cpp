@@ -1,6 +1,7 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <LocalLightBridge.h>
 #include <RenderTargets.h>
 #include <ShaderResources.h>
 #include <d3d11.h>
@@ -122,7 +123,8 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
 }
 
 bool ParseInputBinding(const std::string& token, InputBinding& out) {
-    // Format: "<slot>:<source>" where source is depth | currentRTV | currentPSRV:N | customResource:NAME | gbufferRT:N
+    // Format: "<slot>:<source>" where source is depth | currentRTV |
+    // currentPSRV:N | customResource:NAME | gbufferRT:N
     auto colon = token.find(':');
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
@@ -1324,6 +1326,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularFloatsSRV) context->PSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         if (g_modularIntsSRV)   context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
+        LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
         REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
         context->PSSetSamplers(0, 2, samplers);
         context->Draw(3, 0);
@@ -1347,6 +1350,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularFloatsSRV) context->CSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         if (g_modularIntsSRV)   context->CSSetShaderResources(MODULAR_INTS_SLOT,   1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
+        LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/false);
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());

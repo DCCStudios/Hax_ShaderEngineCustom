@@ -6,6 +6,7 @@
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
 #include <LightCullPolicy.h>
+#include <LocalLightBridge.h>
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
 #include <ShadowUpgrade.h>
@@ -1972,11 +1973,11 @@ namespace
     // The function has only ONE caller (this lambda); patch the `call rel32`
     // at lambda+0x281 directly so AddLight's RIP-relative prologue stays
     // untouched.
-    using BSDFTiledLightingAddLight_t = void (*)(std::uint32_t id,
-                                                 const RE::NiPoint3* pos,
+    using BSDFTiledLightingAddLight_t = void (*)(std::uint32_t lightType,
+                                                 const RE::NiPoint3* viewPosition,
                                                  float radius,
                                                  const RE::NiColor* color,
-                                                 const RE::NiPoint3* dir,
+                                                 const RE::NiPoint3* attenuation,
                                                  bool flagA, bool flagB, bool flagC, bool flagD);
     BSDFTiledLightingAddLight_t OriginalBSDFTiledLightingAddLight = nullptr;
 
@@ -3680,10 +3681,10 @@ std::uint32_t HookedBSLightTestFrustumCull(void* light, void* cullingProcess)
 // per-volume mesh (which gets its own transient scale via the
 // SetupPointLightGeometry hook). Both paths now use the same boosted radius
 // so non-shadow lights with both paths active match shadow-light coverage.
-void HookedBSDFTiledLightingAddLight(std::uint32_t id,
-                                     const RE::NiPoint3* pos, float radius,
+void HookedBSDFTiledLightingAddLight(std::uint32_t lightType,
+                                     const RE::NiPoint3* viewPosition, float radius,
                                      const RE::NiColor* color,
-                                     const RE::NiPoint3* dir,
+                                     const RE::NiPoint3* attenuation,
                                      bool flagA, bool flagB, bool flagC, bool flagD)
 {
     float adjusted = radius;
@@ -3691,7 +3692,8 @@ void HookedBSDFTiledLightingAddLight(std::uint32_t id,
     if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
         adjusted = radius * scale;
     }
-    OriginalBSDFTiledLightingAddLight(id, pos, adjusted, color, dir,
+    LocalLightBridge::OnTiledLight(viewPosition, adjusted, color, attenuation);
+    OriginalBSDFTiledLightingAddLight(lightType, viewPosition, adjusted, color, attenuation,
                                       flagA, flagB, flagC, flagD);
 }
 
@@ -3710,8 +3712,10 @@ bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask
 {
     float saved = std::numeric_limits<float>::quiet_NaN();
     float* radiusPtr = nullptr;
+    std::byte* geometryBytes = nullptr;
     if (light) {
         if (auto* geometry = *reinterpret_cast<void**>(static_cast<std::byte*>(light) + 0xB8)) {
+            geometryBytes = static_cast<std::byte*>(geometry);
             radiusPtr = reinterpret_cast<float*>(static_cast<std::byte*>(geometry) + 0x138);
             const float scale = LightCullPolicy::GetCurrentScale();
             if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
@@ -3721,6 +3725,38 @@ bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask
         }
     }
     const bool result = OriginalSetupPointLightGeometry(shader, light, mask, isUnk);
+    if (result && light && geometryBytes && radiusPtr) {
+        // SetupPointLightGeometry's stock cb2 packing, verified in OG at
+        // 0x1428C37A0:
+        //   geometry+0xA0  absolute world center
+        //   geometry+0x12C gamma RGB, raised to 2.2
+        //   geometry+0x138 radius
+        //   geometry+0x144 color scale
+        //   geometry+0x170 attenuation shaping vector
+        //   BSLight+0x10   light intensity
+        const auto* worldPosition =
+            reinterpret_cast<const RE::NiPoint3*>(geometryBytes + 0xA0);
+        const auto* gammaColor =
+            reinterpret_cast<const RE::NiColor*>(geometryBytes + 0x12C);
+        const auto* attenuation =
+            reinterpret_cast<const RE::NiPoint3*>(geometryBytes + 0x170);
+        const float intensity =
+            *reinterpret_cast<const float*>(static_cast<const std::byte*>(light) + 0x10);
+        const float colorScale =
+            *reinterpret_cast<const float*>(geometryBytes + 0x144);
+        const float combinedScale = intensity * colorScale;
+        const RE::NiColor linearColor{
+            std::pow((std::max)(0.0f, gammaColor->r), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor->g), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor->b), 2.2f) * combinedScale
+        };
+        LocalLightBridge::OnRasterLight(
+            light,
+            worldPosition,
+            *radiusPtr,
+            &linearColor,
+            attenuation);
+    }
     if (!std::isnan(saved) && radiusPtr) {
         *radiusPtr = saved;
     }
@@ -4325,9 +4361,11 @@ bool InstallDrawTaggingHooks_Internal()
         //   TryAddTiledLightLambda @ 0x142813CE0, REL ID 999390
         //   call site +0x281 @ 0x142813F61
         //   E8 6A 9C 05 00 -> BSDFTiledLighting::AddLight @ 0x14286DBD0
-        // ABI: RCX=id, RDX=NiPoint3* NDC position, XMM2=radius,
+        // ABI: RCX=light type (0 for point lights), RDX=NiPoint3* view-space
+        // center, XMM2=radius,
         // R9=NiColor* linear color; the cb2[3] attenuation vector and four
-        // bools are stack args.
+        // bools are stack args. LocalLightBridge consumes the same record
+        // before the engine appends it to the tiled structured buffer.
         // AE is unconfirmed and deliberately not patched.
         constexpr std::array<std::uint8_t, 5> kExpectedAddLightCall{
             0xE8, 0x6A, 0x9C, 0x05, 0x00
