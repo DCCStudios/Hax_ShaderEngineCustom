@@ -10,7 +10,7 @@ namespace
     // cannot make a raster light disappear, then retire genuinely stale
     // copied records without ever dereferencing the old BSLight pointer.
     constexpr std::uint64_t kRasterKeepAliveFrames = 240;
-    constexpr std::size_t kExpectedTiledLightCount = 128;
+    constexpr std::size_t kExpectedTiledLightCount = MAX_LIGHTS;
     constexpr float kViewSpaceKind = 0.0f;
     constexpr float kAbsoluteWorldKind = 1.0f;
 
@@ -32,7 +32,6 @@ namespace
     struct PublicationCandidate
     {
         GpuLocalLight light{};
-        std::uint64_t lastSeenFrame = 0;
     };
 
     std::mutex g_mutex;
@@ -41,6 +40,7 @@ namespace
     std::vector<RasterLight> g_tiledFallbackLights;
     std::uint64_t g_frame = 0;
     bool g_uploadDirty = true;
+    bool g_overflowLogged = false;
 
     REX::W32::ID3D11Buffer* g_lightBuffer = nullptr;
     REX::W32::ID3D11ShaderResourceView* g_lightSRV = nullptr;
@@ -225,23 +225,69 @@ namespace
             (std::max)(1.0f, light.positionAndRadius.w));
     }
 
+    struct PublicationDistance
+    {
+        float outsideInfluence = (std::numeric_limits<float>::max)();
+        float center = (std::numeric_limits<float>::max)();
+    };
+
+    PublicationDistance DistanceFromCamera(
+        const GpuLocalLight& light) noexcept
+    {
+        const auto& position = light.positionAndRadius;
+        float deltaX = position.x;
+        float deltaY = position.y;
+        float deltaZ = position.z;
+        if (light.colorAndKind.w > 0.5f) {
+            const auto& camera =
+                g_customBufferData.g_CurrentCameraPositionAdjust;
+            if (!Finite(camera.x) || !Finite(camera.y) || !Finite(camera.z)) {
+                return {};
+            }
+            deltaX -= camera.x;
+            deltaY -= camera.y;
+            deltaZ -= camera.z;
+        }
+
+        const float distanceSquared =
+            deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ;
+        if (!Finite(distanceSquared) || distanceSquared < 0.0f) {
+            return {};
+        }
+        const float center = std::sqrt(distanceSquared);
+        return {
+            (std::max)(0.0f, center - position.w),
+            center
+        };
+    }
+
     bool PublicationOrder(
         const PublicationCandidate& left,
         const PublicationCandidate& right) noexcept
     {
-        const bool leftCurrent = left.lastSeenFrame == g_frame;
-        const bool rightCurrent = right.lastSeenFrame == g_frame;
-        if (leftCurrent != rightCurrent) {
-            return leftCurrent;
+        // Native raster/tiled submission is view dependent. Ranking records
+        // seen this frame ahead of retained records therefore changed the GPU
+        // subset whenever the camera crossed a frustum boundary. Distance to
+        // the light's influence sphere is stable under camera rotation and is
+        // the correct first-order relevance metric for a screen-space pass.
+        const auto leftDistance = DistanceFromCamera(left.light);
+        const auto rightDistance = DistanceFromCamera(right.light);
+        if (leftDistance.outsideInfluence !=
+            rightDistance.outsideInfluence) {
+            return leftDistance.outsideInfluence <
+                rightDistance.outsideInfluence;
+        }
+        if (leftDistance.center != rightDistance.center) {
+            return leftDistance.center < rightDistance.center;
         }
 
+        // Intensity and reach are secondary only. They break ties between
+        // spatially equivalent candidates without making camera-facing cull
+        // order part of the publication contract.
         const float leftScore = PublicationScore(left.light);
         const float rightScore = PublicationScore(right.light);
         if (leftScore != rightScore) {
             return leftScore > rightScore;
-        }
-        if (left.lastSeenFrame != right.lastSeenFrame) {
-            return left.lastSeenFrame > right.lastSeenFrame;
         }
 
         const auto& a = left.light.positionAndRadius;
@@ -249,7 +295,18 @@ namespace
         if (a.x != b.x) return a.x < b.x;
         if (a.y != b.y) return a.y < b.y;
         if (a.z != b.z) return a.z < b.z;
-        return a.w < b.w;
+        if (a.w != b.w) return a.w < b.w;
+        const auto& ac = left.light.colorAndKind;
+        const auto& bc = right.light.colorAndKind;
+        if (ac.x != bc.x) return ac.x < bc.x;
+        if (ac.y != bc.y) return ac.y < bc.y;
+        if (ac.z != bc.z) return ac.z < bc.z;
+        if (ac.w != bc.w) return ac.w < bc.w;
+        const auto& aa = left.light.attenuation;
+        const auto& ba = right.light.attenuation;
+        if (aa.x != ba.x) return aa.x < ba.x;
+        if (aa.y != ba.y) return aa.y < ba.y;
+        return aa.z < ba.z;
     }
 
     bool EnsureGpuResource(REX::W32::ID3D11Device* device)
@@ -308,6 +365,7 @@ void Initialize()
     g_tiledFallbackLights.reserve(kExpectedTiledLightCount);
     g_frame = 0;
     g_uploadDirty = true;
+    g_overflowLogged = false;
 }
 
 void Shutdown()
@@ -325,6 +383,7 @@ void Shutdown()
         g_lightBuffer = nullptr;
     }
     g_uploadDirty = true;
+    g_overflowLogged = false;
 }
 
 void OnRasterLight(
@@ -410,9 +469,9 @@ void OnTiledLight(
         [&light](const GpuLocalLight& candidate) {
             return std::memcmp(&candidate, &light, sizeof(light)) == 0;
         });
-    // MAX_LIGHTS is the final GPU publication limit, not a collection limit.
-    // Bethesda's submission order is view-dependent, so truncating here made
-    // otherwise stable lights appear and disappear as they crossed slot 48.
+    // MAX_LIGHTS is the native GPU publication ceiling, not a collection
+    // limit. Collect everything first so native submission order cannot
+    // decide which records survive publication.
     if (duplicate == g_tiledLights.end()) {
         g_tiledLights.push_back(light);
     }
@@ -478,10 +537,10 @@ void BindCustomPassResource(
                 }
             }
 
-            // Build the complete deduplicated CPU candidate set before
-            // applying the fixed GPU publication limit. Current-frame lights
-            // win over retained fallbacks; within each set, prefer lights with
-            // greater peak intensity and reach instead of Bethesda call order.
+            // Build the complete deduplicated CPU candidate set before the
+            // native 625-record publication ceiling. Publication is ordered
+            // by camera distance only for deterministic overflow handling;
+            // freshness remains an expiration concern, not a ranking input.
             std::vector<std::pair<std::uintptr_t, RasterLight>> raster;
             raster.reserve(g_rasterLights.size());
             for (const auto& entry : g_rasterLights) {
@@ -493,10 +552,7 @@ void BindCustomPassResource(
                 raster.size() + g_tiledFallbackLights.size() +
                 transientTiled.size());
             for (const auto& entry : raster) {
-                candidates.push_back({
-                    entry.second.light,
-                    entry.second.lastSeenFrame
-                });
+                candidates.push_back({ entry.second.light });
             }
             for (const auto& entry : g_tiledFallbackLights) {
                 const auto& position = entry.light.positionAndRadius;
@@ -515,22 +571,28 @@ void BindCustomPassResource(
                             rasterEntry.second.light);
                     });
                 if (!duplicate) {
-                    candidates.push_back({
-                        entry.light,
-                        entry.lastSeenFrame
-                    });
+                    candidates.push_back({ entry.light });
                 }
             }
             // Matrix data is unavailable only during startup. Preserve those
             // current-frame records without attempting persistence.
             for (const auto& entry : transientTiled) {
-                candidates.push_back({ entry, g_frame });
+                candidates.push_back({ entry });
             }
 
             std::sort(
                 candidates.begin(),
                 candidates.end(),
                 PublicationOrder);
+            if (candidates.size() > upload.size() && !g_overflowLogged) {
+                REX::WARN(
+                    "LocalLightBridge: {} valid local lights exceed the "
+                    "native 625-light publication contract; publishing the "
+                    "nearest {} by influence distance",
+                    candidates.size(),
+                    upload.size());
+                g_overflowLogged = true;
+            }
             const std::size_t count = (std::min)(
                 candidates.size(),
                 upload.size());

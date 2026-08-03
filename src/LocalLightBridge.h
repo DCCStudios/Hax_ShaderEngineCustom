@@ -9,7 +9,11 @@
 namespace LocalLightBridge
 {
     inline constexpr UINT SRV_SLOT = 36;
-    inline constexpr UINT MAX_LIGHTS = 48;
+    // IDA OG 1.10.163: ShadowSceneNode::UpdateLightList sets the native
+    // tiled-light ceiling to 625, and BSDFTiledLighting::AddLight indexes a
+    // 30,000-byte list with a 48-byte stride (30,000 / 48 = 625). Mirror the
+    // complete native contract instead of imposing a second 48-light cutoff.
+    inline constexpr UINT MAX_LIGHTS = 625;
 
     void Initialize();
     void Shutdown();
