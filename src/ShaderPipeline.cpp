@@ -4,8 +4,35 @@
 #include <ShaderPipeline.h>
 
 std::atomic_bool g_anyReplacementShaderUsesDrawTag{ false };
+
+// A definition may have been precompiled before the engine creates the
+// matching vanilla shader. Seed that new entry from the already-created
+// replacement while holding the definition's compile lock. Compile completion
+// handles the opposite ordering by publishing to entries already in ShaderDB.
+static void AttachCompiledReplacementToEntry(
+    ShaderDBEntry& entry,
+    ShaderDefinition* def)
+{
+    if (!def) return;
+    if (!def->compileMutex) def->compileMutex = std::make_unique<std::mutex>();
+    std::lock_guard compileLock(*def->compileMutex);
+    if (def->type == ShaderType::Pixel) {
+        entry.SetReplacementPixelShader(def->loadedPixelShader);
+    } else {
+        entry.SetReplacementVertexShader(def->loadedVertexShader);
+    }
+}
+
 // Analyze the shader bytecode to extract info for matching and potential replacement.
-ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, REX::W32::ID3D11VertexShader* vertexShader, std::vector<uint8_t> bytecode, SIZE_T BytecodeLength) {
+ShaderDBEntry AnalyzeShader_Internal(
+    REX::W32::ID3D11PixelShader* pixelShader,
+    REX::W32::ID3D11VertexShader* vertexShader,
+    std::vector<uint8_t> bytecode,
+    SIZE_T bytecodeLength,
+    std::uint32_t fxpPixelShaderID,
+    bool hasFxpPixelShaderID,
+    std::uint32_t fxpShaderType,
+    bool hasFxpShaderType) {
     ShaderDBEntry entry{};
     if (!pixelShader && !vertexShader || bytecode.empty()) return entry;
     void* shader = nullptr;
@@ -21,9 +48,16 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
         entry.type = ShaderType::Vertex;
     }
     entry.bytecode = std::move(bytecode);
+    // Publish the native identity before definition matching below. Assigning
+    // it after AnalyzeShader_Internal returned made FXP-based rules miss the
+    // only authoritative match performed during shader creation.
+    entry.fxpPixelShaderID = fxpPixelShaderID;
+    entry.hasFxpPixelShaderID = hasFxpPixelShaderID;
+    entry.fxpShaderType = fxpShaderType;
+    entry.hasFxpShaderType = hasFxpShaderType;
     auto hash = static_cast<std::uint32_t>(std::hash<std::string_view>{}(std::string_view((char*)entry.bytecode.data(), entry.bytecode.size())));
     entry.hash = hash;
-    entry.size = BytecodeLength;
+    entry.size = bytecodeLength;
     // Analyze the shader entry
     if (ReflectShader_Internal(entry)) {
         if (DEBUGGING) {
@@ -46,6 +80,7 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
         if (def->active && DoesEntryMatchDefinition_Internal(entry, def)) {
             entry.SetMatched(true);
             entry.matchedDefinition = def; // Store the matched definition for later use during shader compilation
+            AttachCompiledReplacementToEntry(entry, def);
             if (DEVELOPMENT && def->log) {
                 REX::INFO("AnalyzeShader_Internal: ------------------------------------------------");
                     REX::INFO("RematchAllShaders_Internal: Found matching shader definition '{}' for {} shader with ShaderUID '{}'.", def->id, entry.type == ShaderType::Vertex ? "Vertex" : "Pixel", entry.shaderUID);
@@ -72,6 +107,12 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
                 REX::INFO(" - Shader Input Mask: 0x{:08X}", entry.inputMask);
                 REX::INFO(" - Shader Output Count: {}", entry.outputCount != -1 ? std::to_string(entry.outputCount) : "X");
                 REX::INFO(" - Shader Output Mask: 0x{:08X}", entry.outputMask);
+                if (entry.hasFxpPixelShaderID) {
+                    REX::INFO(
+                        " - FXP Family/Permutation: 0x{:08X}/0x{:08X}",
+                        entry.hasFxpShaderType ? entry.fxpShaderType : 0xFFFFFFFFu,
+                        entry.fxpPixelShaderID);
+                }
                 REX::INFO("AnalyzeShader_Internal: ------------------------------------------------");
             }
             if (DEVELOPMENT && def->dump && !entry.IsDumped()) {
@@ -158,6 +199,10 @@ bool CompileShader_Internal(ShaderDefinition* def) {
     // Check if already compiled (re-checked under the lock so a concurrent
     // compile that finished while we were waiting is observed correctly).
     if (def->loadedPixelShader || def->loadedVertexShader) {
+        // Repair entries matched after an earlier precompile. This is cheap in
+        // the normal path and keeps the Shader Monitor tied to actual object
+        // readiness instead of whether the permutation has executed yet.
+        g_ShaderDB.PublishReplacementForDefinition(def);
         if (DEBUGGING)
             REX::INFO("CompileShader_Internal: Shader '{}' is already compiled. Skipping compilation.", def->id);
         return true;
@@ -280,6 +325,7 @@ bool CompileShader_Internal(ShaderDefinition* def) {
         }
         return false;
     }
+    g_ShaderDB.PublishReplacementForDefinition(def);
     return true;
 }
 
@@ -328,6 +374,25 @@ bool DoesEntryMatchDefinition_Internal(ShaderDBEntry const& entry, ShaderDefinit
             }
         }
         if (!asmHashMatch) {
+            return false;
+        }
+    }
+    // Match the same family/permutation keys that BSShader::Load and the FXP
+    // lookup use. A requested FXP criterion fails closed for custom shaders
+    // and for runtimes where that identity has not been verified.
+    if (!def->fxpShaderType.empty()) {
+        if (!entry.hasFxpShaderType ||
+            std::ranges::find(
+                def->fxpShaderType, entry.fxpShaderType) ==
+                def->fxpShaderType.end()) {
+            return false;
+        }
+    }
+    if (!def->fxpPixelShaderID.empty()) {
+        if (!entry.hasFxpPixelShaderID ||
+            std::ranges::find(
+                def->fxpPixelShaderID, entry.fxpPixelShaderID) ==
+                def->fxpPixelShaderID.end()) {
             return false;
         }
     }
@@ -408,6 +473,10 @@ void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* d
                                   shaderUID=entry.shaderUID,
                                   hash=entry.hash,
                                   asmHash=entry.asmHash,
+                                  fxpPixelShaderID=entry.fxpPixelShaderID,
+                                  hasFxpPixelShaderID=entry.hasFxpPixelShaderID,
+                                  fxpShaderType=entry.fxpShaderType,
+                                  hasFxpShaderType=entry.hasFxpShaderType,
                                   size=entry.size,
                                   bytecode=entry.bytecode,
                                   expectedCBSizes=[&entry]() { 
@@ -462,6 +531,16 @@ void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* d
                 logFile << "shaderUID=" << shaderUID << std::endl;
                 logFile << "hash=0x" << std::hex << std::uppercase << hash << std::dec << std::endl;
                 logFile << "asmHash=0x" << std::hex << std::uppercase << asmHash << std::dec << std::endl;
+                if (hasFxpShaderType) {
+                    logFile << "fxpShaderType=0x" << std::hex
+                            << std::uppercase << fxpShaderType << std::dec
+                            << std::endl;
+                }
+                if (hasFxpPixelShaderID) {
+                    logFile << "fxpPixelShaderID=0x" << std::hex
+                            << std::uppercase << fxpPixelShaderID << std::dec
+                            << std::endl;
+                }
                 // Size as exact match in parentheses
                 logFile << "size=(" << size << ")" << std::endl;
                 // Buffer sizes in format: size@slot,size@slot
@@ -736,6 +815,12 @@ void RematchAllShaders_Internal() {
                     REX::INFO(" - Shader Input Mask: 0x{:08X}", entry.inputMask);
                     REX::INFO(" - Shader Output Count: {}", entry.outputCount != -1 ? std::to_string(entry.outputCount) : "X");
                     REX::INFO(" - Shader Output Mask: 0x{:08X}", entry.outputMask);
+                    if (entry.hasFxpPixelShaderID) {
+                        REX::INFO(
+                            " - FXP Family/Permutation: 0x{:08X}/0x{:08X}",
+                            entry.hasFxpShaderType ? entry.fxpShaderType : 0xFFFFFFFFu,
+                            entry.fxpPixelShaderID);
+                    }
                     REX::INFO("RematchAllShaders_Internal: ------------------------------------------------");
                 }
                 if (DEVELOPMENT && def->dump && !entry.IsDumped()) {

@@ -41,13 +41,13 @@ enum class Mode : std::uint8_t {
 
 extern std::atomic<Mode> g_mode;
 
-// Called from PhaseTelemetry::HookedDeferredLightsImpl at entry, before the
-// original. Cheap (single relaxed load + branch) when mode == Off.
+// Called from ShadowUpgrade's validated DeferredLightsImpl wrapper at entry,
+// before the original. Cheap (single relaxed load + branch) when mode == Off.
 void OnEnter();
 
-// Called from PhaseTelemetry::HookedDeferredLightsImpl after the original
-// returns. Restores the pre-sort pointer order so downstream code sees the
-// unmodified array. No-op when mode == Off OR when OnEnter didn't sort
+// Called from ShadowUpgrade's validated DeferredLightsImpl wrapper after the
+// original returns. Restores the pre-sort pointer order so downstream code
+// sees the unmodified array. No-op when mode == Off OR when OnEnter didn't sort
 // (e.g. ShadowSceneNode pointer was null, or array was empty).
 void OnExit();
 

@@ -79,7 +79,10 @@ enum class Depth : int
     kMainCopy = 3,
     kMainCopyCopy = 4,
 
-    kShadowMap = 8,
+    // OG IDA: BSGraphics::RenderTargetManager::QShadowMapArrayDepthStencil
+    // @ 0x141D31770 returns logical depth target 6. Live directional and
+    // BSShadowFrustumLight maps both use this array and reuse its slices.
+    kShadowMap = 6,
 
     kCount = 13
 };

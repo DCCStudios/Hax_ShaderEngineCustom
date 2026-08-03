@@ -14,7 +14,8 @@ namespace ShaderResources
         kMain = 2,
         kMainCopy = 3,
         kMainCopyCopy = 4,
-        kShadowMap = 8,
+        // OG QShadowMapArrayDepthStencil @ 0x141D31770 returns target 6.
+        kShadowMap = 6,
         kCount = 13
     };
 

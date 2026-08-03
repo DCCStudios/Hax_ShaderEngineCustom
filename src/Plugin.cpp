@@ -6,8 +6,10 @@
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
 #include <LightCullPolicy.h>
+#include <LocalLightBridge.h>
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
+#include <ShadowUpgrade.h>
 
 #include <optional>
 
@@ -89,9 +91,10 @@ void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS)
 
 bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source)
 {
-    if (!SHADERENGINE_EFFECTS_ON) {
+    if (!SHADERENGINE_EFFECTS_ON || !g_armedCustomPassDrawBatch) {
         return false;
     }
+    RefreshCustomBufferForCustomPass();
     return CustomPass::g_registry.FireResolvedDrawBatch(
         context,
         g_armedCustomPassDrawBatch,
@@ -1970,11 +1973,11 @@ namespace
     // The function has only ONE caller (this lambda); patch the `call rel32`
     // at lambda+0x281 directly so AddLight's RIP-relative prologue stays
     // untouched.
-    using BSDFTiledLightingAddLight_t = void (*)(std::uint32_t id,
-                                                 const RE::NiPoint3* pos,
+    using BSDFTiledLightingAddLight_t = void (*)(std::uint32_t lightType,
+                                                 const RE::NiPoint3* viewPosition,
                                                  float radius,
                                                  const RE::NiColor* color,
-                                                 const RE::NiPoint3* dir,
+                                                 const RE::NiPoint3* attenuation,
                                                  bool flagA, bool flagB, bool flagC, bool flagD);
     BSDFTiledLightingAddLight_t OriginalBSDFTiledLightingAddLight = nullptr;
 
@@ -2763,7 +2766,8 @@ namespace
             }
         }
 
-        OriginalBSBatchRendererDraw(pass, unk2, unk3, dynamicDrawData);
+        OriginalBSBatchRendererDraw(
+            pass, unk2, unk3, dynamicDrawData);
         if (needsDrawTag) {
             PopCurrentDrawTag();
         }
@@ -3677,10 +3681,10 @@ std::uint32_t HookedBSLightTestFrustumCull(void* light, void* cullingProcess)
 // per-volume mesh (which gets its own transient scale via the
 // SetupPointLightGeometry hook). Both paths now use the same boosted radius
 // so non-shadow lights with both paths active match shadow-light coverage.
-void HookedBSDFTiledLightingAddLight(std::uint32_t id,
-                                     const RE::NiPoint3* pos, float radius,
+void HookedBSDFTiledLightingAddLight(std::uint32_t lightType,
+                                     const RE::NiPoint3* viewPosition, float radius,
                                      const RE::NiColor* color,
-                                     const RE::NiPoint3* dir,
+                                     const RE::NiPoint3* attenuation,
                                      bool flagA, bool flagB, bool flagC, bool flagD)
 {
     float adjusted = radius;
@@ -3688,7 +3692,8 @@ void HookedBSDFTiledLightingAddLight(std::uint32_t id,
     if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
         adjusted = radius * scale;
     }
-    OriginalBSDFTiledLightingAddLight(id, pos, adjusted, color, dir,
+    LocalLightBridge::OnTiledLight(viewPosition, adjusted, color, attenuation);
+    OriginalBSDFTiledLightingAddLight(lightType, viewPosition, adjusted, color, attenuation,
                                       flagA, flagB, flagC, flagD);
 }
 
@@ -3707,8 +3712,10 @@ bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask
 {
     float saved = std::numeric_limits<float>::quiet_NaN();
     float* radiusPtr = nullptr;
+    std::byte* geometryBytes = nullptr;
     if (light) {
         if (auto* geometry = *reinterpret_cast<void**>(static_cast<std::byte*>(light) + 0xB8)) {
+            geometryBytes = static_cast<std::byte*>(geometry);
             radiusPtr = reinterpret_cast<float*>(static_cast<std::byte*>(geometry) + 0x138);
             const float scale = LightCullPolicy::GetCurrentScale();
             if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
@@ -3718,6 +3725,38 @@ bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask
         }
     }
     const bool result = OriginalSetupPointLightGeometry(shader, light, mask, isUnk);
+    if (result && light && geometryBytes && radiusPtr) {
+        // SetupPointLightGeometry's stock cb2 packing, verified in OG at
+        // 0x1428C37A0:
+        //   geometry+0xA0  absolute world center
+        //   geometry+0x12C gamma RGB, raised to 2.2
+        //   geometry+0x138 radius
+        //   geometry+0x144 color scale
+        //   geometry+0x170 attenuation shaping vector
+        //   BSLight+0x10   light intensity
+        const auto* worldPosition =
+            reinterpret_cast<const RE::NiPoint3*>(geometryBytes + 0xA0);
+        const auto* gammaColor =
+            reinterpret_cast<const RE::NiColor*>(geometryBytes + 0x12C);
+        const auto* attenuation =
+            reinterpret_cast<const RE::NiPoint3*>(geometryBytes + 0x170);
+        const float intensity =
+            *reinterpret_cast<const float*>(static_cast<const std::byte*>(light) + 0x10);
+        const float colorScale =
+            *reinterpret_cast<const float*>(geometryBytes + 0x144);
+        const float combinedScale = intensity * colorScale;
+        const RE::NiColor linearColor{
+            std::pow((std::max)(0.0f, gammaColor->r), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor->g), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor->b), 2.2f) * combinedScale
+        };
+        LocalLightBridge::OnRasterLight(
+            light,
+            worldPosition,
+            *radiusPtr,
+            &linearColor,
+            attenuation);
+    }
     if (!std::isnan(saved) && radiusPtr) {
         *radiusPtr = saved;
     }
@@ -3815,6 +3854,38 @@ bool InstallDrawTaggingHooks_Internal()
     }
 
     if (!OriginalBSBatchRendererDraw) {
+        // IDA OG 1.10.163:
+        //   BSBatchRenderer::Draw @ 0x14287EDE0, REL ID 1152191
+        // ABI: void __fastcall(pass=RCX, arg2=RDX, arg3=R8,
+        //                      dynamicDrawData=R9)
+        // The first 15 bytes end on an instruction boundary:
+        //   40 53                push rbx
+        //   41 56                push r14
+        //   48 83 EC 58          sub rsp,58h
+        //   48 8B 59 18          mov rbx,[rcx+18h]
+        //   4C 8B F1             mov r14,rcx
+        // The existing AE relocation is retained for draw tagging, but the
+        // interior shadow replay is OG-only because its enclosing
+        // DeferredLightsImpl contract is not installed on AE.
+        if (REX::FModule::IsRuntimeOG()) {
+            constexpr std::array<std::uint8_t, 15> kExpectedDrawPrologue{
+                0x40, 0x53, 0x41, 0x56, 0x48,
+                0x83, 0xEC, 0x58, 0x48, 0x8B,
+                0x59, 0x18, 0x4C, 0x8B, 0xF1
+            };
+            const auto address = Hooks::Addresses::BSBatchRendererDraw.address();
+            if (std::memcmp(
+                    reinterpret_cast<const void*>(address),
+                    kExpectedDrawPrologue.data(),
+                    kExpectedDrawPrologue.size()) != 0) {
+                REX::WARN(
+                    "InstallDrawTaggingHooks_Internal: BSBatchRenderer::Draw "
+                    "@ {:#x} failed expected-byte validation; hook not "
+                    "installed",
+                    address);
+                return false;
+            }
+        }
         constexpr std::size_t kDrawPrologueSize = 15;
         OriginalBSBatchRendererDraw = Hooks::CreateBranchGateway5<BSBatchRendererDraw_t>(Hooks::Addresses::BSBatchRendererDraw, kDrawPrologueSize, reinterpret_cast<void*>(&HookedBSBatchRendererDraw));
 
@@ -4285,10 +4356,31 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSLight::TestFrustumCull hook installed");
     }
 
-    if (!OriginalBSDFTiledLightingAddLight) {
-        // 5-byte `call rel32` patch at lambda+0x281. write_call<5> returns the
-        // original target (AddLight @ 0x14286DBD0) for forwarding.
+    if (REX::FModule::IsRuntimeOG() && !OriginalBSDFTiledLightingAddLight) {
+        // IDA OG 1.10.163:
+        //   TryAddTiledLightLambda @ 0x142813CE0, REL ID 999390
+        //   call site +0x281 @ 0x142813F61
+        //   E8 6A 9C 05 00 -> BSDFTiledLighting::AddLight @ 0x14286DBD0
+        // ABI: RCX=light type (0 for point lights), RDX=NiPoint3* view-space
+        // center, XMM2=radius,
+        // R9=NiColor* linear color; the cb2[3] attenuation vector and four
+        // bools are stack args. LocalLightBridge consumes the same record
+        // before the engine appends it to the tiled structured buffer.
+        // AE is unconfirmed and deliberately not patched.
+        constexpr std::array<std::uint8_t, 5> kExpectedAddLightCall{
+            0xE8, 0x6A, 0x9C, 0x05, 0x00
+        };
         const std::uintptr_t callSite = Hooks::Addresses::TryAddTiledLightLambda.address() + Hooks::Offsets::AddLightCallSiteOG;
+        if (std::memcmp(
+                reinterpret_cast<const void*>(callSite),
+                kExpectedAddLightCall.data(),
+                kExpectedAddLightCall.size()) != 0) {
+            REX::WARN(
+                "InstallDrawTaggingHooks_Internal: AddLight call site {:#x} "
+                "failed expected-byte validation; redirect not installed",
+                callSite);
+            return false;
+        }
         REL::Relocation<std::uintptr_t> callSiteRel{ callSite };
         OriginalBSDFTiledLightingAddLight = reinterpret_cast<BSDFTiledLightingAddLight_t>(
             callSiteRel.write_call<5>(reinterpret_cast<std::uintptr_t>(&HookedBSDFTiledLightingAddLight)));
@@ -4301,12 +4393,28 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSDFTiledLighting::AddLight call-site redirect installed at {:#x} (scales radius arg)", callSite);
     }
 
-    if (!OriginalSetupPointLightGeometry) {
-        // Prologue at OG 0x1428C37A0: `mov [rsp-8+arg_18], r9b` is exactly 5
-        // bytes and a clean instruction boundary. Use CreateBranchGateway5 so
-        // we only patch those 5 bytes (the surrounding `push rbp/rbx/rsi/rdi`
-        // etc. stay intact). The 14-byte path would mid-cut `lea rbp` at
-        // offset +13.
+    if (REX::FModule::IsRuntimeOG() && !OriginalSetupPointLightGeometry) {
+        // IDA OG 1.10.163, REL ID 212931, 0x1428C37A0:
+        //   44 88 4C 24 20   mov [rsp+20h],r9b
+        // ABI: bool __fastcall(BSDFLightShader*=RCX, BSLight*=RDX,
+        //                      uint32_t=R8D, char=R9B)
+        // The instruction is exactly five bytes and is the complete safe
+        // prologue copied by the gateway. AE is unconfirmed.
+        constexpr std::array<std::uint8_t, 5> kExpectedSetupPointPrologue{
+            0x44, 0x88, 0x4C, 0x24, 0x20
+        };
+        const auto setupAddress =
+            Hooks::Addresses::SetupPointLightGeometry.address();
+        if (std::memcmp(
+                reinterpret_cast<const void*>(setupAddress),
+                kExpectedSetupPointPrologue.data(),
+                kExpectedSetupPointPrologue.size()) != 0) {
+            REX::WARN(
+                "InstallDrawTaggingHooks_Internal: SetupPointLightGeometry "
+                "@ {:#x} failed expected-byte validation; hook not installed",
+                setupAddress);
+            return false;
+        }
         constexpr std::size_t kSetupPointLightGeometryPrologueSize = 5;
         OriginalSetupPointLightGeometry = Hooks::CreateBranchGateway5<SetupPointLightGeometry_t>(
             Hooks::Addresses::SetupPointLightGeometry, kSetupPointLightGeometryPrologueSize,

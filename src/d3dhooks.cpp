@@ -6,6 +6,7 @@
 #include <GpuScalar.h>
 #include <hooks.h>
 #include <ImguiMenu.h>
+#include <LocalLightBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <RenderTargets.h>
@@ -51,12 +52,42 @@ RE::Sky* g_sky = nullptr;
 
 static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
 static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
+static std::atomic_bool g_customBufferRefreshedBeforePresent{ false };
 
 namespace
 {
     constexpr UINT kReplaySRVCacheSlots = 128;
     constexpr UINT kReplayVertexBufferSlots = 32;
     constexpr std::chrono::seconds kReplayMapTelemetryInterval{ 2 };
+
+    using BSShaderLoad_t = void (*)(void* shader, void* stream);
+    BSShaderLoad_t s_originalBSShaderLoad = nullptr;
+    thread_local std::uint32_t s_loadingFxpShaderType = 0;
+    thread_local bool s_hasLoadingFxpShaderType = false;
+
+    void HookedBSShaderLoad(void* shader, void* stream)
+    {
+        const auto previousType = s_loadingFxpShaderType;
+        const auto previousValid = s_hasLoadingFxpShaderType;
+        if (shader) {
+            // IDA-derived BSShader layout on OG: every concrete constructor
+            // writes its ShaderEnum to this+0x18 after BSShader(name). Examples:
+            // BSDFLightShader @ 0x1428C020F writes 4; BSDFCompositeShader
+            // @ 0x142876299 writes 6.
+            std::memcpy(
+                &s_loadingFxpShaderType,
+                static_cast<const std::byte*>(shader) + 0x18,
+                sizeof(s_loadingFxpShaderType));
+            s_hasLoadingFxpShaderType = true;
+        } else {
+            s_loadingFxpShaderType = 0;
+            s_hasLoadingFxpShaderType = false;
+        }
+
+        s_originalBSShaderLoad(shader, stream);
+        s_loadingFxpShaderType = previousType;
+        s_hasLoadingFxpShaderType = previousValid;
+    }
 
     struct ReplaySRVCallCache
     {
@@ -406,14 +437,17 @@ void UpdateCustomBuffer_Internal() {
     auto gfxState = RE::BSGraphics::State::GetSingleton();
     auto& camState = *SelectGameplayCameraState(gfxState); // CameraStateData
     auto& camView  = camState.camViewData;        // viewMat, viewDir, viewUp, viewRight, viewPort
-    // viewport
+    // Camera viewport. This is exposed to shaders for camera-space effects,
+    // but it is not a reliable render-domain authority: external upscalers can
+    // leave it at their previous reduced resolution when switching to a
+    // native-resolution AA mode.
     auto vp = camView.viewPort;
-    float vpX = vp.left, vpY = vp.top;
-    float vpW = vp.right - vp.left, vpH = vp.bottom - vp.top;
     // forward vector -> yaw/pitch
     auto vd = camView.viewDir;
     float vx = vd.m128_f32[0], vy = vd.m128_f32[1], vz = vd.m128_f32[2];
-    // world-space camera position from the inverse game view matrix
+    // BGS builds a rotation-only view matrix. Its inverse translation is the
+    // camera-relative origin; absolute translation lives in CameraStateData's
+    // *PosAdjust fields and is injected separately below.
     auto& VM = camView.viewMat; // __m128 viewMat[4]
     DirectX::XMMATRIX view = DirectX::XMMATRIX(VM[0], VM[1], VM[2], VM[3]);
     DirectX::XMMATRIX invView = DirectX::XMMatrixInverse(nullptr, view);
@@ -473,6 +507,16 @@ void UpdateCustomBuffer_Internal() {
     // Use the game-provided view-projection matrix directly.
     auto& VPM = camView.viewProjMat;
     DirectX::XMMATRIX viewProj = DirectX::XMMATRIX(VPM[0], VPM[1], VPM[2], VPM[3]);
+    // BSGraphics::ViewData+0x190 is the renderer-maintained previous
+    // unjittered view-projection. It is paired with
+    // CameraStateData::previousPosAdjust (+0x228). Live OG 1.10.163 memory
+    // confirms both fields for the selected gameplay camera.
+    auto& previousVPM = camView.previousViewProjUnjittered;
+    DirectX::XMMATRIX previousViewProj = DirectX::XMMATRIX(
+        previousVPM[0],
+        previousVPM[1],
+        previousVPM[2],
+        previousVPM[3]);
     float timeOfDay = 0.0f;
     float weatherTransition = 0.0f;
     uint32_t currentWeatherID = 0;
@@ -665,6 +709,87 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_SH_R = shR;
     g_customBufferData.g_SH_G = shG;
     g_customBufferData.g_SH_B = shB;
+    g_customBufferData.g_CurrentCameraPositionAdjust = {
+        camState.currentPosAdjust.x,
+        camState.currentPosAdjust.y,
+        camState.currentPosAdjust.z,
+        0.0f
+    };
+    g_customBufferData.g_PreviousCameraPositionAdjust = {
+        camState.previousPosAdjust.x,
+        camState.previousPosAdjust.y,
+        camState.previousPosAdjust.z,
+        0.0f
+    };
+
+    // Resolve the projection domain from renderer-owned contracts:
+    //   physical proxy allocation > active native DRS ratio > allocation.
+    //
+    // Do not infer it from CameraStateData::viewPort. The upscaler can retain
+    // a Quality-mode camera viewport (for example 1280x720) after switching to
+    // DLAA while kMain and the depth target are already native 1920x1080.
+    // Treating that stale viewport as the projection domain clipped custom
+    // composites to the top-left 2/3 of the frame. BGS explicitly publishes
+    // whether its dynamic-resolution ratio is active; only consume the ratio
+    // under that contract.
+    // Fallout's depth pyramid (RT39) is not proxy-swapped by the upscaler, so
+    // shaders need this extent separately from any individual texture size.
+    const float displayW = gfxState.screenWidth > 0
+        ? static_cast<float>(gfxState.screenWidth)
+        : resX;
+    const float displayH = gfxState.screenHeight > 0
+        ? static_cast<float>(gfxState.screenHeight)
+        : resY;
+    const auto renderTargetManager =
+        RE::BSGraphics::RenderTargetManager::GetSingleton();
+    const float dynamicWidthRatio =
+        renderTargetManager.dynamicWidthRatio > 0.0f &&
+        renderTargetManager.dynamicWidthRatio <= 1.0f
+            ? renderTargetManager.dynamicWidthRatio
+            : 1.0f;
+    const float dynamicHeightRatio =
+        renderTargetManager.dynamicHeightRatio > 0.0f &&
+        renderTargetManager.dynamicHeightRatio <= 1.0f
+            ? renderTargetManager.dynamicHeightRatio
+            : 1.0f;
+    const bool dynamicResolutionActive =
+        renderTargetManager.isDynamicResolutionCurrentlyActivated;
+    constexpr float kMinimumRenderExtent = 16.0f;
+    const bool physicalExtentValid =
+        std::isfinite(resX) &&
+        std::isfinite(resY) &&
+        resX >= kMinimumRenderExtent &&
+        resY >= kMinimumRenderExtent;
+    const bool proxyAllocation =
+        physicalExtentValid &&
+        (resX + 0.5f < displayW || resY + 0.5f < displayH);
+    const bool dynamicRatio =
+        dynamicResolutionActive &&
+        (dynamicWidthRatio < 0.999f || dynamicHeightRatio < 0.999f);
+    float renderW = physicalExtentValid ? resX : displayW;
+    float renderH = physicalExtentValid ? resY : displayH;
+    if (proxyAllocation) {
+        renderW = resX;
+        renderH = resY;
+    } else if (dynamicRatio) {
+        renderW = (std::max)(
+            1.0f, std::floor(displayW * dynamicWidthRatio));
+        renderH = (std::max)(
+            1.0f, std::floor(displayH * dynamicHeightRatio));
+    }
+    if (renderW < kMinimumRenderExtent ||
+        renderH < kMinimumRenderExtent ||
+        !std::isfinite(renderW) ||
+        !std::isfinite(renderH)) {
+        renderW = displayW;
+        renderH = displayH;
+    }
+    g_customBufferData.g_RenderInfo = {
+        renderW,
+        renderH,
+        displayW,
+        displayH
+    };
 
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow0, invProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow1, invProj.r[1]);
@@ -678,13 +803,18 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.inCombat = g_inCombat ? 1.0f : 0.0f;
     g_customBufferData.inInterior = g_inInterior ? 1.0f : 0.0f;
     g_customBufferData._padding = 0.0f; // just in case, to avoid any potential uninitialized data issues in shaders
-    // Snapshot the previous frame's ViewProj BEFORE writing the new one. The
-    // very first frame snapshots zeros (CB is zero-initialized), which the
-    // shader detects via the all-zero matrix and falls back to non-temporal.
-    g_customBufferData.g_PrevViewProjRow0 = g_customBufferData.g_ViewProjRow0;
-    g_customBufferData.g_PrevViewProjRow1 = g_customBufferData.g_ViewProjRow1;
-    g_customBufferData.g_PrevViewProjRow2 = g_customBufferData.g_ViewProjRow2;
-    g_customBufferData.g_PrevViewProjRow3 = g_customBufferData.g_ViewProjRow3;
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow0,
+        previousViewProj.r[0]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow1,
+        previousViewProj.r[1]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow2,
+        previousViewProj.r[2]);
+    DirectX::XMStoreFloat4(
+        &g_customBufferData.g_PrevViewProjRow3,
+        previousViewProj.r[3]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow0, viewProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow1, viewProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow2, viewProj.r[2]);
@@ -753,6 +883,21 @@ void UpdateCustomBuffer_Internal() {
     ShaderResources::UpdateInjectedShaderResourceViews(g_rendererData->context);
 }
 
+void RefreshCustomBufferForCustomPass()
+{
+    if (!CUSTOMBUFFER_ON) {
+        return;
+    }
+
+    bool expected = false;
+    if (!g_customBufferRefreshedBeforePresent.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_relaxed)) {
+        return;
+    }
+    UpdateCustomBuffer_Internal();
+}
 
 // --- D3D11 hook handlers ---
 
@@ -766,7 +911,11 @@ void D3D11OnPresent_Internal()
     // poll Numpad * for new arms, open the next capture file. No-op when
     // DEVELOPMENT is off.
     LightTracker::Tick();
-    if (CUSTOMBUFFER_ON) {
+    const bool refreshedAtCustomPass =
+        g_customBufferRefreshedBeforePresent.exchange(
+            false,
+            std::memory_order_relaxed);
+    if (CUSTOMBUFFER_ON && !refreshedAtCustomPass) {
         UpdateCustomBuffer_Internal();
     }
     // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
@@ -780,6 +929,9 @@ void D3D11OnPresent_Internal()
         // probes see the same per-frame data as regular customPass shaders.
         GpuScalar::OnFramePresent(g_rendererData->context);
     }
+    // AtPresent passes consume the completed frame's list above. Clear the
+    // tiled records and age the retained non-tiled BSLight cache.
+    LocalLightBridge::OnFramePresent();
     UIRenderFrame();
 }
 
@@ -1480,7 +1632,7 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
 
     // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
     // scissor / cb2 / SRVs before PSSetShader, so all the per-pass state
-    // we want is live at this moment. Cheap no-op when not capturing.
+    // it wants is live at this moment.
     LightTracker::OnPSBind(context, pixelShader);
     if (!SHADERENGINE_EFFECTS_ON) {
         return result;
@@ -1497,6 +1649,11 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
         if (g_ShaderDB.IsEntryMatched(pixelShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(pixelShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pixelShader);
+            if (matchedDefinition &&
+                matchedDefinition->shadowUpgrade &&
+                !SHADOW_UPGRADE_ON) {
+                return result;
+            }
             // If the HLSL watcher flagged a disk change for this definition,
             // drop the cached compiled shader + replacement pointers BEFORE we
             // read them below. Done here on the render thread so the D3D11
@@ -1505,7 +1662,10 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
             auto* replacementPixelShader = g_ShaderDB.GetReplacementShader(pixelShader);
             if (replacementPixelShader) {
                 if (DEBUGGING) {
-                    REX::INFO("MyPSSetShader: Replacing pixel shader with matched replacement for definition '{}'", matchedDefinition ? matchedDefinition->id : "Unknown");
+                    REX::INFO(
+                        "MyPSSetShader: Replacing pixel shader with matched "
+                        "replacement for definition '{}'",
+                        matchedDefinition ? matchedDefinition->id : "Unknown");
                 }
                 result.shader = replacementPixelShader;
                 result.usingReplacementPixelShader = true;
@@ -1519,11 +1679,17 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
                         g_ShaderDB.SetReplacementShader(pixelShader, matchedDefinition->loadedPixelShader);
                         if (DEBUGGING) {
                             REX::INFO("MyPSSetShader: Compiled replacement shader for definition '{}'", matchedDefinition->id);
-                            REX::INFO("MyPSSetShader: Replacing pixel shader with newly compiled replacement for definition '{}'", matchedDefinition->id);
+                            REX::INFO(
+                                "MyPSSetShader: Replacing pixel shader with "
+                                "newly compiled replacement for definition '{}'",
+                                matchedDefinition->id);
                         }
                         result.shader = g_ShaderDB.GetReplacementShader(pixelShader);
                         result.usingReplacementPixelShader = result.shader != nullptr;
-                        result.activeReplacementDef = result.usingReplacementPixelShader ? matchedDefinition : nullptr;
+                        result.activeReplacementDef =
+                            result.usingReplacementPixelShader ?
+                                matchedDefinition :
+                                nullptr;
                     } else {
                         REX::WARN("MyPSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true;
@@ -1619,7 +1785,11 @@ void D3D11OnCreatePixelShader_Internal(
     HRESULT hr,
     const void* shaderBytecode,
     SIZE_T bytecodeLength,
-    REX::W32::ID3D11PixelShader** pixelShader)
+    REX::W32::ID3D11PixelShader** pixelShader,
+    std::uint32_t fxpPixelShaderID,
+    bool hasFxpPixelShaderID,
+    std::uint32_t fxpShaderType,
+    bool hasFxpShaderType)
 {
     if (REX::W32::SUCCESS(hr) && pixelShader && *pixelShader) {
         std::vector<uint8_t> bytecode(bytecodeLength);
@@ -1627,8 +1797,27 @@ void D3D11OnCreatePixelShader_Internal(
         if (g_ShaderDB.HasEntry(*pixelShader)) {
             return;
         }
-        ShaderDBEntry entry = AnalyzeShader_Internal(*pixelShader, nullptr, std::move(bytecode), bytecodeLength);
+        ShaderDBEntry entry = AnalyzeShader_Internal(
+            *pixelShader,
+            nullptr,
+            std::move(bytecode),
+            bytecodeLength,
+            fxpPixelShaderID,
+            hasFxpPixelShaderID,
+            fxpShaderType,
+            hasFxpShaderType);
         g_ShaderDB.AddShaderEntry(std::move(entry));
+        if (hasFxpPixelShaderID) {
+            static std::atomic_bool loggedFxpCapture{ false };
+            if (!loggedFxpCapture.exchange(
+                    true, std::memory_order_relaxed)) {
+                REX::INFO(
+                    "ShaderEngine: captured native Shaders011.fxp pixel "
+                    "shader IDs (first family={}, key=0x{:08X})",
+                    hasFxpShaderType ? fxpShaderType : 0xFFFFFFFFu,
+                    fxpPixelShaderID);
+            }
+        }
     }
 }
 
@@ -1881,7 +2070,11 @@ namespace
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawIndexed(context, indexCount, startIndexLocation, baseVertexLocation);
+                D3D11Hooks::OriginalDrawIndexed(
+                    context,
+                    indexCount,
+                    startIndexLocation,
+                    baseVertexLocation);
             });
     }
 
@@ -1894,7 +2087,8 @@ namespace
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDraw(context, vertexCount, startVertexLocation);
+                D3D11Hooks::OriginalDraw(
+                    context, vertexCount, startVertexLocation);
             });
     }
 
@@ -1949,10 +2143,12 @@ namespace
         REX::W32::D3D11_MAPPED_SUBRESOURCE* mappedResource)
     {
 #if !SHADERENGINE_ENABLE_PHASE_TELEMETRY
-        return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+        return D3D11Hooks::OriginalMap(
+            context, resource, subresource, mapType, mapFlags, mappedResource);
 #else
         if (!PhaseTelemetry::IsInCommandBufferReplay()) {
-            return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+            return D3D11Hooks::OriginalMap(
+                context, resource, subresource, mapType, mapFlags, mappedResource);
         }
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -2159,8 +2355,47 @@ namespace
             return D3D11Hooks::OriginalCreatePixelShader(device, shaderBytecode, bytecodeLength, classLinkage, pixelShader);
         }
 
+        std::uint32_t fxpPixelShaderID = 0;
+        bool hasFxpPixelShaderID = false;
+        std::uint32_t fxpShaderType = 0;
+        bool hasFxpShaderType = false;
+        // IDA, Fallout 4 OG 1.10.163:
+        // Renderer::CreatePixelShaderFromStream @ 0x141D10D40 reads the FXP
+        // key into BSGraphics::PixelShader+0, then calls ID3D11Device::
+        // CreatePixelShader at 0x141D10EA0 with the output pointer set to
+        // wrapper+8. The indirect call returns at +0x164. Limit the wrapper
+        // read to that exact, version-checked call; custom/Shader.ini shader
+        // creation keeps the zero non-FXP identity.
+        if (REX::FModule::IsRuntimeOG() &&
+            REX::FModule::GetExecutingModule().GetFileVersion() ==
+                REL::Version{ 1, 10, 163, 0 }) {
+            static REL::Relocation<std::uintptr_t>
+                createPixelShaderFromStream{ REL::ID{ 957517, 0 } };
+            const auto returnAddress =
+                reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+            if (returnAddress ==
+                    createPixelShaderFromStream.address() + 0x164 &&
+                pixelShader) {
+                std::memcpy(
+                    &fxpPixelShaderID,
+                    reinterpret_cast<const std::byte*>(pixelShader) - 8,
+                    sizeof(fxpPixelShaderID));
+                hasFxpPixelShaderID = true;
+                fxpShaderType = s_loadingFxpShaderType;
+                hasFxpShaderType = s_hasLoadingFxpShaderType;
+            }
+        }
+
         const HRESULT hr = D3D11Hooks::OriginalCreatePixelShader(device, shaderBytecode, bytecodeLength, classLinkage, pixelShader);
-        D3D11OnCreatePixelShader_Internal(hr, shaderBytecode, bytecodeLength, pixelShader);
+        D3D11OnCreatePixelShader_Internal(
+            hr,
+            shaderBytecode,
+            bytecodeLength,
+            pixelShader,
+            fxpPixelShaderID,
+            hasFxpPixelShaderID,
+            fxpShaderType,
+            hasFxpShaderType);
         return hr;
     }
 
@@ -2370,6 +2605,54 @@ bool InstallShaderCreationHooks_Internal()
     D3D11Hooks::OriginalClipCursor =
         *reinterpret_cast<D3D11Hooks::ClipCursor_t*>(Hooks::Addresses::ClipCursor.address());
     Hooks::Addresses::ClipCursor.write_vfunc(0, &HookedClipCursor);
+
+    if (REX::FModule::IsRuntimeOG() && !s_originalBSShaderLoad) {
+        // IDA, Fallout 4 OG 1.10.163:
+        // BSShader::Load(BSIStream*) @ 0x142891450, REL ID 101507.
+        // ABI: this=RCX, stream=RDX. The first 14 bytes contain no RIP-
+        // relative operands and end exactly after `sub rsp,68h`:
+        //   48 8B C4             mov rax,rsp
+        //   48 89 48 08          mov [rax+8],rcx
+        //   57                   push rdi
+        //   41 55                push r13
+        //   48 83 EC 68          sub rsp,68h
+        // The hook is observe-only: it publishes this+0x18 as TLS context
+        // while the original synchronously creates this family's shaders.
+        constexpr std::array<std::uint8_t, 14> expectedPrologue{
+            0x48, 0x8B, 0xC4,
+            0x48, 0x89, 0x48, 0x08,
+            0x57,
+            0x41, 0x55,
+            0x48, 0x83, 0xEC, 0x68
+        };
+        const auto address = Hooks::Addresses::BSShaderLoad.address();
+        if (std::memcmp(
+                reinterpret_cast<const void*>(address),
+                expectedPrologue.data(),
+                expectedPrologue.size()) != 0) {
+            REX::WARN(
+                "InstallShaderCreationHooks_Internal: BSShader::Load @ "
+                "{:#x} failed expected-byte validation; FXP family "
+                "identity unavailable",
+                address);
+            return false;
+        }
+
+        s_originalBSShaderLoad =
+            Hooks::CreateBranchGateway5<BSShaderLoad_t>(
+                Hooks::Addresses::BSShaderLoad,
+                expectedPrologue.size(),
+                reinterpret_cast<void*>(&HookedBSShaderLoad));
+        if (!s_originalBSShaderLoad) {
+            REX::WARN(
+                "InstallShaderCreationHooks_Internal: failed to install "
+                "BSShader::Load identity hook");
+            return false;
+        }
+        REX::INFO(
+            "InstallShaderCreationHooks_Internal: BSShader::Load FXP "
+            "family identity hook installed");
+    }
 
     return true;
 }

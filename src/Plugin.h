@@ -68,11 +68,9 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_ViewProjRow2; // 34
     DirectX::XMFLOAT4 g_ViewProjRow3; // 35
 
-    // Previous-frame view-projection rows. Snapshot of g_ViewProjRow* taken
-    // at the START of UpdateCustomBuffer_Internal each frame, *before* the
-    // current-frame matrices are written. Lets temporal effects (SSRTGI,
-    // motion vectors, TAA) reproject this-frame world position into the
-    // previous-frame screen, which is the basis for accurate history reuse.
+    // Renderer-maintained previous unjittered view-projection rows from
+    // BSGraphics::ViewData. Pair with g_PreviousCameraPositionAdjust because
+    // BGS stores camera translation outside this matrix.
     DirectX::XMFLOAT4 g_PrevViewProjRow0;
     DirectX::XMFLOAT4 g_PrevViewProjRow1;
     DirectX::XMFLOAT4 g_PrevViewProjRow2;
@@ -149,6 +147,19 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_SH_R;
     DirectX::XMFLOAT4 g_SH_G;
     DirectX::XMFLOAT4 g_SH_B;
+
+    // BSGraphics camera translation is not part of viewMat/viewProjMat.
+    // Reconstructed depth positions are therefore camera-relative, while
+    // renderer light geometry is absolute world space. These exact
+    // CameraStateData values let traced passes rebase both local lights and
+    // previous-frame reprojection without changing the long-standing
+    // camera-relative contract of ReconstructWorldPos.
+    DirectX::XMFLOAT4 g_CurrentCameraPositionAdjust;
+    DirectX::XMFLOAT4 g_PreviousCameraPositionAdjust;
+
+    // xy is the logical projection/render extent. zw is the display extent.
+    // They differ under native dynamic resolution and external upscalers.
+    DirectX::XMFLOAT4 g_RenderInfo;
 };
 
 struct alignas(16) DrawTagData
@@ -475,6 +486,8 @@ struct ShaderDefinition {
         , shaderUID(std::move(other.shaderUID))
         , hash(std::move(other.hash))
         , asmHash(std::move(other.asmHash))
+        , fxpPixelShaderID(std::move(other.fxpPixelShaderID))
+        , fxpShaderType(std::move(other.fxpShaderType))
         , sizeRequirements(std::move(other.sizeRequirements))
         , bufferSizes(std::move(other.bufferSizes))
         , textureSlots(std::move(other.textureSlots))
@@ -487,6 +500,7 @@ struct ShaderDefinition {
         , outputCountRequirements(std::move(other.outputCountRequirements))
         , outputMask(other.outputMask)
         , shaderFile(std::move(other.shaderFile))
+        , shadowUpgrade(other.shadowUpgrade)
         , buggy(other.buggy)
         , compiledShader(other.compiledShader)
         , loadedPixelShader(other.loadedPixelShader)
@@ -525,6 +539,10 @@ struct ShaderDefinition {
     std::vector<std::string> shaderUID = {};
     std::vector<std::uint32_t> hash = {};
     std::vector<std::uint32_t> asmHash = {};
+    // Exact native FXP identity. Unlike bytecode hashes, these are the keys
+    // BGS itself uses to select a permutation from a BSShader family.
+    std::vector<std::uint32_t> fxpPixelShaderID = {};
+    std::vector<std::uint32_t> fxpShaderType = {};
     std::vector<SizeRequirement> sizeRequirements;
     std::vector<std::pair<int, int>> bufferSizes;
     std::vector<int> textureSlots;
@@ -538,6 +556,10 @@ struct ShaderDefinition {
     std::uint32_t outputMask = 0;
     // Replacement shader info
     std::filesystem::path shaderFile = "";
+    // Groups the shader under the shadow-upgrade runtime switch. Once enabled,
+    // ShaderDB identity and the normal ShaderEngine replacement path remain
+    // authoritative; renderer-phase hooks do not second-guess permutations.
+    bool shadowUpgrade = false;
     // Compile state
     bool buggy = false;
     ID3DBlob* compiledShader = nullptr;
@@ -617,6 +639,10 @@ struct ShaderDBEntry {
         , shaderUID(other.shaderUID)
         , hash(other.hash)
         , asmHash(other.asmHash)
+        , fxpPixelShaderID(other.fxpPixelShaderID)
+        , hasFxpPixelShaderID(other.hasFxpPixelShaderID)
+        , fxpShaderType(other.fxpShaderType)
+        , hasFxpShaderType(other.hasFxpShaderType)
         , size(other.size)
         , textureSlots(std::move(other.textureSlots))
         , textureDimensions(std::move(other.textureDimensions))
@@ -647,6 +673,10 @@ struct ShaderDBEntry {
             shaderUID = std::move(other.shaderUID);
             hash = other.hash;
             asmHash = other.asmHash;
+            fxpPixelShaderID = other.fxpPixelShaderID;
+            hasFxpPixelShaderID = other.hasFxpPixelShaderID;
+            fxpShaderType = other.fxpShaderType;
+            hasFxpShaderType = other.hasFxpShaderType;
             size = other.size;
             textureSlots = std::move(other.textureSlots);
             textureDimensions = std::move(other.textureDimensions);
@@ -677,6 +707,14 @@ struct ShaderDBEntry {
     std::string shaderUID = "";
     std::uint32_t hash = 0;
     std::uint32_t asmHash = 0;
+    // Native Shaders011.fxp lookup key read from BSGraphics::PixelShader+0.
+    // Zero for non-pixel shaders and pixel shaders not loaded by BGS FXP.
+    std::uint32_t fxpPixelShaderID = 0;
+    bool hasFxpPixelShaderID = false;
+    // Owning BSShader table. FXP permutation keys are only unique inside this
+    // family (4=DFLight, 6=DFComposite on OG).
+    std::uint32_t fxpShaderType = 0;
+    bool hasFxpShaderType = false;
     std::size_t size = 0;
     std::uint32_t expectedCBSizes[14] = {0};
     std::vector<int> textureSlots = {};
@@ -876,6 +914,26 @@ struct ShaderDB {
             it->second.SetReplacementVertexShader(replacement);
         }
     }
+    // Publish a successfully created replacement object to every vanilla
+    // shader entry already matched to this definition. The definition owns
+    // the D3D object; entries only cache its pointer for render-thread lookup.
+    //
+    // Background precompilation creates def->loaded*Shader before a vanilla
+    // permutation necessarily executes. Without this publication step the
+    // monitor reports INVALID and the entry remains empty until PSSetShader /
+    // VSSetShader happens to bind that exact permutation.
+    void PublishReplacementForDefinition(ShaderDefinition* def) {
+        if (!def) return;
+        std::shared_lock lock(mutex);
+        for (auto& [shader, entry] : entries) {
+            if (entry.matchedDefinition != def) continue;
+            if (def->type == ShaderType::Pixel) {
+                entry.SetReplacementPixelShader(def->loadedPixelShader);
+            } else {
+                entry.SetReplacementVertexShader(def->loadedVertexShader);
+            }
+        }
+    }
     void ClearReplacementsForDefinition(ShaderDefinition* def) {
         // Mutates entries — must be exclusive. Was previously a shared_lock
         // which raced when multiple watcher threads / hot-reload paths fired
@@ -932,7 +990,15 @@ static_assert(offsetof(BSRenderPassLayout, listNext) == 0x38);
 static_assert(offsetof(BSRenderPassLayout, passGroupNext) == 0x40);
 static_assert(offsetof(BSRenderPassLayout, techniqueID) == 0x48);
 
-ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, REX::W32::ID3D11VertexShader* vertexShader, std::vector<uint8_t> bytecode, SIZE_T BytecodeLength);
+ShaderDBEntry AnalyzeShader_Internal(
+    REX::W32::ID3D11PixelShader* pixelShader,
+    REX::W32::ID3D11VertexShader* vertexShader,
+    std::vector<uint8_t> bytecode,
+    SIZE_T bytecodeLength,
+    std::uint32_t fxpPixelShaderID = 0,
+    bool hasFxpPixelShaderID = false,
+    std::uint32_t fxpShaderType = 0,
+    bool hasFxpShaderType = false);
 bool CompileShader_Internal(ShaderDefinition* def);
 bool DoesEntryMatchDefinition_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);
 void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);

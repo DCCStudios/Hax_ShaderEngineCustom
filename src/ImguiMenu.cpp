@@ -550,7 +550,9 @@ void UIDrawShaderDebugOverlay() {
         // and push them to the clipboard as CSV (definitionId,used,shaderUid).
         // Run before renderRow consumes the recentlyUsed flags so the snapshot
         // reflects what the user sees in the Used column this frame.
-        std::string csv = "definition,status,used,shaderUid\n";
+        std::string csv =
+            "definition,status,used,shaderUid,fxpShaderType,"
+            "fxpPixelShaderId\n";
         auto appendRow = [&](const ShaderDBEntry& e) {
             const ShaderDefinition* def = e.GetMatchedDefinition();
             const char* id = def ? def->id.c_str() : "<removed>";
@@ -561,15 +563,27 @@ void UIDrawShaderDebugOverlay() {
                 : (e.GetReplacementVertexShader() != nullptr);
             const bool hasShaderFile = def && !def->shaderFile.empty();
             const bool isBuggy = def && def->buggy;
-            const char* status = hasReplacement
-                ? "REPLACED"
-                : (isBuggy ? "BUGGY"
-                           : (hasShaderFile ? "INVALID" : "MATCHED"));
+            const bool featureDisabled =
+                def && def->shadowUpgrade && !SHADOW_UPGRADE_ON;
+            const char* status = featureDisabled
+                ? "DISABLED"
+                : (hasReplacement
+                       ? "REPLACED"
+                       : (isBuggy ? "INVALID"
+                                  : (hasShaderFile ? "PENDING" : "MATCHED")));
             csv += id;
             csv += ',';
             csv += status;
             csv += used ? ",YES," : ",NO,";
             csv += uid;
+            csv += ',';
+            if (e.hasFxpShaderType) {
+                csv += std::format("0x{:08X}", e.fxpShaderType);
+            }
+            csv += ',';
+            if (e.hasFxpPixelShaderID) {
+                csv += std::format("0x{:08X}", e.fxpPixelShaderID);
+            }
             csv += '\n';
         };
         std::shared_lock lock(g_ShaderDB.mutex);
@@ -632,13 +646,24 @@ void UIDrawShaderDebugOverlay() {
                 const char* id = def ? def->id.c_str() : "<removed>";
                 bool hasReplacement = (entry.type == ShaderType::Pixel) ? (entry.GetReplacementPixelShader() != nullptr) : (entry.GetReplacementVertexShader() != nullptr);
                 bool hasShaderFile = def && !def->shaderFile.empty();
-                if (hasReplacement) ImGui::TextColored(ImVec4(0,1,0,1), "%s", id);
+                bool featureDisabled = def && def->shadowUpgrade && !SHADOW_UPGRADE_ON;
+                if (featureDisabled) ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1), "%s", id);
+                else if (hasReplacement) ImGui::TextColored(ImVec4(0,1,0,1), "%s", id);
+                else if (def && def->buggy) ImGui::TextColored(ImVec4(1,0.25f,0.25f,1), "%s", id);
                 else if (hasShaderFile) ImGui::TextColored(ImVec4(1,0.5f,0,1), "%s", id);
                 else ImGui::TextColored(ImVec4(1,1,0,1), "%s", id);
+                if (entry.hasFxpPixelShaderID && ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "FXP family 0x%08X, permutation 0x%08X",
+                        entry.hasFxpShaderType ? entry.fxpShaderType : 0xFFFFFFFFu,
+                        entry.fxpPixelShaderID);
+                }
                 // Column 1: Status
                 ImGui::TableSetColumnIndex(1);
-                if (hasReplacement) ImGui::TextColored(ImVec4(0,1,0,1), "REPLACED");
-                else if (hasShaderFile) ImGui::TextColored(ImVec4(1,0.5f,0,1), "INVALID");
+                if (featureDisabled) ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1), "DISABLED");
+                else if (hasReplacement) ImGui::TextColored(ImVec4(0,1,0,1), "REPLACED");
+                else if (def && def->buggy) ImGui::TextColored(ImVec4(1,0.25f,0.25f,1), "INVALID");
+                else if (hasShaderFile) ImGui::TextColored(ImVec4(1,0.5f,0,1), "PENDING");
                 else ImGui::TextColored(ImVec4(1,1,0,1), "MATCHED");
                 // Column 2: Recently used
                 ImGui::TableSetColumnIndex(2);
@@ -722,9 +747,11 @@ void UIDrawShaderDebugOverlay() {
                         ? (e->GetReplacementPixelShader() != nullptr)
                         : (e->GetReplacementVertexShader() != nullptr);
                     const bool hasShaderFile = d && !d->shaderFile.empty();
-                    if (hasReplacement) return 0; // REPLACED
-                    if (hasShaderFile) return 1;  // INVALID
-                    return 2;                     // MATCHED
+                    if (d && d->shadowUpgrade && !SHADOW_UPGRADE_ON) return 0;
+                    if (hasReplacement) return 1;
+                    if (d && d->buggy) return 2;
+                    if (hasShaderFile) return 3;
+                    return 4;
                 };
                 ImGuiTableSortSpecs* sortSpecs = ImGui::TableGetSortSpecs();
                 if (sortSpecs && sortSpecs->SpecsCount > 0) {

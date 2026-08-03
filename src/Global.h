@@ -28,6 +28,12 @@ extern std::filesystem::path g_pluginPath;
 extern bool DEBUGGING;
 // Master runtime kill switch for shader replacements and custom passes.
 extern bool SHADERENGINE_EFFECTS_ON;
+// Enables the validated OG deferred-light scope and directional-cascade
+// operand patch. Legacy Shader.ini rules may also opt into this gate.
+extern bool SHADOW_UPGRADE_ON;
+// End distance of the highest-detail directional-shadow cascade. This is
+// applied only with SHADOW_UPGRADE_ON and requires a restart.
+extern float DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE;
 // Custom buffer update flag
 extern bool CUSTOMBUFFER_ON;
 // Experimental directional shadow-map static-depth cache. Off by default.
@@ -100,6 +106,9 @@ extern REX::W32::ID3D11ShaderResourceView* g_depthSRV;
 // render thread's shader-creation hook to skip analysis on real game
 // shaders (or vice versa).
 extern thread_local bool g_isCreatingReplacementShader;
+// Original engine PS associated with the currently bound replacement. Updated
+// by the PSSetShader hook before ShaderEngine substitutes the D3D11 object.
+extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
 // Set while BindInjectedPixelShaderResources is mutating SRV slots, so the
 // PSSetShaderResources hook does not re-enter and create infinite recursion.
 // thread_local for the same reason as above (also: PSSetShaderResources is
@@ -238,6 +247,9 @@ public:
     // this to know when to drop compiled state before re-compiling.
     bool ConsumeReloadRequest() {
         return reloadRequested.exchange(false, std::memory_order_acq_rel);
+    }
+    void RequestReload() {
+        reloadRequested.store(true, std::memory_order_release);
     }
     void Check() {
         try {

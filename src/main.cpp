@@ -2,9 +2,11 @@
 #include <CustomPass.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
+#include <LocalLightBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
+#include <ShadowUpgrade.h>
 #include <LightSorter.h>
 
 // Global logger pointer
@@ -82,6 +84,8 @@ std::filesystem::path g_shaderFolderPath;
 bool DEBUGGING = false;
 // Master runtime kill switch for shader replacements and custom passes.
 bool SHADERENGINE_EFFECTS_ON = true;
+bool SHADOW_UPGRADE_ON = false;
+float DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE = 1600.0f;
 // Custom buffer update flag
 bool CUSTOMBUFFER_ON = true;
 // Experimental directional shadow-map static-depth cache benchmark
@@ -313,6 +317,8 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
         bool foundShadowTelemetry = false;
 #endif
         bool foundShaderEngineEffects = false;
+        bool foundShadowUpgrade = false;
+        bool foundDirectionalShadowFirstCascadeDistance = false;
         bool foundShadowCache = false;
         bool foundCommandBufferReplayDedupeSrv = false;
         for (auto& line : lines) {
@@ -337,6 +343,14 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             if (lowerKey == "shaderengine_effects_on") {
                 line = std::string("SHADERENGINE_EFFECTS_ON=") + (SHADERENGINE_EFFECTS_ON ? "true" : "false");
                 foundShaderEngineEffects = true;
+            } else if (lowerKey == "shadow_upgrade_on") {
+                line = std::string("SHADOW_UPGRADE_ON=") + (SHADOW_UPGRADE_ON ? "true" : "false");
+                foundShadowUpgrade = true;
+            } else if (lowerKey == "directional_shadow_first_cascade_distance") {
+                line = std::format(
+                    "DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE={}",
+                    DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE);
+                foundDirectionalShadowFirstCascadeDistance = true;
             } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
@@ -377,6 +391,21 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             lines.emplace_back("; --- SHADERENGINE EFFECTS ---");
             lines.emplace_back("; Master kill switch for shader replacements and custom passes.");
             lines.emplace_back(std::string("SHADERENGINE_EFFECTS_ON=") + (SHADERENGINE_EFFECTS_ON ? "true" : "false"));
+        }
+        if (!foundShadowUpgrade) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- SHADOW UPGRADE ---");
+            lines.emplace_back("; Validated OG deferred-light scope and directional-cascade patch.");
+            lines.emplace_back(std::string("SHADOW_UPGRADE_ON=") + (SHADOW_UPGRADE_ON ? "true" : "false"));
+        }
+        if (!foundDirectionalShadowFirstCascadeDistance) {
+            lines.emplace_back("; End distance of the highest-detail directional-shadow cascade.");
+            lines.emplace_back("; Requires SHADOW_UPGRADE_ON=true and a restart; must be below 3000 and fDirShadowDistance.");
+            lines.emplace_back(std::format(
+                "DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE={}",
+                DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE));
         }
         if (!foundShadowCache) {
             if (!lines.empty() && !lines.back().empty()) {
@@ -578,6 +607,10 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                         def.active = true;
                     }
                 }
+                else if (lowerKey == "shadowupgrade") {
+                    const auto enabled = ToLower(value);
+                    def.shadowUpgrade = enabled == "true" || enabled == "1" || enabled == "on";
+                }
                 // Default to 0
                 else if (lowerKey == "priority") {
                     try {
@@ -627,6 +660,39 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                             def.asmHash.push_back(ParseHexFormID(segment));
                         } catch (...) {
                             REX::WARN("LoadShaderDefinitionsFromFile: Invalid asmHash for {}: {}", shaderId, segment);
+                        }
+                    }
+                }
+                else if (lowerKey == "fxppixelshaderid" ||
+                         lowerKey == "fxpshaderid") {
+                    std::stringstream ss(value);
+                    std::string segment;
+                    while (std::getline(ss, segment, ',')) {
+                        try {
+                            def.fxpPixelShaderID.push_back(
+                                ParseHexFormID(segment));
+                        } catch (...) {
+                            REX::WARN(
+                                "LoadShaderDefinitionsFromFile: Invalid "
+                                "fxpPixelShaderID for {}: {}",
+                                shaderId,
+                                segment);
+                        }
+                    }
+                }
+                else if (lowerKey == "fxpshadertype") {
+                    std::stringstream ss(value);
+                    std::string segment;
+                    while (std::getline(ss, segment, ',')) {
+                        try {
+                            def.fxpShaderType.push_back(
+                                ParseHexFormID(segment));
+                        } catch (...) {
+                            REX::WARN(
+                                "LoadShaderDefinitionsFromFile: Invalid "
+                                "fxpShaderType for {}: {}",
+                                shaderId,
+                                segment);
                         }
                     }
                 }
@@ -699,12 +765,14 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                         size_t atPos = token.find('@');
                         if (atPos != std::string::npos) {
                             try {
-                                int slot = std::stoi(token.substr(0, atPos));
-                                std::string dimStr = token.substr(atPos + 1);
-                                // Trim whitespace from dimension string
-                                dimStr.erase(0, dimStr.find_first_not_of(" \t"));
-                                dimStr.erase(dimStr.find_last_not_of(" \t") + 1);
-                                int dimension = dimStr.empty() ? -1 : std::stoi(dimStr);
+                                // Shader.ini uses dimension@slot, matching the
+                                // generated metadata written by ShaderPipeline.
+                                int dimension = std::stoi(token.substr(0, atPos));
+                                std::string slotStr = token.substr(atPos + 1);
+                                // Trim whitespace from slot string
+                                slotStr.erase(0, slotStr.find_first_not_of(" \t"));
+                                slotStr.erase(slotStr.find_last_not_of(" \t") + 1);
+                                int slot = slotStr.empty() ? -1 : std::stoi(slotStr);
                                 def.textureDimensions.emplace_back(dimension, slot);
                                 if (dimension >= 0 && dimension < 32) {
                                     def.textureDimensionMask |= (1UL << dimension);
@@ -1111,6 +1179,37 @@ void LoadConfig(HMODULE hModule) {
             REX::INFO("LoadConfig: SHADERENGINE_EFFECTS_ON set to {}", SHADERENGINE_EFFECTS_ON);
             continue;
         }
+        else if (lowerKey == "shadow_upgrade_on") {
+            const std::string v = ToLower(value);
+            SHADOW_UPGRADE_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: SHADOW_UPGRADE_ON set to {}", SHADOW_UPGRADE_ON);
+            continue;
+        }
+        else if (lowerKey == "directional_shadow_first_cascade_distance") {
+            try {
+                const auto distance = std::stof(value);
+                if (!std::isfinite(distance) || distance <= 0.0f) {
+                    REX::WARN(
+                        "LoadConfig: DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE "
+                        "must be finite and positive; keeping {}",
+                        DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE);
+                } else {
+                    DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE = distance;
+                    REX::INFO(
+                        "LoadConfig: DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE "
+                        "set to {}",
+                        DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE);
+                }
+            } catch (...) {
+                REX::WARN(
+                    "LoadConfig: Invalid "
+                    "DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE value: {}; "
+                    "keeping {}",
+                    value,
+                    DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE);
+            }
+            continue;
+        }
         else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
             const std::string v = ToLower(value);
             SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = (v == "true" || v == "1" || v == "on");
@@ -1498,11 +1597,16 @@ void F4SEMessageHandler(F4SE::MessagingInterface::Message *a_message) {
             break;
         case F4SE::MessagingInterface::kGameLoaded:
             REX::INFO("Received kMessage_GameLoaded. A save game has been loaded.");
+            ShadowUpgrade::OnGameDataReady();
             ResetPlayerRadDamageTracking();
             ClearActorDrawTaggedGeometry_Internal();
             break;
         case F4SE::MessagingInterface::kGameDataReady:
             REX::INFO("Received kMessage_GameDataReady. Game data is ready.");
+            // Fallout applies INIPref-backed renderer globals after plugin load.
+            // Install the first-cascade override only after the live
+            // fDirShadowDistance contract is populated.
+            ShadowUpgrade::OnGameDataReady();
             // Get the global data handle and interfaces
             g_dataHandle = RE::TESDataHandler::GetSingleton();
             if (g_dataHandle) {
@@ -1522,11 +1626,13 @@ void F4SEMessageHandler(F4SE::MessagingInterface::Message *a_message) {
             break;
         case F4SE::MessagingInterface::kPostLoadGame:
             REX::INFO("Received kMessage_PostLoadGame. A save game has been loaded.");
+            ShadowUpgrade::OnGameDataReady();
             ResetPlayerRadDamageTracking();
             ClearActorDrawTaggedGeometry_Internal();
             break;
         case F4SE::MessagingInterface::kNewGame:
             REX::INFO("Received kMessage_NewGame. A new game has been started.");
+            ShadowUpgrade::OnGameDataReady();
             ResetPlayerRadDamageTracking();
             ClearActorDrawTaggedGeometry_Internal();
             // Install graphics hooks
@@ -1567,6 +1673,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // the user presses Numpad *; D3D resources are allocated lazily on first
     // capture, so it's safe to call this before the renderer is up.
     LightTracker::Initialize();
+    LocalLightBridge::Initialize();
     // Cull-policy module: arms BSLight::TestFrustumCull to consult active
     // shader rules for an optional bound-radius scale value. Side-effect-free
     // until a Shader.ini block sets `lightCullRadiusScaleValue` AND that
@@ -1590,6 +1697,10 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
+    // The shadow-upgrade module owns the sole DeferredLightsImpl wrapper used
+    // for renderer phase context. It is observe/dispatch-only unless a
+    // separately gated consumer is enabled.
+    ShadowUpgrade::Initialize();
     // Phase telemetry installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
     // = no logging.
@@ -1599,9 +1710,8 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
     ShadowTelemetry::Initialize();
 #endif
-    // LightSorter ? stable-partitions the point-light array by stencil flag
-    // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
-    // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.
+    // LightSorter stable-partitions the point-light array by stencil flag
+    // inside ShadowUpgrade's validated DeferredLightsImpl wrapper.
     LightSorter::Initialize();
     // Get the scaleform interface
     g_scaleformInterface = F4SE::GetScaleformInterface();
@@ -1665,6 +1775,7 @@ extern "C"
         }
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
+        LocalLightBridge::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
         // during teardown bails out of the slow path cheaply.
         LightCullPolicy::Shutdown();

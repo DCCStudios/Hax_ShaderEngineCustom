@@ -1,6 +1,7 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <LocalLightBridge.h>
 #include <RenderTargets.h>
 #include <ShaderResources.h>
 #include <d3d11.h>
@@ -122,7 +123,8 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
 }
 
 bool ParseInputBinding(const std::string& token, InputBinding& out) {
-    // Format: "<slot>:<source>" where source is depth | currentRTV | currentPSRV:N | customResource:NAME | gbufferRT:N
+    // Format: "<slot>:<source>" where source is depth | currentRTV |
+    // currentPSRV:N | customResource:NAME | gbufferRT:N
     auto colon = token.find(':');
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
@@ -199,6 +201,26 @@ ThreadGroupDim ParseThreadGroupDim(const std::string& s) {
 bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
                                uint32_t backbufferW, uint32_t backbufferH) {
     if (!device) return false;
+    if (spec.renderDomain) {
+        constexpr float kMinimumRenderExtent = 16.0f;
+        const bool renderExtentValid =
+            std::isfinite(g_customBufferData.g_RenderInfo.x) &&
+            std::isfinite(g_customBufferData.g_RenderInfo.y) &&
+            g_customBufferData.g_RenderInfo.x >= kMinimumRenderExtent &&
+            g_customBufferData.g_RenderInfo.y >= kMinimumRenderExtent;
+        if (renderExtentValid) {
+            const auto renderW = static_cast<uint32_t>(
+                std::round(g_customBufferData.g_RenderInfo.x));
+            const auto renderH = static_cast<uint32_t>(
+                std::round(g_customBufferData.g_RenderInfo.y));
+            // The injected domain is renderer telemetry, not permission to
+            // allocate beyond the live kMain contract. This also makes a mode
+            // transition fail safely if the injected buffer and the renderer
+            // briefly disagree for one frame.
+            backbufferW = (std::min)(renderW, backbufferW);
+            backbufferH = (std::min)(renderH, backbufferH);
+        }
+    }
     uint32_t targetW = 0, targetH = 0;
     ResolveScale(spec.scaleMode, spec.scaleDiv, spec.absWidth, spec.absHeight,
                  backbufferW, backbufferH, targetW, targetH);
@@ -255,6 +277,12 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
             Release(); return false;
         }
     }
+    REX::INFO(
+        "CustomPass::Resource[{}]: allocated {}x{} (domain={})",
+        spec.name,
+        width,
+        height,
+        spec.renderDomain ? "render" : "allocation");
     return true;
 }
 
@@ -426,6 +454,7 @@ bool Registry::ParseResourceSection(const std::string& name,
 
         if      (lk == "format")          res->spec.format = ParseFormat(value);
         else if (lk == "scale")           ParseScale(value, res->spec.scaleMode, res->spec.scaleDiv, res->spec.absWidth, res->spec.absHeight);
+        else if (lk == "domain")          res->spec.renderDomain = (ToLower(value) == "render");
         else if (lk == "miplevels")       { try { res->spec.mipLevels = static_cast<uint32_t>(std::stoul(value)); } catch (...) {} }
         else if (lk == "srvslot")         { try { res->spec.srvSlot = std::stoi(value); } catch (...) {} }
         else if (lk == "global" || lk == "globalbind") res->spec.globalBind = (ToLower(value) == "true" || value == "1");
@@ -452,8 +481,11 @@ bool Registry::ParseResourceSection(const std::string& name,
         hasGlobalResourceBindings.store(true, std::memory_order_release);
     }
     resources.push_back(std::move(res));
-    REX::INFO("CustomPass: registered customResource '{}' (slot t{}, global={})",
-        name, raw->spec.srvSlot, raw->spec.globalBind ? "true" : "false");
+    REX::INFO("CustomPass: registered customResource '{}' (slot t{}, global={}, domain={})",
+        name,
+        raw->spec.srvSlot,
+        raw->spec.globalBind ? "true" : "false",
+        raw->spec.renderDomain ? "render" : "allocation");
     return true;
 }
 
@@ -1294,6 +1326,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularFloatsSRV) context->PSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         if (g_modularIntsSRV)   context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
+        LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
         REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
         context->PSSetSamplers(0, 2, samplers);
         context->Draw(3, 0);
@@ -1317,6 +1350,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularFloatsSRV) context->CSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         if (g_modularIntsSRV)   context->CSSetShaderResources(MODULAR_INTS_SLOT,   1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
+        LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/false);
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());
