@@ -2801,8 +2801,10 @@ namespace
             RemoveActorDrawTaggedGeometry(bipObject->partClone.get());
         }
 
+        // RemovePart can run inside AIProcess::Update3dModel and can queue
+        // scenegraph detaches. A full refresh here may walk stale face nodes;
+        // stable model lifecycle hooks repopulate the actor tags instead.
         OriginalBipedAnimRemovePart(biped, bipObject, queueDetach);
-        RefreshActorDrawTaggedGeometry(biped);
     }
 
     void HookedFinishShadowRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
