@@ -131,6 +131,14 @@ extern REX::W32::ID3D11Buffer* g_modularBoolsSRVBuffer;
 extern REX::W32::ID3D11ShaderResourceView* g_modularBoolsSRV;
 // Global flag if an INI reload is queued
 extern std::atomic<bool> g_reloadQueued;
+// Bumped once per manual "Reload shaders" request (the settings-overlay
+// button). Every ShaderDefinition carries the generation it last applied;
+// MaybeApplyHlslHotReload_Internal drops compiled state on the render thread
+// whenever the two differ. This is the watcher-independent half of the
+// hot-reload pipeline: HlslFileWatcher / IncludeDirWatcher only exist when
+// DEVELOPMENT=true, so without it a shipped build has no way to pick up HLSL
+// edits short of a game restart.
+extern std::atomic<std::uint64_t> g_manualShaderReloadGeneration;
 
 // Helper function to convert string to lowercase
 inline std::string ToLower(const std::string& str) {
@@ -141,6 +149,9 @@ inline std::string ToLower(const std::string& str) {
 
 std::string GetCommonShaderHeaderHLSLTop();
 std::string GetCommonShaderHeaderHLSLBottom();
+// True only when both formats used by the voxel pipeline support typed UAV
+// loads on the live D3D11 device. No-device calls return false without caching.
+bool SupportsVoxelTypedUavLoads();
 bool SaveShaderEngineConfig(std::string* errorMessage = nullptr);
 
 // --- Compiled-shader cache ----------------------------------------------

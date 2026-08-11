@@ -115,6 +115,46 @@ static void SaveShaderSettingsWithFeedback()
     g_shaderSettingsSaveModalRequested = true;
 }
 
+// Manual HLSL hot reload. The file watchers that normally drive recompiles
+// only exist when DEVELOPMENT=true, so this is the shipped-build path for
+// picking up shader edits without a restart: flush the include memo (so the
+// on-disk shader cache re-keys against the current include contents), then
+// flag every replacement definition and custom pass. Nothing is released
+// here - the render thread drops the compiled objects on the next bind/fire,
+// since it is the only thread that may touch objects the immediate context
+// might currently have bound.
+static void ReloadShadersWithFeedback()
+{
+    ShaderCache::InvalidateIncludeMemo();
+    std::size_t definitionCount = 0;
+    {
+        std::shared_lock lock(g_shaderDefinitions.mutex);
+        for (auto* def : g_shaderDefinitions.definitions) {
+            if (def && def->active && !def->shaderFile.empty()) {
+                ++definitionCount;
+            }
+        }
+    }
+    g_manualShaderReloadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    const std::size_t passCount = CustomPass::g_registry.RequestReloadAll();
+
+    REX::INFO(
+        "ReloadShadersWithFeedback: manual reload requested, generation {} - {} replacement shader(s), {} custom pass(es)",
+        g_manualShaderReloadGeneration.load(std::memory_order_relaxed),
+        definitionCount,
+        passCount);
+
+    g_shaderSettingsSaveSucceeded = true;
+    g_shaderSettingsSaveMessage = std::format(
+        "Marked {} replacement shader(s) and {} custom pass(es) for reload.\n"
+        "Each one recompiles from disk the next time it is used, so edits "
+        "appear over the next frame or two.\n"
+        "Adding or removing Values.ini settings still needs a game restart.",
+        definitionCount,
+        passCount);
+    g_shaderSettingsSaveModalRequested = true;
+}
+
 // UI: Compiler neon flash shader pointer
 REX::W32::ID3D11PixelShader* g_flashPixelShader = nullptr;
 // UI: Imgui WndProc hook variables
@@ -351,6 +391,16 @@ void UIDrawShaderSettingsOverlay() {
     if (ImGui::Button("Save settings")) {
         SaveShaderSettingsWithFeedback();
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload shaders")) {
+        ReloadShadersWithFeedback();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Recompile every replacement shader and custom pass from disk.\n"
+            "Picks up .hlsl and include edits without restarting the game.\n"
+            "Values.ini settings added or removed still need a restart.");
+    }
     ImGui::Separator();
 
     bool shaderEngineEffectsOn = SHADERENGINE_EFFECTS_ON;
@@ -429,6 +479,13 @@ void UIDrawShaderSettingsOverlay() {
                     /* value changed */
                 }
                 break;
+        }
+        if (!sValue.tooltip.empty() && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+            ImGui::TextUnformatted(sValue.tooltip.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
         }
         if (canEditValue) {
             ImGui::SameLine();
@@ -1065,10 +1122,11 @@ void Registry::DrawDebugOverlay() {
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::CollapsingHeader("Passes", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::BeginTable("passes_tbl", 6, kTableFlags)) {
+        if (ImGui::BeginTable("passes_tbl", 7, kTableFlags)) {
             ImGui::TableSetupColumn("Name",      ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableSetupColumn("Kind",      ImGuiTableColumnFlags_WidthFixed,  40.0f);
             ImGui::TableSetupColumn("Status",    ImGuiTableColumnFlags_WidthFixed,  60.0f);
+            ImGui::TableSetupColumn("GPU ms",    ImGuiTableColumnFlags_WidthFixed,  65.0f);
             ImGui::TableSetupColumn("LastFired", ImGuiTableColumnFlags_WidthFixed,  90.0f);
             ImGui::TableSetupColumn("Trigger",   ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableSetupColumn("Detail",    ImGuiTableColumnFlags_WidthStretch, 2.5f);
@@ -1105,6 +1163,28 @@ void Registry::DrawDebugOverlay() {
                 ImGui::TextColored(col, "%s", status);
 
                 ImGui::TableSetColumnIndex(3);
+                const uint64_t timingSamples =
+                    p->gpuTimingSamples.load(std::memory_order_relaxed);
+                if (!s.profileGpu) {
+                    ImGui::TextUnformatted("-");
+                } else if (timingSamples == 0) {
+                    ImGui::TextUnformatted("...");
+                } else {
+                    const float averageMs =
+                        p->gpuAverageMs.load(std::memory_order_relaxed);
+                    const float lastMs =
+                        p->gpuLastMs.load(std::memory_order_relaxed);
+                    ImGui::Text("%.3f", averageMs);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Asynchronous GPU time\nEMA: %.3f ms\nLast: %.3f ms\nSamples: %llu\nNo flush or render-thread wait",
+                            averageMs,
+                            lastMs,
+                            static_cast<unsigned long long>(timingSamples));
+                    }
+                }
+
+                ImGui::TableSetColumnIndex(4);
                 // The pass fires DURING frame F's draws; OnFramePresent then
                 // increments currentFrame to F+1; this overlay renders AFTER
                 // the increment. So a pass with lastFired == currentFrame-1
@@ -1123,10 +1203,10 @@ void Registry::DrawDebugOverlay() {
                     }
                 }
 
-                ImGui::TableSetColumnIndex(4);
+                ImGui::TableSetColumnIndex(5);
                 ImGui::TextUnformatted(TriggerName(s.trigger));
 
-                ImGui::TableSetColumnIndex(5);
+                ImGui::TableSetColumnIndex(6);
                 switch (s.trigger) {
                     case TriggerKind::BeforeShaderUID:
                         ImGui::TextUnformatted(s.triggerUID.c_str());

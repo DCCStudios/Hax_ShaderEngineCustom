@@ -135,8 +135,14 @@ depthTest=false
 
 ; --- Logging ---
 log=false
+profileGpu=false              ; asynchronous timestamps shown in the Custom Passes overlay
 [/customPass:hachiSSRTGI]
 ```
+
+`profileGpu=true` wraps only the pass draw or dispatch in a four-slot D3D11
+timestamp ring. Results are polled at least two frames later with
+`D3D11_ASYNC_GETDATA_DONOTFLUSH`; an unresolved result is skipped rather than
+waiting for the GPU. The overlay reports the most recent sample and an EMA.
 
 ### Trigger semantics
 

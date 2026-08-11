@@ -199,6 +199,9 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_CurrentCameraPositionAdjust; // absolute BGS camera translation for the current frame
 ;    float4   GFXInjected[0].g_PreviousCameraPositionAdjust; // translation paired with g_PrevViewProjRow*
 ;    float4   GFXInjected[0].g_RenderInfo; // xy=logical render extent, zw=display extent
+;    float4   GFXInjected[0].g_WorldSH_R; // world-space L1 ambient cube for R; .xyz=directional bands, .w=DC
+;    float4   GFXInjected[0].g_WorldSH_G; // world-space L1 ambient cube for G
+;    float4   GFXInjected[0].g_WorldSH_B; // world-space L1 ambient cube for B
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -212,6 +215,7 @@ LIGHT_SORTER_MODE=off
 ;id=g_SomeFloatValue      ; the name of the variable in the shader to set, e.g. g_SomeFloatValue
 ;label="Some Float Value" ; the label to show in the menu for this setting
 ;group=Example            ; optional group name to organize this setting in the menu
+;tooltip=Hover help text   ; optional wrapped help shown while hovering the control
 ;type=float               ; the type of the variable (bool, int, float)
 ;value=0.5                ; the default value to set (true/false for bool, numeric value for int and float)
 ;min=0.0                  ; optional minimum value for float and int types
@@ -244,9 +248,51 @@ float4 main(PS_INPUT input) : SV_Target {
 }
 )";
 
+bool SupportsVoxelTypedUavLoads()
+{
+    auto* device = g_rendererData ? g_rendererData->device : nullptr;
+    if (!device) {
+        return false;
+    }
+
+    struct FormatSupport2Data {
+        REX::W32::DXGI_FORMAT inFormat;
+        std::uint32_t outFormatSupport2;
+    };
+
+    static std::mutex cacheMutex;
+    static REX::W32::ID3D11Device* cachedDevice = nullptr;
+    static bool cachedResult = false;
+    std::lock_guard lock(cacheMutex);
+    if (cachedDevice == device) {
+        return cachedResult;
+    }
+
+    const auto supportsTypedLoad = [device](REX::W32::DXGI_FORMAT format) {
+        FormatSupport2Data support{ format, 0 };
+        const auto hr = device->CheckFeatureSupport(
+            REX::W32::D3D11_FEATURE_FORMAT_SUPPORT2,
+            &support,
+            sizeof(support));
+        return REX::W32::SUCCESS(hr) &&
+               (support.outFormatSupport2 &
+                REX::W32::D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+    };
+
+    cachedResult = supportsTypedLoad(REX::W32::DXGI_FORMAT_R16_FLOAT) &&
+                   supportsTypedLoad(REX::W32::DXGI_FORMAT_R16G16B16A16_FLOAT);
+    cachedDevice = device;
+    REX::INFO("Voxel GI: R16/RGBA16 typed UAV loads {}",
+        cachedResult ? "supported" : "unsupported; using R32 volume formats");
+    return cachedResult;
+}
+
 std::string GetCommonShaderHeaderHLSLTop()
 {
-    return R"(
+    std::string header = SupportsVoxelTypedUavLoads()
+        ? "#define VX_TYPED_UAV_LOADS 1\n"
+        : "#define VX_TYPED_UAV_LOADS 0\n";
+    header += R"(
         // Data passed from the plugin as resource view
         struct GFXBoosterAccessData
         {
@@ -379,6 +425,14 @@ std::string GetCommonShaderHeaderHLSLTop()
             // upscalers may keep some engine resources display-sized while
             // rendering the G-buffer through reduced proxy allocations.
             float4 g_RenderInfo; // xy=render, zw=display
+
+            // World-space L1 coefficients from the same blended ambient cube
+            // as g_SH. These fields are appended to preserve the offsets of
+            // the established structured-buffer ABI. World-space tracing
+            // passes evaluate them directly with float4(worldDirection, 1).
+            float4 g_WorldSH_R;
+            float4 g_WorldSH_G;
+            float4 g_WorldSH_B;
         };
 
         struct DrawTagData
@@ -422,7 +476,8 @@ std::string GetCommonShaderHeaderHLSLTop()
         #define GFX_RACE_GROUP_29      0x20000000u
         #define GFX_RACE_GROUP_30      0x40000000u
         #define GFX_RACE_GROUP_31      0x80000000u
-        )";
+    )";
+    return header;
 }
 
 // Here will be the dynamic Shader Settings values defined
@@ -866,6 +921,10 @@ HRESULT __stdcall ShaderIncludeHandler::Close(LPCVOID pData) {
 // --- IncludeDirWatcher implementation -----------------------------------
 
 std::unique_ptr<IncludeDirWatcher> g_includeDirWatcher;
+
+// Starts at 0; every ShaderDefinition starts at 0 too, so no reload is
+// pending until the UI button bumps this.
+std::atomic<std::uint64_t> g_manualShaderReloadGeneration{ 0 };
 
 namespace {
 

@@ -685,6 +685,9 @@ void UpdateCustomBuffer_Internal() {
     DirectX::XMFLOAT4 shR(0.0f, 0.0f, 0.0f, 0.0f);
     DirectX::XMFLOAT4 shG(0.0f, 0.0f, 0.0f, 0.0f);
     DirectX::XMFLOAT4 shB(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShR(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShG(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShB(0.0f, 0.0f, 0.0f, 0.0f);
     if (g_sky) {
         const auto& dac = g_sky->directionalAmbientColorsA;
 
@@ -705,10 +708,38 @@ void UpdateCustomBuffer_Internal() {
             dac[1][0].b, dac[1][1].b,
             dac[2][0].b, dac[2][1].b,
             skyToNormalBasis);
+
+        // Voxel and screen-space ray passes reconstruct world-space normals
+        // and directions. Publish the same blended ambient cube in its native
+        // world basis so those passes do not inherit camera rotation from the
+        // legacy deferred-light packing above.
+        constexpr float identityBasis[3][3] = {
+            { 1.0f, 0.0f, 0.0f },
+            { 0.0f, 1.0f, 0.0f },
+            { 0.0f, 0.0f, 1.0f },
+        };
+        worldShR = PackChannel(
+            dac[0][0].r, dac[0][1].r,
+            dac[1][0].r, dac[1][1].r,
+            dac[2][0].r, dac[2][1].r,
+            identityBasis);
+        worldShG = PackChannel(
+            dac[0][0].g, dac[0][1].g,
+            dac[1][0].g, dac[1][1].g,
+            dac[2][0].g, dac[2][1].g,
+            identityBasis);
+        worldShB = PackChannel(
+            dac[0][0].b, dac[0][1].b,
+            dac[1][0].b, dac[1][1].b,
+            dac[2][0].b, dac[2][1].b,
+            identityBasis);
     }
     g_customBufferData.g_SH_R = shR;
     g_customBufferData.g_SH_G = shG;
     g_customBufferData.g_SH_B = shB;
+    g_customBufferData.g_WorldSH_R = worldShR;
+    g_customBufferData.g_WorldSH_G = worldShG;
+    g_customBufferData.g_WorldSH_B = worldShB;
     g_customBufferData.g_CurrentCameraPositionAdjust = {
         camState.currentPosAdjust.x,
         camState.currentPosAdjust.y,

@@ -87,6 +87,7 @@ REX::W32::DXGI_FORMAT ParseFormat(const std::string& s) {
         { "R32G32B32A32_FLOAT", REX::W32::DXGI_FORMAT_R32G32B32A32_FLOAT },
         { "R32G32_FLOAT",       REX::W32::DXGI_FORMAT_R32G32_FLOAT },
         { "R32_FLOAT",          REX::W32::DXGI_FORMAT_R32_FLOAT },
+        { "R32_UINT",           REX::W32::DXGI_FORMAT_R32_UINT },
         { "R8_UNORM",           REX::W32::DXGI_FORMAT_R8_UNORM },
     };
     auto it = table.find(s);
@@ -161,12 +162,29 @@ bool ParseOutputBinding(const std::string& token, OutputBinding& out) {
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
     std::string source = token.substr(colon + 1);
-    if (source.rfind("customResource:", 0) == 0) {
+    const std::string lowerSource = ToLower(source);
+    if (lowerSource.rfind("customresource:", 0) == 0) {
         out.kind = OutputKind::Resource;
         out.resourceName = source.substr(strlen("customResource:"));
+        const std::string lowerName = ToLower(out.resourceName);
+        const auto mipMarker = lowerName.rfind("@mip");
+        if (mipMarker != std::string::npos) {
+            const std::string mipText = out.resourceName.substr(mipMarker + 4);
+            if (mipText.empty()) return false;
+            try {
+                size_t consumed = 0;
+                const auto mip = std::stoul(mipText, &consumed);
+                if (consumed != mipText.size()) return false;
+                out.mipLevel = static_cast<uint32_t>(mip);
+            } catch (...) {
+                return false;
+            }
+            out.resourceName.resize(mipMarker);
+            if (out.resourceName.empty()) return false;
+        }
         return true;
     }
-    if (source.rfind("gbufferRT:", 0) == 0) {
+    if (lowerSource.rfind("gbufferrt:", 0) == 0) {
         out.kind = OutputKind::GBufferRT;
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
         return true;
@@ -182,7 +200,11 @@ void ParseList(const std::string& value, std::vector<std::string>& out) {
 
 ThreadGroupDim ParseThreadGroupDim(const std::string& s) {
     ThreadGroupDim d{};
-    if (s.rfind("screen/", 0) == 0) {
+    if (s.rfind("screenceil/", 0) == 0) {
+        d.mode = ScaleMode::ScreenDiv;
+        d.roundUp = true;
+        try { d.value = static_cast<uint32_t>(std::stoul(s.substr(11))); } catch (...) { d.value = 1; }
+    } else if (s.rfind("screen/", 0) == 0) {
         d.mode = ScaleMode::ScreenDiv;
         try { d.value = static_cast<uint32_t>(std::stoul(s.substr(7))); } catch (...) { d.value = 1; }
     } else if (s == "screen") {
@@ -224,42 +246,82 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
     uint32_t targetW = 0, targetH = 0;
     ResolveScale(spec.scaleMode, spec.scaleDiv, spec.absWidth, spec.absHeight,
                  backbufferW, backbufferH, targetW, targetH);
-    if (texture && targetW == width && targetH == height) return true;
+    const bool isVolume = spec.depth > 1;
+    auto targetFormat = spec.format;
+    if (isVolume && spec.needUav && !SupportsVoxelTypedUavLoads()) {
+        if (targetFormat == REX::W32::DXGI_FORMAT_R16_FLOAT) {
+            targetFormat = REX::W32::DXGI_FORMAT_R32_FLOAT;
+        } else if (targetFormat == REX::W32::DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            targetFormat = REX::W32::DXGI_FORMAT_R32_UINT;
+        }
+    }
+    const bool hasTexture = isVolume ? texture3D != nullptr : texture != nullptr;
+    if (hasTexture && targetW == width && targetH == height &&
+        spec.depth == depth && targetFormat == allocatedFormat) return true;
 
     Release();
-    width = targetW; height = targetH;
+    width = targetW; height = targetH; depth = spec.depth;
+    allocatedFormat = targetFormat;
 
-    REX::W32::D3D11_TEXTURE2D_DESC desc{};
-    desc.width            = width;
-    desc.height           = height;
-    desc.mipLevels        = spec.mipLevels;
-    desc.arraySize        = 1;
-    desc.format           = spec.format;
-    desc.sampleDesc.count = 1;
-    desc.usage            = REX::W32::D3D11_USAGE_DEFAULT;
-    desc.bindFlags        = REX::W32::D3D11_BIND_SHADER_RESOURCE;
-    if (spec.needRtv) desc.bindFlags |= REX::W32::D3D11_BIND_RENDER_TARGET;
-    if (spec.needUav) desc.bindFlags |= REX::W32::D3D11_BIND_UNORDERED_ACCESS;
+    std::uint32_t bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+    if (spec.needRtv && !isVolume) bindFlags |= REX::W32::D3D11_BIND_RENDER_TARGET;
+    if (spec.needUav) bindFlags |= REX::W32::D3D11_BIND_UNORDERED_ACCESS;
 
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &texture);
-    if (!REX::W32::SUCCESS(hr) || !texture) {
-        REX::WARN("CustomPass::Resource[{}]: CreateTexture2D failed 0x{:08X}", spec.name, hr);
-        return false;
+    HRESULT hr = 0;
+    if (isVolume) {
+        REX::W32::D3D11_TEXTURE3D_DESC desc{};
+        desc.width = width;
+        desc.height = height;
+        desc.depth = depth;
+        desc.mipLevels = spec.mipLevels;
+        desc.format = allocatedFormat;
+        desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+        desc.bindFlags = bindFlags;
+        hr = device->CreateTexture3D(&desc, nullptr, &texture3D);
+        if (!REX::W32::SUCCESS(hr) || !texture3D) {
+            REX::WARN("CustomPass::Resource[{}]: CreateTexture3D failed 0x{:08X}", spec.name, hr);
+            Release(); return false;
+        }
+    } else {
+        REX::W32::D3D11_TEXTURE2D_DESC desc{};
+        desc.width = width;
+        desc.height = height;
+        desc.mipLevels = spec.mipLevels;
+        desc.arraySize = 1;
+        desc.format = allocatedFormat;
+        desc.sampleDesc.count = 1;
+        desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+        desc.bindFlags = bindFlags;
+        hr = device->CreateTexture2D(&desc, nullptr, &texture);
+        if (!REX::W32::SUCCESS(hr) || !texture) {
+            REX::WARN("CustomPass::Resource[{}]: CreateTexture2D failed 0x{:08X}", spec.name, hr);
+            Release(); return false;
+        }
     }
     {
         REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.format        = spec.format;
-        sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.texture2D.mipLevels = spec.mipLevels;
-        hr = device->CreateShaderResourceView(texture, &sd, &srv);
+        sd.format = allocatedFormat;
+        if (isVolume) {
+            sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE3D;
+            sd.texture3D.mostDetailedMip = 0;
+            sd.texture3D.mipLevels = spec.mipLevels;
+        } else {
+            sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.texture2D.mostDetailedMip = 0;
+            sd.texture2D.mipLevels = spec.mipLevels;
+        }
+        auto* resource = isVolume
+            ? static_cast<REX::W32::ID3D11Resource*>(texture3D)
+            : static_cast<REX::W32::ID3D11Resource*>(texture);
+        hr = device->CreateShaderResourceView(resource, &sd, &srv);
         if (!REX::W32::SUCCESS(hr)) {
             REX::WARN("CustomPass::Resource[{}]: CreateShaderResourceView failed 0x{:08X}", spec.name, hr);
             Release(); return false;
         }
     }
-    if (spec.needRtv) {
+    if (spec.needRtv && !isVolume) {
         REX::W32::D3D11_RENDER_TARGET_VIEW_DESC rd{};
-        rd.format        = spec.format;
+        rd.format        = allocatedFormat;
         rd.viewDimension = REX::W32::D3D11_RTV_DIMENSION_TEXTURE2D;
         hr = device->CreateRenderTargetView(texture, &rd, &rtv);
         if (!REX::W32::SUCCESS(hr)) {
@@ -268,39 +330,67 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
         }
     }
     if (spec.needUav) {
-        REX::W32::D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.format        = spec.format;
-        ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE2D;
-        hr = device->CreateUnorderedAccessView(texture, &ud, &uav);
-        if (!REX::W32::SUCCESS(hr)) {
-            REX::WARN("CustomPass::Resource[{}]: CreateUnorderedAccessView failed 0x{:08X}", spec.name, hr);
-            Release(); return false;
+        mipUavs.reserve(spec.mipLevels);
+        for (uint32_t mip = 0; mip < spec.mipLevels; ++mip) {
+            REX::W32::D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.format = allocatedFormat;
+            if (isVolume) {
+                ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE3D;
+                ud.texture3D.mipSlice = mip;
+                ud.texture3D.firstWSlice = 0;
+                ud.texture3D.wSize = std::max<uint32_t>(1, depth >> mip);
+            } else {
+                ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE2D;
+                ud.texture2D.mipSlice = mip;
+            }
+            REX::W32::ID3D11UnorderedAccessView* mipUav = nullptr;
+            auto* resource = isVolume
+                ? static_cast<REX::W32::ID3D11Resource*>(texture3D)
+                : static_cast<REX::W32::ID3D11Resource*>(texture);
+            hr = device->CreateUnorderedAccessView(resource, &ud, &mipUav);
+            if (!REX::W32::SUCCESS(hr) || !mipUav) {
+                REX::WARN("CustomPass::Resource[{}]: CreateUnorderedAccessView mip {} failed 0x{:08X}", spec.name, mip, hr);
+                Release(); return false;
+            }
+            mipUavs.push_back(mipUav);
         }
+        uav = mipUavs.front();
     }
     REX::INFO(
-        "CustomPass::Resource[{}]: allocated {}x{} (domain={})",
+        "CustomPass::Resource[{}]: allocated {}x{}x{} mips={} format={} (domain={})",
         spec.name,
         width,
         height,
+        depth,
+        spec.mipLevels,
+        static_cast<uint32_t>(allocatedFormat),
         spec.renderDomain ? "render" : "allocation");
     return true;
 }
 
 void Resource::Release() {
-    if (uav) { uav->Release(); uav = nullptr; }
+    for (auto* view : mipUavs) if (view) view->Release();
+    mipUavs.clear();
+    uav = nullptr;
     if (rtv) { rtv->Release(); rtv = nullptr; }
     if (srv) { srv->Release(); srv = nullptr; }
     if (texture) { texture->Release(); texture = nullptr; }
-    width = height = 0;
+    if (texture3D) { texture3D->Release(); texture3D = nullptr; }
+    width = height = depth = 0;
+    allocatedFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
 }
 
 void Resource::SwapContents(Resource& other) {
     std::swap(texture, other.texture);
+    std::swap(texture3D, other.texture3D);
     std::swap(rtv, other.rtv);
     std::swap(srv, other.srv);
     std::swap(uav, other.uav);
+    std::swap(mipUavs, other.mipUavs);
     std::swap(width, other.width);
     std::swap(height, other.height);
+    std::swap(depth, other.depth);
+    std::swap(allocatedFormat, other.allocatedFormat);
 }
 
 // --- Pass ---------------------------------------------------------------
@@ -310,7 +400,163 @@ void Pass::Release() {
     if (psShader) { psShader->Release(); psShader = nullptr; }
     if (csShader) { csShader->Release(); csShader = nullptr; }
     if (compiledBlob) { compiledBlob->Release(); compiledBlob = nullptr; }
+    for (auto& timing : gpuTiming) {
+        if (timing.disjoint) { timing.disjoint->Release(); timing.disjoint = nullptr; }
+        if (timing.begin) { timing.begin->Release(); timing.begin = nullptr; }
+        if (timing.end) { timing.end->Release(); timing.end = nullptr; }
+        timing.submittedFrame = 0;
+        timing.pending = false;
+    }
+    gpuLastMs.store(0.0f, std::memory_order_relaxed);
+    gpuAverageMs.store(0.0f, std::memory_order_relaxed);
+    gpuTimingSamples.store(0, std::memory_order_relaxed);
+    gpuTimingUnavailable = false;
+    gpuTimingFailureLogged = false;
     compileTried = false; compileFailed = false;
+}
+
+namespace {
+bool EnsureGpuTimingQueries(Pass& pass, REX::W32::ID3D11Device* device)
+{
+    if (!pass.spec.profileGpu || pass.gpuTimingUnavailable || !device) {
+        return false;
+    }
+    if (pass.gpuTiming.front().disjoint) {
+        return true;
+    }
+
+    const REX::W32::D3D11_QUERY_DESC disjointDesc{
+        REX::W32::D3D11_QUERY_TIMESTAMP_DISJOINT,
+        0
+    };
+    const REX::W32::D3D11_QUERY_DESC timestampDesc{
+        REX::W32::D3D11_QUERY_TIMESTAMP,
+        0
+    };
+    bool ready = true;
+    for (auto& timing : pass.gpuTiming) {
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&disjointDesc, &timing.disjoint));
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&timestampDesc, &timing.begin));
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&timestampDesc, &timing.end));
+        if (!ready) {
+            break;
+        }
+    }
+    if (ready) {
+        return true;
+    }
+
+    for (auto& timing : pass.gpuTiming) {
+        if (timing.disjoint) { timing.disjoint->Release(); timing.disjoint = nullptr; }
+        if (timing.begin) { timing.begin->Release(); timing.begin = nullptr; }
+        if (timing.end) { timing.end->Release(); timing.end = nullptr; }
+        timing.pending = false;
+    }
+    pass.gpuTimingUnavailable = true;
+    if (!pass.gpuTimingFailureLogged) {
+        REX::WARN(
+            "CustomPass[{}]: asynchronous GPU timestamp queries unavailable; profiling disabled",
+            pass.spec.name);
+        pass.gpuTimingFailureLogged = true;
+    }
+    return false;
+}
+
+Pass::GpuTimingSlot* BeginGpuTiming(
+    Pass& pass,
+    REX::W32::ID3D11Device* device,
+    REX::W32::ID3D11DeviceContext* context,
+    uint32_t frame)
+{
+    if (!context || !EnsureGpuTimingQueries(pass, device)) {
+        return nullptr;
+    }
+
+    auto& timing = pass.gpuTiming[frame % pass.gpuTiming.size()];
+    if (timing.pending) {
+        // Never overwrite an unresolved query. Skipping a diagnostic sample
+        // is preferable to forcing the driver to flush or wait.
+        return nullptr;
+    }
+    context->Begin(timing.disjoint);
+    context->End(timing.begin);
+    timing.submittedFrame = frame;
+    return &timing;
+}
+
+void EndGpuTiming(
+    REX::W32::ID3D11DeviceContext* context,
+    Pass::GpuTimingSlot* timing)
+{
+    if (!context || !timing) {
+        return;
+    }
+    context->End(timing->end);
+    context->End(timing->disjoint);
+    timing->pending = true;
+}
+
+void PollGpuTiming(
+    Pass& pass,
+    REX::W32::ID3D11DeviceContext* context,
+    uint32_t frame)
+{
+    if (!pass.spec.profileGpu || !context || pass.gpuTimingUnavailable) {
+        return;
+    }
+
+    constexpr std::uint32_t kNoFlush =
+        REX::W32::D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    for (auto& timing : pass.gpuTiming) {
+        if (!timing.pending || frame - timing.submittedFrame < 2) {
+            continue;
+        }
+
+        REX::W32::D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+        const HRESULT disjointResult = context->GetData(
+            timing.disjoint,
+            &disjoint,
+            sizeof(disjoint),
+            kNoFlush);
+        if (disjointResult == S_FALSE) {
+            continue;
+        }
+        if (FAILED(disjointResult)) {
+            timing.pending = false;
+            continue;
+        }
+
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        const HRESULT beginResult = context->GetData(
+            timing.begin, &begin, sizeof(begin), kNoFlush);
+        const HRESULT endResult = context->GetData(
+            timing.end, &end, sizeof(end), kNoFlush);
+        if (beginResult == S_FALSE || endResult == S_FALSE) {
+            continue;
+        }
+        timing.pending = false;
+        if (FAILED(beginResult) || FAILED(endResult) || disjoint.disjoint ||
+            disjoint.frequency == 0 || end < begin) {
+            continue;
+        }
+
+        const float milliseconds = static_cast<float>(
+            static_cast<double>(end - begin) * 1000.0 /
+            static_cast<double>(disjoint.frequency));
+        const std::uint64_t samples =
+            pass.gpuTimingSamples.fetch_add(1, std::memory_order_relaxed) + 1;
+        const float previous =
+            pass.gpuAverageMs.load(std::memory_order_relaxed);
+        const float average = samples == 1 ? milliseconds :
+            previous + 0.15f * (milliseconds - previous);
+        pass.gpuLastMs.store(milliseconds, std::memory_order_relaxed);
+        pass.gpuAverageMs.store(average, std::memory_order_relaxed);
+    }
+}
 }
 
 // --- Snapshot SRV cache --------------------------------------------------
@@ -454,6 +700,7 @@ bool Registry::ParseResourceSection(const std::string& name,
 
         if      (lk == "format")          res->spec.format = ParseFormat(value);
         else if (lk == "scale")           ParseScale(value, res->spec.scaleMode, res->spec.scaleDiv, res->spec.absWidth, res->spec.absHeight);
+        else if (lk == "depth")           { try { res->spec.depth = std::max<uint32_t>(1, static_cast<uint32_t>(std::stoul(value))); } catch (...) {} }
         else if (lk == "domain")          res->spec.renderDomain = (ToLower(value) == "render");
         else if (lk == "miplevels")       { try { res->spec.mipLevels = static_cast<uint32_t>(std::stoul(value)); } catch (...) {} }
         else if (lk == "srvslot")         { try { res->spec.srvSlot = std::stoi(value); } catch (...) {} }
@@ -565,6 +812,8 @@ bool Registry::ParsePassSection(const std::string& name,
                              :                        BlendMode::Opaque;
         }
         else if (lk == "log")          pass->spec.log = (ToLower(value) == "true" || value == "1");
+        else if (lk == "profilegpu" || lk == "profile")
+            pass->spec.profileGpu = (ToLower(value) == "true" || value == "1");
         else if (lk == "threadgroups") {
             std::vector<std::string> parts; ParseList(value, parts);
             const size_t n = parts.size() < 3u ? parts.size() : 3u;
@@ -1016,6 +1265,7 @@ struct PassStateCache {
 // Default sampler (linear/clamp) bound on s0 for pass shaders.
 REX::W32::ID3D11SamplerState* g_passSamplerLinear = nullptr;
 REX::W32::ID3D11SamplerState* g_passSamplerPoint = nullptr;
+REX::W32::ID3D11SamplerState* g_passSamplerLinearWrap = nullptr;
 void EnsureSamplers(REX::W32::ID3D11Device* dev) {
     if (!g_passSamplerLinear) {
         REX::W32::D3D11_SAMPLER_DESC d{};
@@ -1030,6 +1280,14 @@ void EnsureSamplers(REX::W32::ID3D11Device* dev) {
         d.addressU = d.addressV = d.addressW = REX::W32::D3D11_TEXTURE_ADDRESS_CLAMP;
         d.maxLOD = (std::numeric_limits<float>::max)();
         dev->CreateSamplerState(&d, &g_passSamplerPoint);
+    }
+    if (!g_passSamplerLinearWrap) {
+        REX::W32::D3D11_SAMPLER_DESC d{};
+        d.filter = REX::W32::D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        d.addressU = d.addressV = d.addressW =
+            REX::W32::D3D11_TEXTURE_ADDRESS_WRAP;
+        d.maxLOD = (std::numeric_limits<float>::max)();
+        dev->CreateSamplerState(&d, &g_passSamplerLinearWrap);
     }
 }
 }  // anonymous
@@ -1074,33 +1332,45 @@ bool Registry::FireSortedBatch(REX::W32::ID3D11DeviceContext* context, const std
     return firedAny;
 }
 
-// Evaluate the optional `activeWhen` runtime gate. Returns true (fire)
-// when the spec is empty, the bool is true, or the spec is "!id" and the
-// bool is false. The resolved ShaderValue* is cached in the pass on first
-// call so subsequent fires skip the linear scan.
+// Evaluate the optional `activeWhen` runtime gate. Commas and `&&` both form
+// an AND-list, and each term may start with `!`. Resolved ShaderValue pointers
+// are cached on first use so the render-thread fast path only reads bools.
 static bool EvaluateActiveWhen(Pass& pass) {
     const std::string& spec = pass.spec.activeWhen;
     if (spec.empty()) return true;
 
     if (!pass.activeWhenChecked) {
-        bool negate = !spec.empty() && spec[0] == '!';
-        const std::string id = negate ? spec.substr(1) : spec;
-        ShaderValue* resolved = nullptr;
-        for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
-            if (sv && sv->id == id) { resolved = sv; break; }
+        std::string normalized = spec;
+        for (size_t pos = 0; (pos = normalized.find("&&", pos)) != std::string::npos;) {
+            normalized.replace(pos, 2, ",");
         }
-        if (!resolved) {
-            REX::WARN("CustomPass[{}]: activeWhen='{}' did not resolve to a Values.ini bool — pass will fire as if no gate were set",
-                pass.spec.name, spec);
+        std::stringstream terms(normalized);
+        std::string token;
+        while (std::getline(terms, token, ',')) {
+            if (token.empty()) continue;
+            const bool negate = token[0] == '!';
+            const std::string id = negate ? token.substr(1) : token;
+            if (id.empty()) continue;
+            ShaderValue* resolved = nullptr;
+            for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
+                if (sv && sv->id == id) { resolved = sv; break; }
+            }
+            if (!resolved) {
+                REX::WARN("CustomPass[{}]: activeWhen term '{}' did not resolve to a Values.ini bool; that term will fire-open",
+                    pass.spec.name, token);
+            }
+            pass.activeWhenTerms.push_back({ resolved, negate });
         }
-        pass.activeWhenResolved = resolved;
-        pass.activeWhenNegated  = negate;
         pass.activeWhenChecked  = true;
     }
 
-    auto* sv = static_cast<ShaderValue*>(pass.activeWhenResolved);
-    if (!sv) return true;  // fire-open on unknown id
-    return pass.activeWhenNegated ? !sv->current.b : sv->current.b;
+    for (const auto& term : pass.activeWhenTerms) {
+        auto* sv = static_cast<ShaderValue*>(term.shaderValue);
+        if (!sv) continue;
+        const bool value = term.negate ? !sv->current.b : sv->current.b;
+        if (!value) return false;
+    }
+    return true;
 }
 
 bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& pass, SavedState& saved) {
@@ -1240,7 +1510,14 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (pass.spec.type == PassType::Pixel) {
             if (out.slot >= 0 && out.slot < (int)rtvBindings.size()) rtvBindings[out.slot] = r->rtv;
         } else {
-            if (out.slot >= 0 && out.slot < (int)uavBindings.size()) uavBindings[out.slot] = r->uav;
+            if (out.mipLevel >= r->mipUavs.size()) {
+                REX::WARN("CustomPass[{}]: output '{}' requests mip {} but resource has {} UAV mip(s)",
+                    pass.spec.name, r->spec.name, out.mipLevel, r->mipUavs.size());
+                return false;
+            }
+            if (out.slot >= 0 && out.slot < (int)uavBindings.size()) {
+                uavBindings[out.slot] = r->mipUavs[out.mipLevel];
+            }
         }
     }
 
@@ -1266,7 +1543,14 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
                 targetTex = g_rendererData->renderTargets[out.gbufferIndex].texture;
             }
         } else {
-            if (auto* r = FindResource(out.resourceName)) targetTex = r->texture;
+            if (auto* r = FindResource(out.resourceName)) {
+                if (r->texture3D) {
+                    outW = std::max<uint32_t>(1, r->width >> out.mipLevel);
+                    outH = std::max<uint32_t>(1, r->height >> out.mipLevel);
+                    break;
+                }
+                targetTex = r->texture;
+            }
         }
         if (targetTex) {
             REX::W32::D3D11_TEXTURE2D_DESC d{};
@@ -1327,9 +1611,16 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularIntsSRV)   context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
-        REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
-        context->PSSetSamplers(0, 2, samplers);
+        REX::W32::ID3D11SamplerState* samplers[3] = {
+            g_passSamplerLinear,
+            g_passSamplerPoint,
+            g_passSamplerLinearWrap
+        };
+        context->PSSetSamplers(0, 3, samplers);
+        auto* gpuTiming = BeginGpuTiming(
+            pass, device, context, currentFrame);
         context->Draw(3, 0);
+        EndGpuTiming(context, gpuTiming);
 
         // Unbind RTVs to allow restore.
         REX::W32::ID3D11RenderTargetView* nullRTV[8] = {};
@@ -1355,8 +1646,12 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());
         }
-        REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
-        context->CSSetSamplers(0, 2, samplers);
+        REX::W32::ID3D11SamplerState* samplers[3] = {
+            g_passSamplerLinear,
+            g_passSamplerPoint,
+            g_passSamplerLinearWrap
+        };
+        context->CSSetSamplers(0, 3, samplers);
 
         // Resolve dispatch geometry.
         UINT groups[3] = { 1, 1, 1 };
@@ -1370,10 +1665,20 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             switch (tg.mode) {
                 case ScaleMode::Absolute:  groups[i] = std::max<uint32_t>(1, tg.value); break;
                 case ScaleMode::Screen:    groups[i] = (i == 0 ? bw : (i == 1 ? bh : 1)); break;
-                case ScaleMode::ScreenDiv: groups[i] = std::max<uint32_t>(1, (i == 0 ? bw : (i == 1 ? bh : 1)) / std::max<uint32_t>(1, tg.value)); break;
+                case ScaleMode::ScreenDiv: {
+                    const auto extent = i == 0 ? bw : (i == 1 ? bh : 1);
+                    const auto divisor = std::max<uint32_t>(1, tg.value);
+                    groups[i] = std::max<uint32_t>(1,
+                        tg.roundUp ? (extent + divisor - 1) / divisor
+                                   : extent / divisor);
+                    break;
+                }
             }
         }
+        auto* gpuTiming = BeginGpuTiming(
+            pass, device, context, currentFrame);
         context->Dispatch(groups[0], groups[1], groups[2]);
+        EndGpuTiming(context, gpuTiming);
         // Unbind UAVs to release for restore.
         if (!uavBindings.empty()) {
             std::vector<REX::W32::ID3D11UnorderedAccessView*> nulls(uavBindings.size(), nullptr);
@@ -1559,6 +1864,9 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
     if (bd.width == 0 || bd.height == 0) return;
     {
         std::lock_guard lk(mutex);
+        for (auto& pass : passes) {
+            PollGpuTiming(*pass, context, currentFrame);
+        }
         for (auto& res : resources) res->EnsureAllocated(g_rendererData->device, bd.width, bd.height);
         for (auto& res : resources) {
             if (res->pingpongPartner) continue;
@@ -1584,8 +1892,22 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
 
         // clearOnPresent
         for (auto& res : resources) {
-            if (!res->spec.clearOnPresent || !res->rtv) continue;
-            context->ClearRenderTargetView(res->rtv, res->spec.clearColor);
+            if (!res->spec.clearOnPresent) continue;
+            if (res->rtv) {
+                context->ClearRenderTargetView(res->rtv, res->spec.clearColor);
+            } else if (res->uav) {
+                if (res->allocatedFormat == REX::W32::DXGI_FORMAT_R32_UINT) {
+                    const std::uint32_t clear[4] = {
+                        static_cast<std::uint32_t>(res->spec.clearColor[0]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[1]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[2]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[3])
+                    };
+                    context->ClearUnorderedAccessViewUint(res->uav, clear);
+                } else {
+                    context->ClearUnorderedAccessViewFloat(res->uav, res->spec.clearColor);
+                }
+            }
         }
 
         // AtPresent passes
@@ -1687,6 +2009,17 @@ void Registry::StartFileWatchers() {
         });
         p->hlslWatcher->Start();
     }
+}
+
+std::size_t Registry::RequestReloadAll() {
+    std::lock_guard lk(mutex);
+    std::size_t marked = 0;
+    for (auto& p : passes) {
+        if (!p || p->spec.shaderFile.empty()) continue;
+        p->reloadRequested.store(true, std::memory_order_release);
+        ++marked;
+    }
+    return marked;
 }
 
 size_t Registry::ResourceCount() const { std::lock_guard lk(mutex); return resources.size(); }

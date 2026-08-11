@@ -23,7 +23,8 @@ namespace LocalLightBridge
     void OnRasterLight(
         const void* identity,
         const RE::NiPoint3* worldPosition,
-        float radius,
+        float adjustedRadius,
+        float nativeRadius,
         const RE::NiColor* linearColor,
         const RE::NiPoint3* attenuation);
 
@@ -31,7 +32,8 @@ namespace LocalLightBridge
     // subtracts camera translation and applies the camera's inverse rotation.
     void OnTiledLight(
         const RE::NiPoint3* viewPosition,
-        float radius,
+        float adjustedRadius,
+        float nativeRadius,
         const RE::NiColor* color,
         const RE::NiPoint3* attenuation);
 

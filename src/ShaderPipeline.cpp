@@ -744,8 +744,18 @@ bool ReflectShader_Internal(ShaderDBEntry& entry) {
 // draws, so we never race the immediate context. Called from MyPSSetShader
 // and MyVSSetShader before they reach CompileShader_Internal.
 void MaybeApplyHlslHotReload_Internal(ShaderDefinition* def) {
-    if (!def || !def->hlslFileWatcher) return;
-    if (!def->hlslFileWatcher->ConsumeReloadRequest()) return;
+    if (!def) return;
+    // Two independent triggers: the per-file watcher (DEVELOPMENT only) and
+    // the manual reload generation bumped by the settings-overlay button
+    // (always available). Both must be consumed, not short-circuited, so a
+    // watcher event isn't swallowed by a manual reload landing first.
+    const std::uint64_t manualGeneration =
+        g_manualShaderReloadGeneration.load(std::memory_order_acquire);
+    const bool manualPending = def->appliedReloadGeneration != manualGeneration;
+    const bool watcherPending =
+        def->hlslFileWatcher && def->hlslFileWatcher->ConsumeReloadRequest();
+    if (!manualPending && !watcherPending) return;
+    def->appliedReloadGeneration = manualGeneration;
     // Take the per-def compile mutex so an in-flight precompile (or a
     // concurrent on-demand render-thread compile) cannot publish bytecode
     // that we're about to drop, leaving us with a stale but newly-cached

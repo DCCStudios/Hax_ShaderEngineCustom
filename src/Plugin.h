@@ -160,6 +160,16 @@ struct alignas(16) GFXBoosterAccessData
     // xy is the logical projection/render extent. zw is the display extent.
     // They differ under native dynamic resolution and external upscalers.
     DirectX::XMFLOAT4 g_RenderInfo;
+
+    // World-space copy of RE::Sky's directional ambient cube. Keep this at
+    // the end of the structured-buffer ABI so older compiled shaders retain
+    // the offsets of every pre-existing field. Voxel and screen-space ray
+    // passes operate in world space and can evaluate these coefficients
+    // directly, without the camera-dependent basis used by the legacy g_SH
+    // fields above.
+    DirectX::XMFLOAT4 g_WorldSH_R;
+    DirectX::XMFLOAT4 g_WorldSH_G;
+    DirectX::XMFLOAT4 g_WorldSH_B;
 };
 
 struct alignas(16) DrawTagData
@@ -192,6 +202,7 @@ struct ShaderValue {
     std::string id = ""; // Unique ID for this value
     std::string label = ""; // Label to show in UI
     std::string group = ""; // Optional group name to organize values in the UI
+    std::string tooltip = ""; // Optional hover help loaded from Values.ini
     enum class Type { Float, Int, Bool } type = Type::Float; // Type of the value for UI and storage
     // Value Tracking
     struct Data {
@@ -514,6 +525,7 @@ struct ShaderDefinition {
         , usesGFXModularBools(other.usesGFXModularBools)
         , compileMutex(std::move(other.compileMutex))
         , hlslFileWatcher(std::move(other.hlslFileWatcher))
+        , appliedReloadGeneration(other.appliedReloadGeneration)
         , log(other.log)
         , dump(other.dump)
         , lightCullRadiusScaleValue(std::move(other.lightCullRadiusScaleValue))
@@ -582,6 +594,12 @@ struct ShaderDefinition {
     std::unique_ptr<std::mutex> compileMutex = std::make_unique<std::mutex>();
     // File watcher for this shader definition Shader.ini
     std::unique_ptr<HlslFileWatcher> hlslFileWatcher;
+    // Last value of g_manualShaderReloadGeneration this definition has acted
+    // on. Only ever read/written by the render thread inside
+    // MaybeApplyHlslHotReload_Internal, so it needs no synchronization of its
+    // own. A definition created after a manual reload starts at 0 and takes
+    // one no-op drop on its next bind (it has nothing compiled yet).
+    std::uint64_t appliedReloadGeneration = 0;
     // Logging and dumping options
     bool log = false;
     bool dump = false;

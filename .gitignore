@@ -14,3 +14,5 @@ vs*/
 compile_commands.json
 
 .claude/
+# Local deployment staging (built DLL/PDB copied for packaging)
+Compile/

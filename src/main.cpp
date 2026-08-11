@@ -1027,7 +1027,8 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     // Skip empty lines and comments
                     if (valueLine.empty() || valueLine[0] == ';') continue;
                     // Remove inline comments and trim
-                    std::string valueClean = RemoveInlineComment(valueLine);
+                    std::string valueText = RemoveInlineComment(valueLine);
+                    std::string valueClean = valueText;
                     // Remove all whitespace for easier parsing
                     valueClean = RemoveAllWhitespace(valueClean);
                     if (valueClean.empty()) continue;
@@ -1054,6 +1055,16 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     }
                     else if (lowerKey == "group") {
                         shaderV.group = value;
+                    }
+                    else if (lowerKey == "tooltip") {
+                        const auto equals = valueText.find('=');
+                        if (equals != std::string::npos) {
+                            const auto first = valueText.find_first_not_of(" \t\r\n\"", equals + 1);
+                            const auto last = valueText.find_last_not_of(" \t\r\n\"");
+                            if (first != std::string::npos && last >= first) {
+                                shaderV.tooltip = valueText.substr(first, last - first + 1);
+                            }
+                        }
                     }
                     else if (lowerKey == "type") {
                         std::string type = ToLower(value);

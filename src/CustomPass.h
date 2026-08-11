@@ -56,6 +56,7 @@ struct ResourceSpec {
     uint32_t                                scaleDiv = 1;       // Screen/N
     uint32_t                                absWidth = 0;       // Absolute
     uint32_t                                absHeight = 0;      // Absolute
+    uint32_t                                depth = 1;          // depth > 1 selects Texture3D
     bool                                    renderDomain = false; // scale relative to logical render extent
     uint32_t                                mipLevels = 1;
     int                                     srvSlot = -1;       // Preferred/requested SRV slot for INI consumers.
@@ -74,11 +75,16 @@ class Resource {
 public:
     ResourceSpec                                spec{};
     REX::W32::ID3D11Texture2D*                  texture = nullptr;
+    REX::W32::ID3D11Texture3D*                  texture3D = nullptr;
     REX::W32::ID3D11RenderTargetView*           rtv = nullptr;
     REX::W32::ID3D11ShaderResourceView*         srv = nullptr;
+    // Non-owning alias of mipUavs[0], retained for existing callers.
     REX::W32::ID3D11UnorderedAccessView*        uav = nullptr;
+    std::vector<REX::W32::ID3D11UnorderedAccessView*> mipUavs;
     uint32_t                                    width = 0;
     uint32_t                                    height = 0;
+    uint32_t                                    depth = 0;
+    REX::W32::DXGI_FORMAT                       allocatedFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
     Resource*                                   pingpongPartner = nullptr;
 
     // Allocate / release. Idempotent: EnsureAllocated returns true if usable.
@@ -151,11 +157,13 @@ struct OutputBinding {
     OutputKind                              kind = OutputKind::Resource;
     std::string                             resourceName;        // for Resource
     int                                     gbufferIndex = -1;   // for GBufferRT
+    uint32_t                                mipLevel = 0;        // customResource:NAME@mipN
 };
 
 struct ThreadGroupDim {
     ScaleMode                               mode = ScaleMode::Absolute;
     uint32_t                                value = 1;           // Absolute: literal; ScreenDiv: divisor
+    bool                                    roundUp = false;     // screenceil/N covers partial edge groups
 };
 
 struct PassSpec {
@@ -188,11 +196,22 @@ struct PassSpec {
     bool                                    clearOnFire = false;
     bool                                    depthTest = false;
     bool                                    log = false;
+    // Opt-in asynchronous timestamp queries. Results are polled several
+    // frames later with DONOTFLUSH, so diagnostics never stall the renderer.
+    bool                                    profileGpu = false;
     std::array<ThreadGroupDim, 3>           threadGroups{};      // CS only
 };
 
 class Pass {
 public:
+    struct GpuTimingSlot {
+        REX::W32::ID3D11Query* disjoint = nullptr;
+        REX::W32::ID3D11Query* begin = nullptr;
+        REX::W32::ID3D11Query* end = nullptr;
+        uint32_t submittedFrame = 0;
+        bool pending = false;
+    };
+
     PassSpec                                    spec{};
     REX::W32::ID3D11PixelShader*                psShader = nullptr;
     REX::W32::ID3D11ComputeShader*              csShader = nullptr;
@@ -209,6 +228,12 @@ public:
     // Total fires across the lifetime of this pass — used by the debug
     // overlay and the rate-limited fire log.
     std::atomic<uint64_t>                       totalFireCount{ 0 };
+    std::array<GpuTimingSlot, 4>                gpuTiming{};
+    std::atomic<float>                          gpuLastMs{ 0.0f };
+    std::atomic<float>                          gpuAverageMs{ 0.0f };
+    std::atomic<uint64_t>                       gpuTimingSamples{ 0 };
+    bool                                        gpuTimingUnavailable = false;
+    bool                                        gpuTimingFailureLogged = false;
     // Set by FileWatcher when the .hlsl file changes on disk. FirePass
     // observes the flag on the main render thread, drops the compiled
     // shader, and recompiles before dispatching. This avoids the watcher
@@ -220,15 +245,14 @@ public:
     // compile this pass at once. unique_ptr because std::mutex is non-movable.
     std::unique_ptr<std::mutex>                 compileMutex = std::make_unique<std::mutex>();
 
-    // Cache for activeWhen resolution. Set on first fire after lookup
-    // against g_shaderSettings.GetBoolShaderValues(). Subsequent fires
-    // read sv->current.b directly without rescanning the list.
-    //   activeWhenResolved == nullptr && !activeWhenChecked → unresolved
-    //   activeWhenResolved == nullptr &&  activeWhenChecked → unknown id (fire-open)
-    //   activeWhenResolved != nullptr                       → cached pointer
-    void*                                       activeWhenResolved = nullptr;
+    struct ActiveWhenTerm {
+        void* shaderValue = nullptr;
+        bool negate = false;
+    };
+    // Every cached term must pass. Unknown ids retain the existing fire-open
+    // behavior for that term so legacy configurations do not turn off passes.
+    std::vector<ActiveWhenTerm>                 activeWhenTerms;
     bool                                        activeWhenChecked = false;
-    bool                                        activeWhenNegated = false;
 
     void Release();
 };
@@ -278,6 +302,13 @@ public:
     // Spawn HLSL hot-reload watchers for every pass currently registered.
     // Called once after Shader.ini parsing completes when DEVELOPMENT=true.
     void StartFileWatchers();
+
+    // Mark every pass that has an HLSL file for recompile from disk, exactly
+    // as the watcher callback does but without requiring a watcher to exist
+    // (they are DEVELOPMENT-only). Sets flags only — the compiled objects are
+    // released on the render thread inside FirePassWithSaved. Returns the
+    // number of passes marked.
+    std::size_t RequestReloadAll();
 
     // Submit one compile job per registered pass to the background
     // precompile worker. The worker is owned externally (g_precompileWorker)
