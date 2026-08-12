@@ -141,6 +141,48 @@ T ReadField(void* base, std::size_t offset, T fallback = {}) noexcept
     return value;
 }
 
+// Directional cascade transforms, captured during shadow submission on the
+// render thread and consumed on the frame-publish path. Double buffered with
+// an atomic sequence so the reader can never observe a half-written matrix.
+struct CascadeBank {
+    ShadowTelemetry::DirectionalCascade
+        entries[ShadowTelemetry::kMaxPublishedCascades]{};
+    std::uint32_t count = 0;
+};
+CascadeBank              s_cascadeBanks[2]{};
+std::atomic<std::uint32_t> s_cascadeSequence{0};
+CascadeBank              s_cascadeStaging{};
+
+void ResetCascadeStaging() noexcept
+{
+    s_cascadeStaging = CascadeBank{};
+}
+
+void CaptureCascade(void* shadowMapData, std::uint32_t splitIndex,
+                    std::uint32_t mapSlot) noexcept
+{
+    if (!shadowMapData || splitIndex >= ShadowTelemetry::kMaxPublishedCascades) {
+        return;
+    }
+    auto& entry = s_cascadeStaging.entries[splitIndex];
+    std::memcpy(entry.transform,
+                static_cast<std::byte*>(shadowMapData) + 0x00,
+                sizeof(entry.transform));
+    entry.mapSlot = mapSlot;
+    entry.valid   = true;
+    s_cascadeStaging.count =
+        (std::max)(s_cascadeStaging.count, splitIndex + 1u);
+}
+
+// Publishes the staged bank into the slot the reader is not currently using.
+void CommitCascades() noexcept
+{
+    const std::uint32_t sequence = s_cascadeSequence.load(std::memory_order_relaxed);
+    CascadeBank& target = s_cascadeBanks[(sequence + 1u) & 1u];
+    target = s_cascadeStaging;
+    s_cascadeSequence.store(sequence + 1u, std::memory_order_release);
+}
+
 template <class T>
 void WriteField(void* base, std::size_t offset, const T& value) noexcept
 {
@@ -2337,6 +2379,27 @@ void HookedAccumulateFromLists(void* light, void* cullingGroup)
         return;
     }
 
+    // Cascade capture runs before the shadow-cache gate below. The static
+    // cache is an unrelated experiment that defaults to off, and the sun
+    // shadow volume must not inherit that dependency: these transforms are
+    // published on every directional submission regardless.
+    {
+        ResetCascadeStaging();
+        const auto splitCount = (std::min<std::uint32_t>)(
+            ReadField<std::uint32_t>(light, kShadowMapDataCountOffset),
+            ShadowTelemetry::kMaxPublishedCascades);
+        for (std::uint32_t splitIndex = 0; splitIndex < splitCount; ++splitIndex) {
+            auto* descriptor = ShadowMapDataForSlot(light, splitIndex);
+            if (!descriptor) {
+                continue;
+            }
+            CaptureCascade(
+                descriptor, splitIndex,
+                ReadField<std::uint32_t>(descriptor, kShadowMapMapSlotOffset));
+        }
+        CommitCascades();
+    }
+
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
         s_origAccumulateFromLists(light, cullingGroup);
         return;
@@ -2677,6 +2740,52 @@ void EndShadowWork(WorkKind kind)
     AddToWorkAggregate(tl_scopes.back().work[idx], ns, scope.bsDraws, scope.d3dDraws, scope.cmdBufDraws);
 }
 
+std::uint32_t GetDirectionalCascades(
+    DirectionalCascade* out, std::uint32_t maxCount) noexcept
+{
+    if (!out || maxCount == 0) {
+        return 0;
+    }
+    // Sequence is bumped after the bank is written, so reading it first and
+    // indexing the completed slot cannot observe a torn matrix.
+    const std::uint32_t sequence =
+        s_cascadeSequence.load(std::memory_order_acquire);
+    const CascadeBank& bank = s_cascadeBanks[sequence & 1u];
+    const std::uint32_t count = (std::min)(bank.count, maxCount);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        out[i] = bank.entries[i];
+    }
+    return count;
+}
+
+bool SunCascadesLookValid() noexcept
+{
+    DirectionalCascade cascades[kMaxPublishedCascades]{};
+    const std::uint32_t count =
+        GetDirectionalCascades(cascades, kMaxPublishedCascades);
+    if (count == 0) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (!cascades[i].valid) {
+            continue;
+        }
+        float magnitude = 0.0f;
+        for (float component : cascades[i].transform) {
+            if (!std::isfinite(component)) {
+                return false;
+            }
+            magnitude += component * component;
+        }
+        // A correctly read projection has substantial magnitude. All-zeros is
+        // the signature of reading padding rather than the transform.
+        if (magnitude < 1e-6f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IsInShadowMap()
 {
     return !tl_scopes.empty();
@@ -2920,8 +3029,9 @@ bool HandleShadowCacheClearDepthStencilView(
 bool Initialize()
 {
     if (g_mode.load(std::memory_order_relaxed) != Mode::On &&
-        !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
-        REX::INFO("ShadowTelemetry::Initialize: mode=off and shadow cache=off; hooks skipped");
+        !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+        !SUN_CASCADE_CAPTURE_ON) {
+        REX::INFO("ShadowTelemetry::Initialize: mode=off, shadow cache=off, sun cascade capture=off; hooks skipped");
         return true;
     }
 
@@ -2935,7 +3045,8 @@ bool Initialize()
         s_origRenderShadowMap &&
         (!needsRenderSceneHook || s_origRenderScene) &&
         (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
-            (s_origAccumulateFromLists && s_origRenderShadowMapFlush && s_origDestroyRenderTargets));
+            (s_origAccumulateFromLists && s_origRenderShadowMapFlush && s_origDestroyRenderTargets)) &&
+        (!SUN_CASCADE_CAPTURE_ON || s_origAccumulateFromLists);
     if (s_installed && alreadyReady) {
         REX::INFO("ShadowTelemetry::Initialize: already installed; skipping");
         return true;
@@ -2959,7 +3070,11 @@ bool Initialize()
         REX::INFO("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets hook installed");
     }
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
+    // Sun cascade capture needs this hook too. With the shadow cache off,
+    // HookedAccumulateFromLists captures the transforms and then falls
+    // straight through to the original, so this stays a thin passthrough.
+    if ((SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON || SUN_CASCADE_CAPTURE_ON) &&
+        !s_origAccumulateFromLists) {
 
         s_origAccumulateFromLists = Hooks::CreateBranchGateway5<AccumulateFromLists_t>(
             ptr_AccumulateFromLists,

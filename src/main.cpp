@@ -3,6 +3,7 @@
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LocalLightBridge.h>
+#include <SunCascadeBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
@@ -90,6 +91,11 @@ float DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE = 1600.0f;
 bool CUSTOMBUFFER_ON = true;
 // Experimental directional shadow-map static-depth cache benchmark
 bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
+// Captures the sun's per-cascade shadow transforms so world-space passes can
+// sample the shadow map array. Installs a passthrough hook on
+// BSShadowDirectionalLight::AccumulateFromLists; off by default because it
+// adds a hook to the engine's shadow submission path.
+bool SUN_CASCADE_CAPTURE_ON = false;
 bool COMMAND_BUFFER_REPLAY_DEDUPE_SRV = false;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
@@ -320,6 +326,7 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
         bool foundShadowUpgrade = false;
         bool foundDirectionalShadowFirstCascadeDistance = false;
         bool foundShadowCache = false;
+        bool foundSunCascadeCapture = false;
         bool foundCommandBufferReplayDedupeSrv = false;
         for (auto& line : lines) {
             auto [key, value] = GetKeyValueFromLine(line);
@@ -354,6 +361,9 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
+            } else if (lowerKey == "sun_cascade_capture_on") {
+                line = std::string("SUN_CASCADE_CAPTURE_ON=") + (SUN_CASCADE_CAPTURE_ON ? "true" : "false");
+                foundSunCascadeCapture = true;
             } else if (lowerKey == "command_buffer_replay_dedupe_srv") {
                 line = std::string("COMMAND_BUFFER_REPLAY_DEDUPE_SRV=") + (COMMAND_BUFFER_REPLAY_DEDUPE_SRV ? "true" : "false");
                 foundCommandBufferReplayDedupeSrv = true;
@@ -414,6 +424,15 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             lines.emplace_back("; --- SHADOW STATIC CACHE ---");
             lines.emplace_back("; Directional sun split static-depth cache A/B toggle.");
             lines.emplace_back(std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false"));
+        }
+        if (!foundSunCascadeCapture) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back("");
+            }
+            lines.emplace_back("; --- SUN CASCADE CAPTURE ---");
+            lines.emplace_back("; Publishes the sun's per-cascade shadow transforms for world-space");
+            lines.emplace_back("; occlusion passes. Required by Skylighting's sun shadow term.");
+            lines.emplace_back(std::string("SUN_CASCADE_CAPTURE_ON=") + (SUN_CASCADE_CAPTURE_ON ? "true" : "false"));
         }
         if (!foundCommandBufferReplayDedupeSrv) {
             if (!lines.empty() && !lines.back().empty()) {
@@ -1221,6 +1240,12 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+        else if (lowerKey == "sun_cascade_capture_on") {
+            const std::string v = ToLower(value);
+            SUN_CASCADE_CAPTURE_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: SUN_CASCADE_CAPTURE_ON set to {}", SUN_CASCADE_CAPTURE_ON);
+            continue;
+        }
         else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
             const std::string v = ToLower(value);
             SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = (v == "true" || v == "1" || v == "on");
@@ -1720,6 +1745,14 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 #endif
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
     ShadowTelemetry::Initialize();
+#elif SHADERENGINE_ENABLE_SHADOW_CACHE
+    // Shadow telemetry is compiled out, but the shadow-cache half of
+    // ShadowTelemetry is still built and owns the AccumulateFromLists hook
+    // that sun cascade capture needs. Initialize it here when that capture is
+    // requested; Initialize() itself no-ops when nothing wants a hook.
+    if (SUN_CASCADE_CAPTURE_ON) {
+        ShadowTelemetry::Initialize();
+    }
 #endif
     // LightSorter stable-partitions the point-light array by stencil flag
     // inside ShadowUpgrade's validated DeferredLightsImpl wrapper.
@@ -1787,6 +1820,7 @@ extern "C"
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
         LocalLightBridge::Shutdown();
+        SunCascadeBridge::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
         // during teardown bails out of the slow path cheaply.
         LightCullPolicy::Shutdown();

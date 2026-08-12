@@ -40,6 +40,8 @@ extern bool CUSTOMBUFFER_ON;
 // When enabled, it caches precombine-only depth per live directional split
 // and overlays dynamic/unknown records until the split cache key changes.
 extern bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
+// Captures per-cascade sun shadow transforms for world-space occlusion.
+extern bool SUN_CASCADE_CAPTURE_ON;
 extern bool COMMAND_BUFFER_REPLAY_DEDUPE_SRV;
 // Custom resource view slot in shader
 extern UINT CUSTOMBUFFER_SLOT;

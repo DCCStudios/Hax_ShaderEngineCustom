@@ -17,7 +17,13 @@ enum class State { Idle, Armed, Capturing };
 constexpr int  kHotkey            = VK_MULTIPLY;  // Numpad *
 constexpr UINT kStagingByteWidth  = 512;          // covers cb2 (max 480 in F4 deferred-light passes)
 constexpr UINT kSrvCount          = 8;
-constexpr int  kCb2VecCount       = 9;            // cb2[0..8] — covers light/SH bank
+// cb2[0..20]. [0..8] is the light/SH bank; the cascaded sun variant also
+// uses [10] = cascade end distances, [11..13]/[14..16]/[17..19] = the three
+// cascade projections, [20].zw = shadow map texel scale. Verified against
+// HachiToon/pixelDeferredLight0034A5F8.hlsl. Capturing through 20 lets a dump
+// validate CPU-side cascade matrices against what the engine hands its own
+// shader.
+constexpr int  kCb2VecCount       = 21;
 
 State                              g_state          = State::Idle;
 bool                               g_prevHotkeyDown = false;

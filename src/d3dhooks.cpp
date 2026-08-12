@@ -740,6 +740,61 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_WorldSH_R = worldShR;
     g_customBufferData.g_WorldSH_G = worldShG;
     g_customBufferData.g_WorldSH_B = worldShB;
+
+    // Sun shadow cascade diagnostic.
+    //
+    // The transforms are captured but deliberately NOT published through
+    // GFXInjected: appending 13 float4s to that struct grew the shared
+    // structured-buffer stride enough to push FXC's loop-unroll heuristic
+    // over budget in visualDOFAutoFocus, which dropped the pass and blacked
+    // the frame. GFXInjected is read by every shader, so it is the wrong
+    // place for data one pass needs. Transport is moving to a dedicated
+    // buffer; this block stays as the capture health check.
+    {
+        ShadowTelemetry::DirectionalCascade cascades[ShadowTelemetry::kMaxPublishedCascades]{};
+        const std::uint32_t published =
+            ShadowTelemetry::SunCascadesLookValid()
+                ? ShadowTelemetry::GetDirectionalCascades(cascades, 3u)
+                : 0u;
+
+        // Time throttled rather than change gated. The cascades follow the
+        // camera, so the matrices change every frame while the live count
+        // stays at 3 - an earlier count-gated version logged once and then
+        // never again, which hid exactly the sun-angle comparison this dump
+        // exists to make.
+        static std::uint32_t s_lastLoggedCascadeCount = 0xFFFFFFFFu;
+        static std::chrono::steady_clock::time_point s_lastCascadeLog{};
+        const auto nowSteady = std::chrono::steady_clock::now();
+        const bool dueByTime =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                nowSteady - s_lastCascadeLog).count() >= 5;
+        if (published != s_lastLoggedCascadeCount || dueByTime) {
+            s_lastLoggedCascadeCount = published;
+            s_lastCascadeLog = nowSteady;
+            if (published > 0) {
+                REX::INFO("SunCascades: {} live, slots {}/{}/{}",
+                          published, cascades[0].mapSlot, cascades[1].mapSlot,
+                          cascades[2].mapSlot);
+                // Full matrices, once per state change. Row 3 is the decisive
+                // one: a row-major orthographic projection carries the
+                // translation there, so if row3.xyz is large and row3.w is 1
+                // the matrix is row-major and shaders want mul(float4(pos,1), M).
+                // If instead column 3 holds the translation, it is transposed.
+                for (std::uint32_t c = 0; c < published; ++c) {
+                    for (std::uint32_t r = 0; r < 4u; ++r) {
+                        const float* row = cascades[c].transform + r * 4u;
+                        REX::INFO(
+                            "  cascade{} row{} = [{: .6f} {: .6f} {: .6f} {: .6f}]",
+                            c, r, row[0], row[1], row[2], row[3]);
+                    }
+                }
+            } else {
+                REX::INFO(
+                    "SunCascades: none published (no directional shadow, or "
+                    "the transforms failed the validity check)");
+            }
+        }
+    }
     g_customBufferData.g_CurrentCameraPositionAdjust = {
         camState.currentPosAdjust.x,
         camState.currentPosAdjust.y,

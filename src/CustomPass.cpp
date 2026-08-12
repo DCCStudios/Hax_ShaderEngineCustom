@@ -2,6 +2,7 @@
 #include <PCH.h>
 #include <CustomPass.h>
 #include <LocalLightBridge.h>
+#include <SunCascadeBridge.h>
 #include <RenderTargets.h>
 #include <ShaderResources.h>
 #include <d3d11.h>
@@ -125,7 +126,7 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
 
 bool ParseInputBinding(const std::string& token, InputBinding& out) {
     // Format: "<slot>:<source>" where source is depth | currentRTV |
-    // currentPSRV:N | customResource:NAME | gbufferRT:N
+    // currentPSRV:N | customResource:NAME | gbufferRT:N | depthStencil:N
     auto colon = token.find(':');
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
@@ -152,6 +153,16 @@ bool ParseInputBinding(const std::string& token, InputBinding& out) {
     if (lowerSource.rfind("gbufferrt:", 0) == 0) {
         out.kind = InputKind::GBufferRT;
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
+        return true;
+    }
+    // Depth-stencil targets are a separate array from renderTargets[]. The
+    // shadow map array lives here (RT::Depth::kShadowMap = 6), which is what
+    // world-space occlusion probes sample. Bound as srViewDepth, so the
+    // consuming shader declares a Texture2DArray<float> and samples it with a
+    // SamplerComparisonState.
+    if (lowerSource.rfind("depthstencil:", 0) == 0) {
+        out.kind = InputKind::DepthStencil;
+        try { out.depthStencilIndex = std::stoi(source.substr(strlen("depthStencil:"))); } catch (...) { return false; }
         return true;
     }
     return false;
@@ -1477,6 +1488,45 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             case InputKind::SceneHDR:
                 s = g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].srView;
                 break;
+            case InputKind::DepthStencil: {
+                // Stays nullptr when the engine has not allocated the target
+                // this frame (the shadow array is absent in some interiors and
+                // during loading). Consuming shaders must treat a null bind as
+                // "fully visible" rather than "fully occluded".
+                if (in.depthStencilIndex >= 0 &&
+                    in.depthStencilIndex < (int)RT::idx(RT::Depth::kCount)) {
+                    s = g_rendererData->depthStencilTargets[in.depthStencilIndex].srViewDepth;
+                }
+                // One-shot report per index. A null SRV here is silent on the
+                // GPU: samples return 0, every depth comparison resolves the
+                // same way, and the consuming field looks uniformly wrong
+                // rather than absent - which is indistinguishable from a
+                // working field with nothing to show.
+                {
+                    static std::array<bool, 16> s_reported{};
+                    const int idx = in.depthStencilIndex;
+                    if (idx >= 0 && idx < 16 && !s_reported[idx]) {
+                        s_reported[idx] = true;
+                        if (!s) {
+                            REX::WARN(
+                                "CustomPass: depthStencil:{} has no srViewDepth; "
+                                "shader samples will read 0",
+                                idx);
+                        } else {
+                            REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+                            s->GetDesc(&d);
+                            REX::INFO(
+                                "CustomPass: depthStencil:{} bound, srv dimension={} "
+                                "format={} arraySize={}",
+                                idx,
+                                static_cast<int>(d.viewDimension),
+                                static_cast<int>(d.format),
+                                d.texture2DArray.arraySize);
+                        }
+                    }
+                }
+                break;
+            }
             default: break;
         }
         if (in.slot >= 0 && in.slot < (int)srvBindings.size()) srvBindings[in.slot] = s;
@@ -1611,6 +1661,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularIntsSRV)   context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
+        SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/true);
         REX::W32::ID3D11SamplerState* samplers[3] = {
             g_passSamplerLinear,
             g_passSamplerPoint,
@@ -1642,6 +1693,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularIntsSRV)   context->CSSetShaderResources(MODULAR_INTS_SLOT,   1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/false);
+        SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/false);
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());

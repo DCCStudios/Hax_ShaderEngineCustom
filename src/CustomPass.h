@@ -137,6 +137,7 @@ enum class InputKind : uint8_t {
     GBufferMaterial,      // renderTargets[kGbufferMaterial=24].srView
     MotionVectors,        // renderTargets[kMotionVectors=29].srView
     SceneHDR,             // renderTargets[kMain=3].srView (engine HDR scene)
+    DepthStencil,         // depthStencilTargets[N].srViewDepth (explicit index)
 };
 
 struct InputBinding {
@@ -144,6 +145,7 @@ struct InputBinding {
     InputKind                               kind = InputKind::None;
     std::string                             resourceName;        // for Resource
     int                                     gbufferIndex = -1;   // for GBufferRT
+    int                                     depthStencilIndex = -1;  // for DepthStencil
     int                                     sourceSlot = -1;     // for CurrentPSRV
 };
 

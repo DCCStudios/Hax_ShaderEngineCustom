@@ -24,6 +24,11 @@ CUSTOMBUFFER_ON=true
 ; replays dynamic/unknown casters.
 ; Requires slot-safe DSV access; otherwise it falls back to vanilla rendering.
 SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
+; --- SUN CASCADE CAPTURE ---
+; Publishes the sun's per-cascade shadow transforms so world-space occlusion
+; passes can sample the shadow map array. Required by Skylighting's sun shadow
+; term. Installs a passthrough hook on BSShadowDirectionalLight.
+SUN_CASCADE_CAPTURE_ON=false
 ; --- COMMAND BUFFER REPLAY ---
 ; Experimental CPU optimization: during command-buffer replay, suppress redundant
 ; SRV and input-assembly binds by tracking state and forwarding only changes.
@@ -433,6 +438,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_WorldSH_R;
             float4 g_WorldSH_G;
             float4 g_WorldSH_B;
+
         };
 
         struct DrawTagData

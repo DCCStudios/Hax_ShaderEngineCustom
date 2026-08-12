@@ -23,6 +23,36 @@ enum class Mode : std::uint8_t {
 extern std::atomic<Mode> g_mode;
 inline constexpr bool kDetailedShadowCacheLogging = false;
 
+// One directional shadow cascade as the engine set it up this frame.
+//
+// `transform` is BSShadowLight::ShadowmapDescriptor::lightTransform, read at
+// descriptor offset 0x00. That offset is derived from Skyrim's documented
+// ShadowmapDescriptor layout, corroborated by five neighbouring offsets this
+// file already reads successfully (camera 0x40, accumulator 0x48, port 0xD0,
+// cullingProcess 0xE0, and the 0xF0 stride). It is NOT independently observed
+// on Fallout yet, so consumers must treat it as unvalidated: check
+// `SunCascadesLookValid()` and compare against a LightTracker cb2 dump
+// (cb2[11..13] is the engine's own cascade-0 projection) before trusting it.
+//
+// `mapSlot` is the shadow texture array slice this cascade renders into.
+struct DirectionalCascade {
+    float         transform[16] = {};
+    std::uint32_t mapSlot       = 0;
+    bool          valid         = false;
+};
+
+inline constexpr std::uint32_t kMaxPublishedCascades = 4;
+
+// Copies up to `maxCount` cascades captured during the last directional
+// shadow submission. Returns how many were written.
+std::uint32_t GetDirectionalCascades(
+    DirectionalCascade* out, std::uint32_t maxCount) noexcept;
+
+// True when every live cascade transform is finite and non-degenerate. This
+// is the cheap runtime gate that keeps a wrong offset from producing garbage
+// shadows rather than an obvious failure.
+bool SunCascadesLookValid() noexcept;
+
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY || SHADERENGINE_ENABLE_SHADOW_CACHE
 
 bool Initialize();
@@ -122,6 +152,8 @@ struct WorkTarget {
 };
 
 inline bool Initialize() { return true; }
+inline std::uint32_t GetDirectionalCascades(DirectionalCascade*, std::uint32_t) noexcept { return 0; }
+inline bool SunCascadesLookValid() noexcept { return false; }
 inline void OnBSDraw() {}
 inline void OnD3DDraw() {}
 inline void OnCommandBufferDraw() {}
