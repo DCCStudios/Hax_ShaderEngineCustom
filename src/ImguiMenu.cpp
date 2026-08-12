@@ -334,6 +334,78 @@ const RECT* UIGetWindowRect()
     return &g_windowRect;
 }
 
+namespace {
+
+// Names mirror the branches in GI_DebugColor / SL_DebugView in
+// HachiToon/visualTonemap.hlsl. Keep them in sync: a debug view that is
+// mislabelled is worse than one that is unlabelled, because it sends you
+// looking at the wrong subsystem.
+const char* GIDebugModeName(int mode)
+{
+    switch (mode) {
+    case 1:  return "GI pass reached (flat green)";
+    case 2:  return "World normal";
+    case 3:  return "Albedo";
+    case 4:  return "Scene colour";
+    case 5:  return "World position (wrapped every 256 units)";
+    case 6:  return "Linear depth";
+    case 7:  return "Tonemap hook reached (flat red)";
+    case 8:  return "SSRTGI L0 irradiance (x16)";
+    case 9:  return "SSRTGI receiver albedo";
+    case 10: return "SSRTGI diffuse indirect";
+    case 11: return "SSRTGI principal direction";
+    case 12: return "SSRTGI directional focus";
+    case 13: return "Local light records (bridge t36)";
+    case 14: return "Contact shadow blocked ratio";
+    case 15: return "Contact shadow trace confidence";
+    case 16: return "Contact shadow cached edge age";
+    case 17: return "Skylighting ambient visibility";
+    case 18: return "Skylighting sun visibility (shadow map)";
+    case 19: return "Sun bounce (analytic proxies)";
+    case 20: return "Bounce volume (local lights + sun radiosity)";
+    default: return nullptr;
+    }
+}
+
+// Small always-on caption naming the active diagnostic view. These views
+// replace the whole frame, so without a label it is easy to misread one field
+// as another - several rounds of this project were spent doing exactly that.
+void UIDrawDebugViewCaption()
+{
+    int mode = 0;
+    for (auto* value : g_shaderSettings.GetIntShaderValues()) {
+        if (value && value->id == "ps_GIDebugMode") {
+            mode = value->current.i;
+            break;
+        }
+    }
+    if (mode <= 0) {
+        return;
+    }
+
+    const char* name = GIDebugModeName(mode);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // Bottom-left, clear of the health/AP bars.
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + 24.0f,
+               viewport->WorkPos.y + viewport->WorkSize.y - 150.0f),
+        ImGuiCond_Always,
+        ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    if (ImGui::Begin(
+            "##gi_debug_caption", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "GI Debug View %d", mode);
+        ImGui::TextUnformatted(name ? name : "(unassigned mode)");
+    }
+    ImGui::End();
+}
+
+}  // namespace
+
 void UIRenderFrame()
 {
     if (g_imguiInitialized) {
@@ -343,6 +415,12 @@ void UIRenderFrame()
     }
     if (g_imguiInitialized && SHADERSETTINGS_ON && g_showSettings) {
         UIDrawShaderSettingsOverlay();
+    }
+    // Drawn independently of DEVGUI_ON and g_showSettings: the caption must be
+    // visible whenever a debug view is active, including with the dev GUI
+    // closed, since that is how these views are normally looked at.
+    if (g_imguiInitialized) {
+        UIDrawDebugViewCaption();
     }
     if (g_imguiInitialized && DEVGUI_ON && g_showSettings) {
         UIDrawShaderDebugOverlay();
