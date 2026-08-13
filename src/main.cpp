@@ -2,6 +2,7 @@
 #include <CustomPass.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
+#include "ContactShadowBridge.h"
 #include <LocalLightBridge.h>
 #include <SunCascadeBridge.h>
 #include <LightTracker.h>
@@ -1821,6 +1822,7 @@ extern "C"
         LightTracker::Shutdown();
         LocalLightBridge::Shutdown();
         SunCascadeBridge::Shutdown();
+        ContactShadowBridge::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
         // during teardown bails out of the slow path cheaply.
         LightCullPolicy::Shutdown();

@@ -1,6 +1,7 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include "ContactShadowBridge.h"
 #include <LocalLightBridge.h>
 #include <SunCascadeBridge.h>
 #include <RenderTargets.h>
@@ -1662,6 +1663,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
         SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/true);
+        ContactShadowBridge::BindCustomPassResource(context, /*pixelStage=*/true);
         REX::W32::ID3D11SamplerState* samplers[3] = {
             g_passSamplerLinear,
             g_passSamplerPoint,
@@ -1694,6 +1696,7 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/false);
         SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/false);
+        ContactShadowBridge::BindCustomPassResource(context, /*pixelStage=*/false);
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());

@@ -355,10 +355,13 @@ const char* GIDebugModeName(int mode)
     case 10: return "SSRTGI diffuse indirect";
     case 11: return "SSRTGI principal direction";
     case 12: return "SSRTGI directional focus";
-    case 13: return "Local light records (bridge t36)";
-    case 14: return "Contact shadow blocked ratio";
-    case 15: return "Contact shadow trace confidence";
-    case 16: return "Contact shadow cached edge age";
+    // 13, 15 and 16 were produced by the old quarter-resolution contact trace
+    // pass and died with it: 13 rendered the local-light record field into that
+    // pass's target, and 15/16 were its trace confidence and cached edge age.
+    // The wavefront march is deterministic and keeps no history, so neither
+    // quantity exists to show. Returning nullptr makes the caption read
+    // "retired" rather than labelling a blank screen with a stale name.
+    case 14: return "Contact shadow blocked ratio (full res)";
     case 17: return "Skylighting ambient visibility";
     case 18: return "Skylighting sun visibility (shadow map)";
     case 19: return "Sun bounce (analytic proxies)";
@@ -399,7 +402,8 @@ void UIDrawDebugViewCaption()
             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
         ImGui::TextColored(
             ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "GI Debug View %d", mode);
-        ImGui::TextUnformatted(name ? name : "(unassigned mode)");
+        ImGui::TextUnformatted(
+            name ? name : "(retired or unassigned - nothing produces this)");
     }
     ImGui::End();
 }
