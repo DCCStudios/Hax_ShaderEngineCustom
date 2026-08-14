@@ -203,6 +203,10 @@ bool ParseOutputBinding(const std::string& token, OutputBinding& out) {
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
         return true;
     }
+    if (lowerSource == "currentrtv") {
+        out.kind = OutputKind::CurrentRTV;
+        return true;
+    }
     return false;
 }
 
@@ -1549,6 +1553,39 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     if (maxUavSlot >= 0) uavBindings.resize(maxUavSlot + 1, nullptr);
     Resource* primaryOut = nullptr;
     for (auto& out : pass.spec.outputs) {
+        if (out.kind == OutputKind::CurrentRTV) {
+            // Bind whatever the engine had on OM slot 0 when the trigger
+            // fired. Capture AddRef'd saved.rtvs[0] and Restore releases it
+            // after the batch, so the reference is alive for the whole fire.
+            // The target's identity is unknown by design (at
+            // afterDeferredLights it is not in renderTargets[] at all), so
+            // guard on the one thing the pass requires: a real 2D texture of
+            // plausible size. On any mismatch the slot stays null and the
+            // anyRTV check below skips the pass instead of corrupting state.
+            if (pass.spec.type != PassType::Pixel) continue;
+            auto* rt = saved.rtvs[0];
+            bool usable = false;
+            if (rt) {
+                REX::W32::ID3D11Resource* res = nullptr;
+                rt->GetResource(&res);
+                if (res) {
+                    REX::W32::ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                        reinterpret_cast<void**>(&tex));
+                    if (tex) {
+                        REX::W32::D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        usable = d.width >= 16 && d.height >= 16;
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+            }
+            if (usable && out.slot >= 0 && out.slot < (int)rtvBindings.size()) {
+                rtvBindings[out.slot] = rt;
+            }
+            continue;
+        }
         if (out.kind == OutputKind::GBufferRT) {
             // Direct bind to engine renderTargets[N].rtView. Used by composite
             // passes that need to write into an existing engine surface (e.g.
@@ -1593,6 +1630,30 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     uint32_t outW = 0, outH = 0;
     for (auto& out : pass.spec.outputs) {
         REX::W32::ID3D11Texture2D* targetTex = nullptr;
+        if (out.kind == OutputKind::CurrentRTV) {
+            // Size from the live target itself. Released immediately after
+            // GetDesc below via the shared targetTex handling being skipped -
+            // so query the desc here and continue the loop directly.
+            if (saved.rtvs[0]) {
+                REX::W32::ID3D11Resource* res = nullptr;
+                saved.rtvs[0]->GetResource(&res);
+                if (res) {
+                    REX::W32::ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                        reinterpret_cast<void**>(&tex));
+                    if (tex) {
+                        REX::W32::D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        outW = d.width;
+                        outH = d.height;
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+            }
+            if (outW > 0) break;
+            continue;
+        }
         if (out.kind == OutputKind::GBufferRT) {
             if (out.gbufferIndex >= 0 && out.gbufferIndex < 101) {
                 targetTex = g_rendererData->renderTargets[out.gbufferIndex].texture;

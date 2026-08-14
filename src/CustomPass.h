@@ -157,7 +157,14 @@ struct InputBinding {
 
 enum class OutputKind : uint8_t {
     Resource,                  // a customResource RTV (PS) or UAV (CS)
-    GBufferRT                  // g_rendererData->renderTargets[N].rtView (PS only)
+    GBufferRT,                 // g_rendererData->renderTargets[N].rtView (PS only)
+    // OMGetRenderTargets()[0] as captured at fire time (PS only). Exists for
+    // triggers where the engine's destination surface is not present in
+    // renderTargets[] at all — at afterDeferredLights the composite writes an
+    // RTV that no table index reaches, so the only way to address it is "the
+    // one bound right now". Identity is deliberately unknown; the bind path
+    // guards on it being a 2D texture before using it.
+    CurrentRTV
 };
 
 struct OutputBinding {
