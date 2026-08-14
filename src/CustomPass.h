@@ -116,7 +116,13 @@ enum class TriggerKind : uint8_t {
                               // PREFER THIS for tonemap-piggyback patterns like SSRTGI
                               // composite that need to read/write surfaces the matched
                               // shader is about to consume.
-    AtPresent
+    AtPresent,
+    // Fires immediately after DrawWorld::DeferredLightsImpl returns, i.e. once
+    // all deferred lighting has resolved but before anything transparent is
+    // drawn. A pass that multiplies into the scene here darkens only lit
+    // opaque surfaces; particles, smoke and glass then blend over the result
+    // instead of being darkened by it.
+    AfterDeferredLights
 };
 enum class BlendMode : uint8_t {
     Opaque,        // dst = src                               (writeMask = 0x0F)
@@ -354,6 +360,10 @@ public:
     //   - global SRV bind refresh
     void OnFramePresent(REX::W32::ID3D11DeviceContext* context);
 
+    // Called from ShadowUpgrade's DeferredLightsImpl hook, after the original.
+    // Fires every AfterDeferredLights pass as one priority-sorted batch.
+    void FireAfterDeferredLights(REX::W32::ID3D11DeviceContext* context);
+
     // Called from BindInjectedPixelShaderResources to keep customResource
     // SRVs bound on their declared slots after engine state changes.
     void BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bool pixelStage);
@@ -419,6 +429,11 @@ private:
 
 // Single shared registry. Lifetime: process; reset on Shader.ini hot reload.
 extern Registry g_registry;
+
+// Free-function wrapper so hook translation units can fire this trigger without
+// including CustomPass.h, which is not standalone (it needs Plugin.h's types
+// first). Declared again in ShadowUpgrade.cpp; defined in CustomPass.cpp.
+void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context);
 
 // --- Built-in fullscreen VS used by every PS-typed pass -------------------
 // Compiled once on first PS pass fire and cached.

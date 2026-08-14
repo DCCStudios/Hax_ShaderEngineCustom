@@ -12,6 +12,14 @@
 #include <cstring>
 #include <limits>
 
+// CustomPass.h is not standalone (it needs Plugin.h's types first), so the one
+// entry point this file needs is declared rather than included. This MUST sit
+// at global scope: inside ShadowUpgrade's anonymous namespace it declares a
+// distinct, never-defined symbol and fails to link.
+namespace CustomPass {
+void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context);
+}
+
 namespace ShadowUpgrade {
 namespace {
 
@@ -54,6 +62,23 @@ constexpr float kVanillaSecondCascadeDistance = 3000.0f;
 
 using DeferredLightsImpl_t = void (*)();
 DeferredLightsImpl_t s_originalDeferredLightsImpl = nullptr;
+
+// DrawWorld::DeferredComposite, REL ID 728427, E9-5, 15-byte prologue
+// (mov rax,rsp + 2 saves + 5 pushes). Same target PhaseTelemetry hooks, but
+// that module is compiled out by default (SHADERENGINE_ENABLE_PHASE_TELEMETRY
+// is 0), so its wrapper never installs and cannot be relied on here.
+//
+// Why this hook exists at all: DeferredLightsImpl only ACCUMULATES lighting
+// into the diffuse/specular buffers. DeferredComposite is what combines them
+// into kMain. A pass firing after DeferredLightsImpl and writing kMain is
+// therefore overwritten wholesale moments later - which is exactly what
+// silently removed contact shadows when they were first moved off the tonemap
+// trigger. After DeferredComposite is the real "lighting resolved, nothing
+// transparent drawn yet" boundary.
+REL::Relocation<std::uintptr_t> s_deferredComposite{ REL::ID{ 728427, 0 } };
+constexpr std::size_t kDeferredCompositePrologue = 15;
+using DeferredComposite_t = void (*)();
+DeferredComposite_t s_originalDeferredComposite = nullptr;
 float* s_firstCascadeDistanceStorage = nullptr;
 bool s_firstCascadeDistanceInstalled = false;
 bool s_installed = false;
@@ -83,6 +108,19 @@ void HookedDeferredLightsImpl()
 {
     ScopedDeferredLighting scope;
     s_originalDeferredLightsImpl();
+}
+
+void HookedDeferredComposite()
+{
+    s_originalDeferredComposite();
+
+    // kMain now holds the composited lit scene and nothing transparent has
+    // drawn yet. Passes that multiply into the scene fire here so they darken
+    // lit opaque surfaces only - particles, smoke, glass and fog blend over the
+    // shadowed result afterwards instead of being darkened by it.
+    if (g_rendererData && g_rendererData->context) {
+        ::CustomPass::FireAfterDeferredLightsPasses(g_rendererData->context);
+    }
 }
 
 bool IsAddressInText(std::uintptr_t address, std::size_t byteCount) noexcept
@@ -287,6 +325,28 @@ bool Initialize()
         REX::WARN(
             "ShadowUpgrade::Initialize: failed to create DeferredLightsImpl gateway");
         return false;
+    }
+
+    const auto compositeAddress = s_deferredComposite.address();
+    if (IsAddressInText(compositeAddress, kDeferredCompositePrologue)) {
+        s_originalDeferredComposite =
+            Hooks::CreateBranchGateway5<DeferredComposite_t>(
+                s_deferredComposite,
+                kDeferredCompositePrologue,
+                reinterpret_cast<void*>(&HookedDeferredComposite));
+    }
+    if (!s_originalDeferredComposite) {
+        // Non-fatal: only the afterDeferredLights trigger is lost, and passes
+        // using it simply never fire rather than firing at the wrong time.
+        REX::WARN(
+            "ShadowUpgrade::Initialize: DeferredComposite wrapper NOT installed "
+            "at {:#x}; afterDeferredLights passes will not fire",
+            compositeAddress);
+    } else {
+        REX::INFO(
+            "ShadowUpgrade::Initialize: DeferredComposite wrapper installed "
+            "at {:#x} (afterDeferredLights trigger live)",
+            compositeAddress);
     }
 
     s_installed = true;

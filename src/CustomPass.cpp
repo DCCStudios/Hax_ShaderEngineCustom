@@ -1,6 +1,8 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <chrono>
+
 #include "ContactShadowBridge.h"
 #include <LocalLightBridge.h>
 #include <SunCascadeBridge.h>
@@ -793,6 +795,8 @@ bool Registry::ParsePassSection(const std::string& name,
                 pass->spec.trigger = TriggerKind::BeforeHookId;
                 pass->spec.triggerHookId = value.substr(strlen("beforeDrawForHook:"));
                 pass->spec.atDrawTime = true;
+            } else if (value == "afterDeferredLights") {
+                pass->spec.trigger = TriggerKind::AfterDeferredLights;
             } else if (value == "atPresent") {
                 pass->spec.trigger = TriggerKind::AtPresent;
             }
@@ -1973,6 +1977,47 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
 
         ApplyPingpong();
     }
+}
+
+void Registry::FireAfterDeferredLights(REX::W32::ID3D11DeviceContext* context) {
+    if (!context) return;
+    std::vector<Pass*> matches;
+    {
+        std::lock_guard lk(mutex);
+        for (auto& p : passes) {
+            if (p->spec.trigger != TriggerKind::AfterDeferredLights) continue;
+            if (!p->spec.active) continue;
+            matches.push_back(p.get());
+        }
+    }
+    const bool fired = matches.empty() ? false : FireBatch(context, matches);
+
+    // Throttled. Separates the two ways this can look identical in game -
+    // "no pass matched the trigger" from "passes fired but wrote somewhere
+    // that gets discarded" - which is otherwise only distinguishable by
+    // reading the GPU profiler, and cost a full test cycle to guess at.
+    static std::atomic<std::uint64_t> lastLogMs{0};
+    const auto nowMs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const auto previous = lastLogMs.load(std::memory_order_relaxed);
+    if (nowMs - previous > 5000u) {
+        lastLogMs.store(nowMs, std::memory_order_relaxed);
+        std::string names;
+        for (auto* p : matches) {
+            if (!names.empty()) names += ", ";
+            names += p->spec.name;
+            names += p->lastFiredFrame.load(std::memory_order_relaxed) ==
+                     currentFrame ? "(fired)" : "(SKIPPED)";
+        }
+        REX::INFO(
+            "CustomPass: afterDeferredLights - {} matched, FireBatch={} | {}",
+            matches.size(), fired, names.empty() ? "<none>" : names);
+    }
+}
+
+void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context) {
+    g_registry.FireAfterDeferredLights(context);
 }
 
 void Registry::ApplyPingpong() {
