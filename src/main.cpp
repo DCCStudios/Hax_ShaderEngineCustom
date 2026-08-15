@@ -3,6 +3,7 @@
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include "ContactShadowBridge.h"
+#include "RenderDocBridge.h"
 #include <LocalLightBridge.h>
 #include <SunCascadeBridge.h>
 #include <LightTracker.h>
@@ -1703,6 +1704,11 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     g_pluginPath = std::filesystem::path{ "Data\\F4SE\\Plugins" };
     // Load config
     LoadConfig(hModule);
+    // In-process RenderDoc capture. MUST run before the D3D11 device is
+    // created: RenderDoc hooks the API at device creation, so loading its
+    // DLL any later captures nothing. No-op unless renderdoc.dll sits next
+    // to this plugin's DLL (file presence is the on/off switch).
+    RenderDocBridge::Initialize();
     // Sort the shader definitions by priority (highest first)
     // So we match the definitions with then highest priority
     g_shaderDefinitions.SortByPriority();

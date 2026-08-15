@@ -5,6 +5,7 @@
 #include <Global.h>
 #include <LightSorter.h>
 #include <PhaseTelemetry.h>
+#include <RenderTargets.h>
 #include <hooks.h>
 
 #include <array>
@@ -114,12 +115,94 @@ void HookedDeferredComposite()
 {
     s_originalDeferredComposite();
 
-    // kMain now holds the composited lit scene and nothing transparent has
-    // drawn yet. Passes that multiply into the scene fire here so they darken
-    // lit opaque surfaces only - particles, smoke, glass and fog blend over the
-    // shadowed result afterwards instead of being darkened by it.
-    if (g_rendererData && g_rendererData->context) {
-        ::CustomPass::FireAfterDeferredLightsPasses(g_rendererData->context);
+    // The scene now holds the composited lit opaques and nothing transparent
+    // has drawn yet. Passes that multiply into the scene fire here so they
+    // darken lit opaque surfaces only - particles, smoke, glass and fog blend
+    // over the shadowed result afterwards instead of being darkened by it.
+    //
+    // MAIN SCENE ONLY, by IDENTITY. The engine runs this same composite with
+    // more than one target bound across frames: confirmed in game 2026-08-14
+    // as a 2560x1440 target (2/3 of 3840x2160 - an upscaler Quality-mode
+    // proxy) alternating with the display-sized one in ~0.5s blocks at
+    // GPU-heavy camera angles. A size-based gate ("must match the kMain
+    // allocation") still lost shadows there: when the upscaler proxy-swaps
+    // kMain itself, the smaller target IS the main scene, and the
+    // display-sized composite of those frames is overwritten by the upscale.
+    // The one stable truth is renderTargets[kMain].texture - the engine and
+    // every downstream pass read the scene through that slot, so fire exactly
+    // when the bound target is that texture, whatever size it currently is.
+    if (!g_rendererData || !g_rendererData->context) {
+        return;
+    }
+    auto* context = g_rendererData->context;
+
+    bool mainSceneTarget = false;
+    REX::W32::ID3D11Texture2D* boundTexture = nullptr;
+    std::uint32_t boundW = 0, boundH = 0;
+    REX::W32::ID3D11RenderTargetView* rtv0 = nullptr;
+    context->OMGetRenderTargets(1, &rtv0, nullptr);
+    if (rtv0) {
+        REX::W32::ID3D11Resource* resource = nullptr;
+        rtv0->GetResource(&resource);
+        if (resource) {
+            resource->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                     reinterpret_cast<void**>(&boundTexture));
+            if (boundTexture) {
+                REX::W32::D3D11_TEXTURE2D_DESC boundDesc{};
+                boundTexture->GetDesc(&boundDesc);
+                boundW = boundDesc.width;
+                boundH = boundDesc.height;
+            }
+            resource->Release();
+        }
+        rtv0->Release();
+    }
+
+    // Identity against renderTargets[kMain] was tried and is WRONG: in-game
+    // 2026-08-14 the composite's destination is never that texture. It writes
+    // one of two un-tabled buffers - display-sized (0x...d0e60-style) or a
+    // 2560x1440 upscaler Quality proxy - while kMain is a third texture the
+    // composite reads as an input. There is no stable identity to gate on, so
+    // fire for every plausible scene-sized composite and let the passes bind
+    // whatever target is live; the composite shader derives its extents from
+    // the bound target, so each fire is self-consistent.
+    auto* mainTexture =
+        g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture;
+    mainSceneTarget = boundTexture && boundW >= 16 && boundH >= 16;
+
+    // Per-call transition diagnostic (capped 4/s): bound target vs kMain
+    // identity across composite calls. This is what distinguishes "kMain was
+    // proxy-swapped" from "a separate view rendered" the next time the
+    // frame structure surprises us. Pointer values are compared, never
+    // dereferenced after release.
+    {
+        static const void* s_lastBound = reinterpret_cast<const void*>(~uintptr_t{0});
+        static const void* s_lastMain = nullptr;
+        static std::uint64_t s_lastLogMs = 0;
+        if (boundTexture != s_lastBound || mainTexture != s_lastMain) {
+            s_lastBound = boundTexture;
+            s_lastMain = mainTexture;
+            const auto nowMs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (nowMs - s_lastLogMs > 250) {
+                s_lastLogMs = nowMs;
+                REX::INFO(
+                    "DeferredComposite: bound={} ({}x{}) kMain={} fire={}",
+                    static_cast<const void*>(boundTexture), boundW, boundH,
+                    static_cast<const void*>(mainTexture),
+                    mainSceneTarget ? 1 : 0);
+            }
+        }
+    }
+
+    if (boundTexture) {
+        boundTexture->Release();
+    }
+
+    if (mainSceneTarget) {
+        ::CustomPass::FireAfterDeferredLightsPasses(context);
     }
 }
 

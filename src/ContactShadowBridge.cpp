@@ -6,6 +6,7 @@
 #include "RenderTargets.h"
 #include "ShadowTelemetry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -31,7 +32,16 @@ namespace
         // area reads stale pixels from the unrendered margin instead of
         // resolving to far depth.
         int   renderExtent[2]    = {};
-        int   pad[2]             = {};
+        // 1 = stable geometry, fading to 0 as the sun approaches the view
+        // plane. There the projected light coordinate slews thousands of
+        // pixels per degree of yaw and its w flips sign, switching the march
+        // between toward-light and away-from-anti-light regimes that find
+        // different occluders: shadows visibly POP to new positions instead
+        // of moving. The singularity cannot be stabilized, so the effect
+        // fades out before entering it. Consumed by the composite as a
+        // retention multiplier.
+        float directionStability = 1.0f;
+        int   pad                = 0;
     };
     static_assert(sizeof(GpuContactDispatch) == 64,
                   "SEContactDispatch layout must match HLSL");
@@ -369,16 +379,86 @@ void BindCustomPassResource(
         }
     }
 
+    // --- Sun-direction continuity ------------------------------------------
+    // The capture is re-read every frame, and a single frame where the
+    // cascade look-up fails (or is mid-update) used to zero the WHOLE effect:
+    // publish-no-work -> composite identity -> every contact shadow on screen
+    // vanishes for exactly as long as the glitch lasts. Reported in game as
+    // "a very specific camera angle disables the contact shadows" (2026-08-14)
+    // - the 5s-throttled dump below sampled straight past it. The sun cannot
+    // move meaningfully frame to frame, so a short cache bridges capture gaps.
+    // Transitions log UNthrottled; they are rare by construction.
+    {
+        static float s_cachedDir[3] = { 0.0f, 0.0f, 0.0f };
+        static std::uint64_t s_cachedDirMs = 0;
+        static bool s_usingCachedDir = false;
+        static std::uint64_t s_lastJumpLogMs = 0;
+        constexpr std::uint64_t kCacheLifetimeMs = 2000;
+
+        const auto nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+
+        if (sunDirValid) {
+            // Diagnostic only: a large frame-to-frame swing in the captured
+            // direction means the capture briefly held something that was not
+            // the sun. Logged (1/s) but NOT rejected - a real discontinuity
+            // (load, cell transition) must win eventually, and the cache
+            // below already absorbs single bad frames of the other failure
+            // mode.
+            if (s_cachedDirMs != 0 && nowMs - s_cachedDirMs < 500) {
+                const float dot = sunDir[0] * s_cachedDir[0] +
+                                  sunDir[1] * s_cachedDir[1] +
+                                  sunDir[2] * s_cachedDir[2];
+                if (dot < 0.966f && nowMs - s_lastJumpLogMs > 1000) {
+                    s_lastJumpLogMs = nowMs;
+                    REX::WARN(
+                        "ContactShadowBridge: captured sun direction jumped "
+                        "({:.3f},{:.3f},{:.3f}) -> ({:.3f},{:.3f},{:.3f}) "
+                        "within {}ms - capture briefly held a non-sun view?",
+                        s_cachedDir[0], s_cachedDir[1], s_cachedDir[2],
+                        sunDir[0], sunDir[1], sunDir[2],
+                        nowMs - s_cachedDirMs);
+                }
+            }
+            s_cachedDir[0] = sunDir[0];
+            s_cachedDir[1] = sunDir[1];
+            s_cachedDir[2] = sunDir[2];
+            s_cachedDirMs = nowMs;
+            if (s_usingCachedDir) {
+                s_usingCachedDir = false;
+                REX::INFO(
+                    "ContactShadowBridge: live cascade direction restored");
+            }
+        } else if (s_cachedDirMs != 0 &&
+                   nowMs - s_cachedDirMs < kCacheLifetimeMs) {
+            sunDir[0] = s_cachedDir[0];
+            sunDir[1] = s_cachedDir[1];
+            sunDir[2] = s_cachedDir[2];
+            sunDirValid = true;
+            if (!s_usingCachedDir) {
+                s_usingCachedDir = true;
+                REX::WARN(
+                    "ContactShadowBridge: cascade capture invalid this frame; "
+                    "holding last valid sun direction (age {}ms) so contact "
+                    "shadows do not drop",
+                    nowMs - s_cachedDirMs);
+            }
+        }
+    }
+
     // No valid cascade (interior, night without a shadow-casting light, or
-    // capture disabled) publishes zero work; the composite reads that as
-    // identity, so the correct "no sun contact shadows here" falls out.
+    // capture disabled - and nothing cached recently) publishes zero work;
+    // the composite reads that as identity, so the correct "no sun contact
+    // shadows here" falls out.
     const bool inputsValid =
         BackbufferExtent(backbufferW, backbufferH) && sunDirValid;
 
     int totalGroups = 0;
+    float directionStability = 1.0f;
     const std::uint32_t gridWidth = CeilDiv(backbufferW, GRID_DIV_X);
 
-    const int renderExtent[2] = {
+    int renderExtent[2] = {
         static_cast<int>(renderExtentValid
             ? std::lround(gfx.g_RenderInfo.x)
             : static_cast<long>(backbufferW)),
@@ -386,6 +466,47 @@ void BindCustomPassResource(
             ? std::lround(gfx.g_RenderInfo.y)
             : static_cast<long>(backbufferH)),
     };
+
+    // Clamp to the live render target. The engine composites the scene into
+    // different textures on different frames - a display-sized buffer or a
+    // smaller upscaler proxy (2560x1440 under a 3840x2160 display, in game
+    // 2026-08-14) - and g_RenderInfo does not track the proxy: it reported
+    // full size while the proxy was bound, so the light coordinate was
+    // computed in the wrong pixel space and the border test marched rays
+    // through unrendered depth. At bind time the pass's destination is on OM
+    // slot 0 (the engine's own target during the CS fire; the pass's
+    // currentRTV output during the PS fire - the same texture either way), so
+    // its dimensions are the authoritative pixel space for this fire.
+    // Component-wise min handles both shapes: a physically smaller proxy
+    // (bound < info) and subrect rendering inside a full-size allocation
+    // (info < bound).
+    {
+        REX::W32::ID3D11RenderTargetView* rtv0 = nullptr;
+        context->OMGetRenderTargets(1, &rtv0, nullptr);
+        if (rtv0) {
+            REX::W32::ID3D11Resource* resource = nullptr;
+            rtv0->GetResource(&resource);
+            if (resource) {
+                REX::W32::ID3D11Texture2D* texture = nullptr;
+                resource->QueryInterface(
+                    REX::W32::IID_ID3D11Texture2D,
+                    reinterpret_cast<void**>(&texture));
+                if (texture) {
+                    REX::W32::D3D11_TEXTURE2D_DESC desc{};
+                    texture->GetDesc(&desc);
+                    if (desc.width >= 16 && desc.height >= 16) {
+                        renderExtent[0] = (std::min)(
+                            renderExtent[0], static_cast<int>(desc.width));
+                        renderExtent[1] = (std::min)(
+                            renderExtent[1], static_cast<int>(desc.height));
+                    }
+                    texture->Release();
+                }
+                resource->Release();
+            }
+            rtv0->Release();
+        }
+    }
 
     if (inputsValid) {
         // sunDir is already unit length from the cascade extraction.
@@ -406,6 +527,19 @@ void BindCustomPassResource(
             direction[0] * r0.z + direction[1] * r1.z + direction[2] * r2.z,
             direction[0] * r0.w + direction[1] * r1.w + direction[2] * r2.w,
         };
+
+        // Stability fade around the projection singularity. |w| is the sun's
+        // alignment with the view axis; below ~0.04 the projected light
+        // coordinate becomes numerically wild and the march regime flips with
+        // w's sign, so the composite fades the whole effect over the
+        // [0.04, 0.18] band (roughly the last ~10 degrees before the sun is
+        // perpendicular to the view) rather than letting shadows pop between
+        // positions.
+        {
+            const float absW = std::fabs(lightProjection[3]);
+            const float t = std::clamp((absW - 0.04f) / (0.18f - 0.04f), 0.0f, 1.0f);
+            directionStability = t * t * (3.0f - 2.0f * t);
+        }
 
         const int viewportSize[2] = { renderExtent[0], renderExtent[1] };
         const int minBounds[2] = { 0, 0 };
@@ -450,10 +584,11 @@ void BindCustomPassResource(
     // Every entry carries the header fields, because the shader reads entry 0
     // before it knows which entry owns its group.
     for (auto& entry : upload) {
-        entry.gridWidth       = static_cast<int>(gridWidth);
-        entry.liveTotalGroups = totalGroups;
-        entry.renderExtent[0] = renderExtent[0];
-        entry.renderExtent[1] = renderExtent[1];
+        entry.gridWidth          = static_cast<int>(gridWidth);
+        entry.liveTotalGroups    = totalGroups;
+        entry.renderExtent[0]    = renderExtent[0];
+        entry.renderExtent[1]    = renderExtent[1];
+        entry.directionStability = directionStability;
     }
     if (totalGroups == 0) {
         for (auto& entry : upload) {
@@ -462,6 +597,30 @@ void BindCustomPassResource(
     }
 
     context->UpdateSubresource(g_buffer, 0, nullptr, upload, 0, 0);
+
+    // Publish-state TRANSITIONS, unthrottled. The 5s dump below can sample
+    // straight past a short no-work episode, which is exactly what happened
+    // while diagnosing the angle-specific dropout: every sampled frame showed
+    // work while the frames in between published none. A transition pair
+    // brackets such an episode precisely.
+    {
+        static int s_lastPublishState = -1;
+        const int publishState = totalGroups > 0 ? 1 : 0;
+        if (s_lastPublishState != -1 && s_lastPublishState != publishState) {
+            if (publishState == 0) {
+                REX::WARN(
+                    "ContactShadowBridge: transition -> NOT publishing "
+                    "(sunDirValid={} renderExtentValid={} backbuffer={}x{})",
+                    sunDirValid, renderExtentValid, backbufferW, backbufferH);
+            } else {
+                REX::INFO(
+                    "ContactShadowBridge: transition -> publishing again "
+                    "({} groups)",
+                    totalGroups);
+            }
+        }
+        s_lastPublishState = publishState;
+    }
 
     // Throttled state dump. This path used to fail silently: any unmet
     // precondition published zero groups, the compute pass returned without

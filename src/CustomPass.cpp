@@ -1062,15 +1062,44 @@ std::string IdentifyRenderTarget(REX::W32::ID3D11Resource* resource) {
     return result;
 }
 
-// Log the engine's bound state at trigger time. Once-per-session per pass
-// (rate-limited via fire count) so the F4SE log doesn't drown.
+// Log the engine's bound state at trigger time. Fires on the pass's first
+// fire, and again whenever the engine's RTV0 RESOURCE changes (rate-limited
+// to 1 per 2s) - the engine composites the scene into different textures on
+// different frames, and the binding set that accompanies the alternate
+// target is exactly the information a first-fire-only dump misses.
 void LogEngineBindings(const Pass& pass, REX::W32::ID3D11DeviceContext* ctx, uint64_t fireCount) {
-    if (fireCount != 1) return;  // only on first fire
     if (!ctx) return;
 
     REX::W32::ID3D11RenderTargetView* rtvs[8] = {};
     REX::W32::ID3D11DepthStencilView* dsv = nullptr;
     ctx->OMGetRenderTargets(8, rtvs, &dsv);
+
+    // Pointer identity only, never dereferenced later.
+    static const void* s_lastRtv0Resource = nullptr;
+    static std::uint64_t s_lastForcedDumpMs = 0;
+    const void* rtv0Resource = nullptr;
+    if (rtvs[0]) {
+        REX::W32::ID3D11Resource* res = nullptr;
+        rtvs[0]->GetResource(&res);
+        rtv0Resource = res;
+        if (res) res->Release();
+    }
+    bool due = fireCount == 1;
+    if (!due && rtv0Resource != s_lastRtv0Resource) {
+        const auto nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (nowMs - s_lastForcedDumpMs > 2000) {
+            s_lastForcedDumpMs = nowMs;
+            due = true;
+        }
+    }
+    s_lastRtv0Resource = rtv0Resource;
+    if (!due) {
+        for (int i = 0; i < 8; ++i) if (rtvs[i]) rtvs[i]->Release();
+        if (dsv) dsv->Release();
+        return;
+    }
 
     REX::INFO("CustomPass[{}]: engine bindings at trigger time:", pass.spec.name);
     for (int i = 0; i < 8; ++i) {
@@ -1089,14 +1118,29 @@ void LogEngineBindings(const Pass& pass, REX::W32::ID3D11DeviceContext* ctx, uin
         dsv->Release();
     }
 
-    REX::W32::ID3D11ShaderResourceView* srvs[16] = {};
-    ctx->PSGetShaderResources(0, 16, srvs);
-    for (int i = 0; i < 16; ++i) {
+    REX::W32::ID3D11ShaderResourceView* srvs[32] = {};
+    ctx->PSGetShaderResources(0, 32, srvs);
+    for (int i = 0; i < 32; ++i) {
         if (!srvs[i]) continue;
         REX::W32::ID3D11Resource* res = nullptr;
         srvs[i]->GetResource(&res);
-        REX::INFO("  PS SRV t{}: {}", i, IdentifyRenderTarget(res));
-        if (res) res->Release();
+        // Include dimensions: two same-purpose textures at different
+        // resolutions (native scene vs upscaler proxy) both identify as
+        // "(unknown)", and the size is what tells them apart.
+        std::string name = IdentifyRenderTarget(res);
+        if (res) {
+            REX::W32::ID3D11Texture2D* tex = nullptr;
+            res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                reinterpret_cast<void**>(&tex));
+            if (tex) {
+                REX::W32::D3D11_TEXTURE2D_DESC d{};
+                tex->GetDesc(&d);
+                name += std::format(" {}x{}", d.width, d.height);
+                tex->Release();
+            }
+            res->Release();
+        }
+        REX::INFO("  PS SRV t{}: {}", i, name);
         srvs[i]->Release();
     }
 }
@@ -1438,10 +1482,49 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     for (auto& in : pass.spec.inputs) {
         REX::W32::ID3D11ShaderResourceView* s = nullptr;
         switch (in.kind) {
-            case InputKind::Depth:
+            case InputKind::Depth: {
                 g_depthSRV = ShaderResources::GetDepthBufferSRV_Internal();
                 s = g_depthSRV;
+                // Transition log: which texture "depth" actually resolves to.
+                // The scene can render into an upscaler proxy while the depth
+                // TABLE entry keeps pointing at the native-size buffer, in
+                // which case every consumer of this input samples depth the
+                // current frame never wrote - the contact raymarch then sees
+                // no occluders anywhere and its whole output silently
+                // disappears. Pointer identity only, never dereferenced.
+                {
+                    static const void* s_lastDepthRes =
+                        reinterpret_cast<const void*>(~uintptr_t{0});
+                    const void* depthRes = nullptr;
+                    uint32_t dw = 0, dh = 0;
+                    if (s) {
+                        REX::W32::ID3D11Resource* res = nullptr;
+                        s->GetResource(&res);
+                        if (res) {
+                            depthRes = res;
+                            REX::W32::ID3D11Texture2D* tex = nullptr;
+                            res->QueryInterface(
+                                REX::W32::IID_ID3D11Texture2D,
+                                reinterpret_cast<void**>(&tex));
+                            if (tex) {
+                                REX::W32::D3D11_TEXTURE2D_DESC d{};
+                                tex->GetDesc(&d);
+                                dw = d.width;
+                                dh = d.height;
+                                tex->Release();
+                            }
+                            res->Release();
+                        }
+                    }
+                    if (depthRes != s_lastDepthRes) {
+                        s_lastDepthRes = depthRes;
+                        REX::INFO(
+                            "CustomPass[{}]: depth input resolved to {} ({}x{})",
+                            pass.spec.name, depthRes, dw, dh);
+                    }
+                }
                 break;
+            }
             case InputKind::CurrentRTV: {
                 // Use the snapshot we captured BEFORE Restore (saved.rtvs[0]).
                 // The render target's underlying resource is the engine's HDR
@@ -1565,10 +1648,14 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             if (pass.spec.type != PassType::Pixel) continue;
             auto* rt = saved.rtvs[0];
             bool usable = false;
+            REX::W32::ID3D11Resource* identity = nullptr;
+            uint32_t descW = 0, descH = 0;
+            int descFormat = -1;
             if (rt) {
                 REX::W32::ID3D11Resource* res = nullptr;
                 rt->GetResource(&res);
                 if (res) {
+                    identity = res;
                     REX::W32::ID3D11Texture2D* tex = nullptr;
                     res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
                                         reinterpret_cast<void**>(&tex));
@@ -1576,9 +1663,33 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
                         REX::W32::D3D11_TEXTURE2D_DESC d{};
                         tex->GetDesc(&d);
                         usable = d.width >= 16 && d.height >= 16;
+                        descW = d.width;
+                        descH = d.height;
+                        descFormat = static_cast<int>(d.format);
                         tex->Release();
                     }
                     res->Release();
+                }
+            }
+            // Transition log: the target's identity is unknown by design, so
+            // the one thing worth recording is when it CHANGES - a full-frame
+            // effect dropout at a specific camera angle would show here as the
+            // engine swapping (or unbinding) its composite destination.
+            // `s_lastIdentity` stores the pointer VALUE for comparison only
+            // and is never dereferenced; a destroyed-and-reallocated texture
+            // at the same address logs nothing, which is acceptable for a
+            // diagnostic. Static is fine: render-thread only, and shared
+            // across the (currently one) pass using currentRTV.
+            {
+                static REX::W32::ID3D11Resource* s_lastIdentity =
+                    reinterpret_cast<REX::W32::ID3D11Resource*>(~uintptr_t{0});
+                if (identity != s_lastIdentity) {
+                    s_lastIdentity = identity;
+                    REX::INFO(
+                        "CustomPass[{}]: currentRTV target changed: res={} "
+                        "{}x{} fmt={} usable={}",
+                        pass.spec.name, static_cast<void*>(identity),
+                        descW, descH, descFormat, usable);
                 }
             }
             if (usable && out.slot >= 0 && out.slot < (int)rtvBindings.size()) {
@@ -1808,9 +1919,12 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     }
 
     const uint64_t fires = pass.totalFireCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (pass.spec.oncePerFrame) {
-        pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
-    }
+    // Unconditional: the oncePerFrame GATE above only reads this when that
+    // flag is set, but the afterDeferredLights batch diagnostic reads it as
+    // "did this pass fire this frame" - with the old conditional store, a
+    // oncePerFrame=false pass logged as SKIPPED forever while firing fine,
+    // which sent a live debugging session down the wrong path (2026-08-14).
+    pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
     if (pass.spec.log) {
         // Rate-limit: every fire for the first 5, then every 600th frame
         // (~10s at 60fps). Avoids dumping 180 lines/sec when log=true is on
