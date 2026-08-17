@@ -177,6 +177,13 @@ namespace ShaderCache {
         std::string_view profile;          // "ps_5_0", "vs_5_0", "cs_5_0", ...
         std::string_view entry;            // entry-point function name
         uint32_t         flags;            // D3DCOMPILE_* flags actually passed
+        // Folder holding the shader's own file. Hashed into the key (stat-
+        // probed, content-hashed on change) so sibling-folder includes -
+        // e.g. visualContactShadowTrace.hlsl's body being nothing but
+        // `#include "../HachiToon/visualSSRTGI.hlsl"` - invalidate the
+        // includer even though the included bytes never appear in
+        // assembledSource. Empty = skip (GpuScalar's generated probes).
+        std::filesystem::path shaderFolder;
     };
 
     // Stable hex string suitable for use as a filename. Hash covers `inputs`

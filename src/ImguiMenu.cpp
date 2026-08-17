@@ -125,6 +125,42 @@ static void SaveShaderSettingsWithFeedback()
 // might currently have bound.
 static void ReloadShadersWithFeedback()
 {
+    // Full definition reload on the same task-queued path the DEVELOPMENT
+    // Shader.ini watcher uses: re-parses Shader.ini AND Values.ini for
+    // every shader folder, so newly added sliders, passes and definitions
+    // appear WITHOUT a game restart. Existing sliders keep their live
+    // values - AddShaderValue dedups by id, so a re-parse only adds.
+    if (g_taskInterface) {
+        if (g_reloadQueued.exchange(true)) {
+            g_shaderSettingsSaveSucceeded = false;
+            g_shaderSettingsSaveMessage = "A shader reload is already queued.";
+            g_shaderSettingsSaveModalRequested = true;
+            return;
+        }
+        g_taskInterface->AddTask([]() {
+            try {
+                UIUnlockShaderList_Internal();
+                ReloadAllShaderDefinitions_Internal();
+            } catch (const std::exception& e) {
+                REX::WARN("ReloadShadersWithFeedback: reload task threw: {}", e.what());
+            } catch (...) {
+                REX::WARN("ReloadShadersWithFeedback: reload task threw an unknown exception");
+            }
+            g_reloadQueued = false;
+        });
+        REX::INFO("ReloadShadersWithFeedback: full definition reload queued");
+        g_shaderSettingsSaveSucceeded = true;
+        g_shaderSettingsSaveMessage =
+            "Full shader reload queued: Shader.ini, Values.ini and all HLSL "
+            "reload from disk over the next frames.\n"
+            "New sliders and passes appear without a restart; existing "
+            "sliders keep their current values.";
+        g_shaderSettingsSaveModalRequested = true;
+        return;
+    }
+
+    // Fallback without a task interface: the old mark-for-recompile path
+    // (HLSL edits only; Values.ini additions need a restart here).
     ShaderCache::InvalidateIncludeMemo();
     std::size_t definitionCount = 0;
     {

@@ -148,7 +148,10 @@ GlobalShaderSettings g_shaderSettings = {};
 std::filesystem::path g_commonShaderHeaderPath;
 // Global INI watcher map for hot-reloading shader definitions when their files change
 std::unordered_map<std::filesystem::path, std::unique_ptr<ShaderIniFileWatcher>> g_iniWatchers;
-static std::atomic<bool> g_reloadQueued{false};
+// External linkage (declared extern in Global.h): the settings overlay's
+// Reload button queues the same full-reload task the DEVELOPMENT watcher
+// uses, and needs this flag for its double-queue guard.
+std::atomic<bool> g_reloadQueued{false};
 
 // Helper to check if a file exists
 bool FileExists(const std::filesystem::path& filepath) {
@@ -1155,7 +1158,12 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     }
                 }
                 ShaderValue finalShaderV = shaderV; // Make a copy for ownership handoff
-                g_shaderSettings.AddShaderValue(new ShaderValue(std::move(finalShaderV)));
+                auto* ownedValue = new ShaderValue(std::move(finalShaderV));
+                if (!g_shaderSettings.AddShaderValue(ownedValue)) {
+                    // Duplicate id (full-reload re-parse): the registry keeps
+                    // the live value - its user-tuned current value survives.
+                    delete ownedValue;
+                }
             }
         }
         REX::INFO("LoadShaderDefinitionsFromFile: Loaded values for shader '{}' from {}/Values.ini", cachedShaderID, folderName);

@@ -47,7 +47,13 @@ private:
 
 // --- Resource -------------------------------------------------------------
 
-enum class ScaleMode : uint8_t { Screen, ScreenDiv, Absolute };
+// Saved = the viewport captured from the engine at fire time. Only
+// meaningful for a pass's `viewport=` (resources have no live viewport):
+// at a beforeDrawForHook trigger the snapshot holds the hooked draw's own
+// viewport, which during the imagespace HDR phase is the dynamic-resolution
+// SUBRECT of the target allocation - rasterizing there makes the pass's
+// fullscreen-triangle UV equal the engine's scene-logical UV.
+enum class ScaleMode : uint8_t { Screen, ScreenDiv, Absolute, Saved };
 
 struct ResourceSpec {
     std::string                             name;
@@ -144,6 +150,7 @@ enum class InputKind : uint8_t {
     MotionVectors,        // renderTargets[kMotionVectors=29].srView
     SceneHDR,             // renderTargets[kMain=3].srView (engine HDR scene)
     DepthStencil,         // depthStencilTargets[N].srViewDepth (explicit index)
+    File,                 // WIC-loaded texture file (path relative to the pass's folder)
 };
 
 struct InputBinding {
@@ -153,6 +160,9 @@ struct InputBinding {
     int                                     gbufferIndex = -1;   // for GBufferRT
     int                                     depthStencilIndex = -1;  // for DepthStencil
     int                                     sourceSlot = -1;     // for CurrentPSRV
+    // For File: lazy-loaded on first fire via the same WIC path replacement
+    // shaders use for bindTexture. Released in Pass::Release.
+    ReplacementTextureBinding               fileTexture;
 };
 
 enum class OutputKind : uint8_t {

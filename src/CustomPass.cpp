@@ -101,6 +101,7 @@ REX::W32::DXGI_FORMAT ParseFormat(const std::string& s) {
 void ParseScale(const std::string& s, ScaleMode& mode, uint32_t& div, uint32_t& w, uint32_t& h) {
     mode = ScaleMode::Screen; div = 1; w = 0; h = 0;
     if (s.empty()) return;
+    if (s == "saved")  { mode = ScaleMode::Saved; div = 1; return; }
     if (s == "screen") { mode = ScaleMode::Screen; div = 1; return; }
     if (s.rfind("screen/", 0) == 0) {
         mode = ScaleMode::ScreenDiv;
@@ -124,6 +125,10 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
         case ScaleMode::ScreenDiv: outW = std::max<uint32_t>(1, backW / std::max<uint32_t>(1, div));
                                    outH = std::max<uint32_t>(1, backH / std::max<uint32_t>(1, div)); break;
         case ScaleMode::Absolute:  outW = absW ? absW : backW; outH = absH ? absH : backH; break;
+        // Saved is resolved at fire time from the state snapshot (a live
+        // viewport does not exist here); fall back to the backbuffer size so
+        // a resource misconfigured with scale=saved still allocates sanely.
+        case ScaleMode::Saved:     outW = backW; outH = backH; break;
     }
 }
 
@@ -166,6 +171,17 @@ bool ParseInputBinding(const std::string& token, InputBinding& out) {
     if (lowerSource.rfind("depthstencil:", 0) == 0) {
         out.kind = InputKind::DepthStencil;
         try { out.depthStencilIndex = std::stoi(source.substr(strlen("depthStencil:"))); } catch (...) { return false; }
+        return true;
+    }
+    // File-backed texture: "N:file:relative/or/absolute.png". Relative paths
+    // resolve against the pass's shader folder in the `input=` parse branch
+    // (folderPath is not visible from here).
+    if (lowerSource.rfind("file:", 0) == 0) {
+        std::string path = source.substr(strlen("file:"));
+        if (path.empty()) return false;
+        out.kind = InputKind::File;
+        out.fileTexture.file = path;
+        out.fileTexture.slot = out.slot;
         return true;
     }
     return false;
@@ -415,6 +431,9 @@ void Resource::SwapContents(Resource& other) {
 
 void Pass::Release() {
     if (hlslWatcher) { hlslWatcher->Stop(); hlslWatcher.reset(); }
+    for (auto& in : spec.inputs) {
+        if (in.kind == InputKind::File) in.fileTexture.Release();
+    }
     if (psShader) { psShader->Release(); psShader = nullptr; }
     if (csShader) { csShader->Release(); csShader = nullptr; }
     if (compiledBlob) { compiledBlob->Release(); compiledBlob = nullptr; }
@@ -812,7 +831,14 @@ bool Registry::ParsePassSection(const std::string& name,
         else if (lk == "onceperframe")  pass->spec.oncePerFrame = (ToLower(value) == "true" || value == "1");
         else if (lk == "input") {
             std::vector<std::string> parts; ParseList(value, parts);
-            for (auto& tok : parts) { InputBinding b; if (ParseInputBinding(tok, b)) pass->spec.inputs.push_back(b); }
+            for (auto& tok : parts) {
+                InputBinding b;
+                if (!ParseInputBinding(tok, b)) continue;
+                if (b.kind == InputKind::File && b.fileTexture.file.is_relative()) {
+                    b.fileTexture.file = folderPath / b.fileTexture.file;
+                }
+                pass->spec.inputs.push_back(b);
+            }
         }
         else if (lk == "output" || lk == "uav") {
             std::vector<std::string> parts; ParseList(value, parts);
@@ -946,6 +972,7 @@ bool Registry::EnsureCompiled(Pass& pass) {
         .profile         = profile,
         .entry           = pass.spec.entry,
         .flags           = kCompileFlags,
+        .shaderFolder    = pass.spec.shaderFile.parent_path(),
     });
     if (ShaderCache::TryLoad(cacheKey, &pass.compiledBlob)) {
         REX::INFO("CustomPass[{}]: cache HIT ({} bytes)", pass.spec.name, pass.compiledBlob->GetBufferSize());
@@ -1619,6 +1646,15 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
                 }
                 break;
             }
+            case InputKind::File: {
+                // Lazy-loaded on first fire, exactly like a replacement
+                // shader's bindTexture. Load failure logs once (inside the
+                // loader) and the slot stays null; the consuming shader must
+                // treat a null bind (samples return 0) as "feature off".
+                ShaderResources::EnsureFileTextureSRV(device, in.fileTexture);
+                s = in.fileTexture.srv;
+                break;
+            }
             default: break;
         }
         if (in.slot >= 0 && in.slot < (int)srvBindings.size()) srvBindings[in.slot] = s;
@@ -1787,8 +1823,33 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             break;
         }
     }
+    // viewport=saved: rasterize over the engine's own viewport as captured
+    // when the trigger fired. At a beforeDrawForHook trigger that is the
+    // hooked draw's viewport - during the imagespace HDR phase (tonemap and
+    // earlier) the dynamic-resolution SUBRECT of the allocation, so the
+    // pass's fullscreen UV becomes the engine's scene-logical UV and its
+    // writes land only on texels the scene actually occupies. Falls back to
+    // the output texture's size when the snapshot has no usable viewport.
+    if (pass.spec.viewportMode == ScaleMode::Saved) {
+        if (saved.viewports[0].width >= 1.0f && saved.viewports[0].height >= 1.0f) {
+            outW = (uint32_t)saved.viewports[0].width;
+            outH = (uint32_t)saved.viewports[0].height;
+        }
+        // Transition log: the saved viewport IS the diagnosis surface for
+        // DRS-space bugs (full allocation here means the engine was not in a
+        // subrect and the mapping is identity). Render-thread only.
+        {
+            static uint64_t s_lastDims = ~0ull;
+            const uint64_t dims = (uint64_t(outW) << 32) | outH;
+            if (dims != s_lastDims) {
+                s_lastDims = dims;
+                REX::INFO("CustomPass[{}]: saved viewport {}x{}",
+                    pass.spec.name, outW, outH);
+            }
+        }
+    }
     // Override if explicit viewport scale set (resolves against kMain's size).
-    if (pass.spec.viewportMode != ScaleMode::Screen || pass.spec.viewportDiv > 1) {
+    else if (pass.spec.viewportMode != ScaleMode::Screen || pass.spec.viewportDiv > 1) {
         REX::W32::D3D11_TEXTURE2D_DESC bd{};
         if (g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture)
             g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture->GetDesc(&bd);

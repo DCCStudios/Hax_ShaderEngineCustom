@@ -87,8 +87,8 @@ struct alignas(16) GFXBoosterAccessData
     int32_t  currentWeatherClass;
 
     int32_t  outgoingWeatherClass;
-    float    enbPadding0;
-    float    enbPadding1;
+    float    waterHeight;       // absolute Z of the player cell's water plane, -1e9 = none
+    float    cameraUnderwater;  // 1 when the camera is below that plane
     float    enbPadding2;
 
     DirectX::XMFLOAT4 cameraLocalRow0;
@@ -229,9 +229,14 @@ class GlobalShaderSettings {
     std::vector<ShaderValue*> floatShaderValues;
     std::vector<ShaderValue*> intShaderValues;
 public:
-    // Add a new shader value to the appropriate vector based on its type
-    void AddShaderValue(ShaderValue* value) {
-        if (!value) return;
+    // Add a new shader value to the appropriate vector based on its type.
+    // Returns whether the value was inserted anywhere; on false (a value
+    // with this identity is already registered - the normal case when
+    // Values.ini is RE-parsed by the full reload path) the caller still
+    // owns the pointer and must delete it. Existing entries keep their
+    // live (user-tuned) current values.
+    bool AddShaderValue(ShaderValue* value) {
+        if (!value) return false;
         // Check if we have this id already
         auto dedupCheck = [&](const std::vector<ShaderValue*>& vec) {
             return std::any_of(vec.begin(), vec.end(), [&](ShaderValue* s) {
@@ -242,31 +247,38 @@ public:
                     s->global == value->global;
         });
         };
+        bool added = false;
         if (value->global) {
             if (!dedupCheck(globalShaderValues)) {
                 globalShaderValues.push_back(value);
+                added = true;
             }
         } else {
             if (!dedupCheck(localShaderValues)) {
                 localShaderValues.push_back(value);
+                added = true;
             }
         }
         if (value->type == ShaderValue::Type::Bool) {
             if (!dedupCheck(boolShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(boolShaderValues.size());
                 boolShaderValues.push_back(value);
+                added = true;
             }
         } else if (value->type == ShaderValue::Type::Float) {
             if (!dedupCheck(floatShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(floatShaderValues.size());
                 floatShaderValues.push_back(value);
+                added = true;
             }
         } else if (value->type == ShaderValue::Type::Int) {
             if (!dedupCheck(intShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(intShaderValues.size());
                 intShaderValues.push_back(value);
+                added = true;
             }
         }
+        return added;
     }
     // Save the current shader settings values to a file (e.g. JSON or INI)
     bool SaveSettings(std::string* errorMessage = nullptr) {

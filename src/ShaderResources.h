@@ -41,6 +41,11 @@ namespace ShaderResources
         bool pixelStage);
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal();
+
+    // Lazy-load a file-backed texture SRV (WIC: dds/png/jpg/bmp) into
+    // `binding`. Returns true when binding.srv is usable. Fails once and
+    // remembers (binding.loadFailed) — callers may invoke per frame.
+    bool EnsureFileTextureSRV(REX::W32::ID3D11Device* device, ReplacementTextureBinding& binding);
     UINT FindDepthTargetIndexForDSV(REX::W32::ID3D11DepthStencilView* dsv);
     void TrackOMRenderTargets(
         UINT numViews,

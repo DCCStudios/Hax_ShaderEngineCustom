@@ -260,6 +260,7 @@ bool CompileShader_Internal(ShaderDefinition* def) {
         .profile         = targetProfile,
         .entry           = kEntry,
         .flags           = kCompileFlags,
+        .shaderFolder    = def->shaderFile.parent_path(),
     });
     ID3DBlob* cachedBlob = nullptr;
     if (ShaderCache::TryLoad(cacheKey, &cachedBlob)) {

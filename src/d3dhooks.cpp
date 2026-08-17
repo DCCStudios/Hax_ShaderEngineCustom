@@ -318,26 +318,82 @@ static const RE::NiAVObject* GetPlayerCameraRoot()
     return playerCamera->cameraRoot.get();
 }
 
+// A cached camera is a plausible MAIN-SCENE camera only if its projection's
+// vertical FOV is in gameplay range. The cache also holds render-to-texture
+// cameras - live forensics (2026-08-16) captured MagnaScope's scope camera
+// at 24 degrees and the viewmodel at 54.5 alongside the 72.5-degree world
+// camera - and selecting one of those hands every injected camera quantity
+// (reconstruction matrices, position adjust, underwater flag) to the wrong
+// view. That misselection, flipping with cache order as RTT cameras spawn
+// (e.g. wading into water), was the root cause of the "warped
+// reconstruction" saga: the matrix algebra itself was verified exact
+// (|view*proj - VP| = 0).
+static bool CameraStatePlausibleForScene(const RE::BSGraphics::CameraStateData& cachedCamera)
+{
+    const float m11 = DirectX::XMVectorGetY(cachedCamera.camViewData.projMat[1]);
+    if (std::fabs(m11) < 1e-4f) {
+        return false;
+    }
+    const float fovDeg = 2.0f * std::atan(1.0f / std::fabs(m11)) * 57.29578f;
+    // Wider than the 54.5-degree viewmodel, narrower than fisheye garbage.
+    // Gameplay world FOV in this setup reads 72.5; users run 70-120.
+    return fovDeg > 58.0f && fovDeg < 140.0f;
+}
+
+// SAFETY CONTRACT (crash 2026-08-17, ADS with MagnaScope): entries in
+// cameraDataCache can reference cameras that are being created or destroyed
+// - the old hierarchy fallback (IsNodeInHierarchy over referenceCamera)
+// dereferenced a dangling pointer the moment the plausibility filter made
+// that path reachable. Selection therefore uses ONLY pointer equality and
+// the entry's inline matrix data; cached referenceCamera pointers are never
+// dereferenced.
 static const RE::BSGraphics::CameraStateData* SelectGameplayCameraState(const RE::BSGraphics::State& gfxState)
 {
+    // m11 of the last confirmed world-camera projection. Lets the fallback
+    // recognize "the same camera's data under a different/expired reference"
+    // purely from inline data while the world pointer is unavailable.
+    static float s_lastWorldM11 = 0.0f;
+
     const auto* worldCamera = RE::Main::WorldRootCamera();
+    const RE::BSGraphics::CameraStateData* worldMatch = nullptr;
     if (worldCamera) {
         for (const auto& cachedCamera : gfxState.cameraDataCache) {
             if (cachedCamera.referenceCamera == worldCamera) {
-                return std::addressof(cachedCamera);
+                if (CameraStatePlausibleForScene(cachedCamera)) {
+                    s_lastWorldM11 = std::fabs(DirectX::XMVectorGetY(
+                        cachedCamera.camViewData.projMat[1]));
+                    return std::addressof(cachedCamera);
+                }
+                if (!worldMatch) worldMatch = std::addressof(cachedCamera);
             }
         }
     }
 
-    const auto* playerCameraRoot = GetPlayerCameraRoot();
-    if (playerCameraRoot) {
-        for (const auto& cachedCamera : gfxState.cameraDataCache) {
-            if (cachedCamera.referenceCamera && IsNodeInHierarchy(cachedCamera.referenceCamera, playerCameraRoot)) {
-                return std::addressof(cachedCamera);
-            }
+    // Fallback: among plausible entries (inline data only), prefer the one
+    // whose projection is closest to the last confirmed world camera.
+    const RE::BSGraphics::CameraStateData* best = nullptr;
+    float bestDiff = 1e9f;
+    for (const auto& cachedCamera : gfxState.cameraDataCache) {
+        if (!CameraStatePlausibleForScene(cachedCamera)) continue;
+        const float m11 = std::fabs(DirectX::XMVectorGetY(
+            cachedCamera.camViewData.projMat[1]));
+        const float diff = s_lastWorldM11 > 0.0f
+            ? std::fabs(m11 - s_lastWorldM11)
+            : 0.0f;
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = std::addressof(cachedCamera);
         }
     }
+    if (best) {
+        return best;
+    }
 
+    // Nothing plausible anywhere: keep the old preference order rather than
+    // inventing one (menus/loading legitimately have odd cameras).
+    if (worldMatch) {
+        return worldMatch;
+    }
     return std::addressof(gfxState.cameraState);
 }
 struct SHRows
@@ -507,6 +563,66 @@ void UpdateCustomBuffer_Internal() {
     // Use the game-provided view-projection matrix directly.
     auto& VPM = camView.viewProjMat;
     DirectX::XMMATRIX viewProj = DirectX::XMMATRIX(VPM[0], VPM[1], VPM[2], VPM[3]);
+    // Camera-matrix forensics. The injected reconstruction was proven
+    // ABSOLUTELY warped in game (2026-08-16: world-Z contours bend with
+    // camera pitch - only absolute consumers like the water-caustics plane
+    // test ever noticed; every local/round-trip consumer is insensitive).
+    // This block self-reports the facts needed to root-cause it from a
+    // normal play session's log, no in-game testing required:
+    //  - the SELECTED camera's projection m00/m11 and the vertical FOV they
+    //    imply (a viewmodel-FOV projection here would explain the warp),
+    //  - whether view*proj or proj*view reproduces the game's own
+    //    viewProjMat (multiplication-convention ground truth),
+    //  - every cameraDataCache entry's implied FOV, and which was selected.
+    // Re-fires only when the selected FOV changes by > 0.5 degrees.
+    {
+        const float m00 = DirectX::XMVectorGetX(PM[0]);
+        const float m11 = DirectX::XMVectorGetY(PM[1]);
+        const float fovDeg = (std::fabs(m11) > 1e-4f)
+            ? 2.0f * std::atan(1.0f / std::fabs(m11)) * 57.29578f
+            : 0.0f;
+        static float s_lastLoggedFov = -1000.0f;
+        if (std::fabs(fovDeg - s_lastLoggedFov) > 0.5f) {
+            s_lastLoggedFov = fovDeg;
+            auto residual = [](const DirectX::XMMATRIX& a,
+                               const DirectX::XMMATRIX& b) {
+                float worst = 0.0f;
+                for (int r = 0; r < 4; ++r) {
+                    DirectX::XMFLOAT4 fa, fb;
+                    DirectX::XMStoreFloat4(&fa, a.r[r]);
+                    DirectX::XMStoreFloat4(&fb, b.r[r]);
+                    worst = (std::max)({ worst,
+                        std::fabs(fa.x - fb.x), std::fabs(fa.y - fb.y),
+                        std::fabs(fa.z - fb.z), std::fabs(fa.w - fb.w) });
+                }
+                return worst;
+            };
+            const float dVP = residual(
+                DirectX::XMMatrixMultiply(view, proj), viewProj);
+            const float dPV = residual(
+                DirectX::XMMatrixMultiply(proj, view), viewProj);
+            REX::INFO(
+                "CameraForensics: selected proj m00={:.4f} m11={:.4f} "
+                "vFOV={:.1f}deg |view*proj-VP|={:.4f} |proj*view-VP|={:.4f}",
+                m00, m11, fovDeg, dVP, dPV);
+            int cacheIndex = 0;
+            for (const auto& cachedCamera : gfxState.cameraDataCache) {
+                const auto& cachedPM = cachedCamera.camViewData.projMat;
+                const float cm11 = DirectX::XMVectorGetY(cachedPM[1]);
+                const float cachedFov = (std::fabs(cm11) > 1e-4f)
+                    ? 2.0f * std::atan(1.0f / std::fabs(cm11)) * 57.29578f
+                    : 0.0f;
+                REX::INFO(
+                    "CameraForensics: cache[{}] refCam={} vFOV={:.1f}deg "
+                    "selected={}",
+                    cacheIndex,
+                    static_cast<const void*>(cachedCamera.referenceCamera),
+                    cachedFov,
+                    std::addressof(cachedCamera) == std::addressof(camState));
+                ++cacheIndex;
+            }
+        }
+    }
     // BSGraphics::ViewData+0x190 is the renderer-maintained previous
     // unjittered view-projection. It is paired with
     // CameraStateData::previousPosAdjust (+0x228). Live OG 1.10.163 memory
@@ -914,8 +1030,27 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.skyMode = skyMode;
     g_customBufferData.currentWeatherClass = currentWeatherClass;
     g_customBufferData.outgoingWeatherClass = outgoingWeatherClass;
-    g_customBufferData.enbPadding0 = 0.0f;
-    g_customBufferData.enbPadding1 = 0.0f;
+    // Water plane state for the underwater caustics pass. The cell reports
+    // FLT_MAX-family sentinels when it has no water, so validity is a range
+    // check on both sides. The camera's absolute position is the position
+    // adjust (BGS view matrices are rotation-only; skylighting relies on the
+    // same identity).
+    {
+        float waterHeight = -1e9f;
+        float cameraUnderwater = 0.0f;
+        if (g_player) {
+            if (auto* cell = g_player->GetParentCell()) {
+                const float h = cell->waterHeight;
+                if (std::isfinite(h) && h > -1e8f && h < 1e8f) {
+                    waterHeight = h;
+                    cameraUnderwater =
+                        camState.currentPosAdjust.z < h ? 1.0f : 0.0f;
+                }
+            }
+        }
+        g_customBufferData.waterHeight = waterHeight;
+        g_customBufferData.cameraUnderwater = cameraUnderwater;
+    }
     g_customBufferData.enbPadding2 = 0.0f;
     if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->cameraRoot) {
         const auto* cameraNode = playerCamera->cameraRoot.get();

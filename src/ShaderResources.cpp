@@ -688,6 +688,14 @@ namespace ShaderResources
         }
     }
 
+    // Public face of the lazy WIC texture loader so custom passes can bind
+    // file-backed textures (`input=N:file:foo.png`) through the exact same
+    // load/cache/fail-once path replacement shaders use for bindTexture.
+    bool EnsureFileTextureSRV(REX::W32::ID3D11Device* device, ReplacementTextureBinding& binding)
+    {
+        return EnsureReplacementTextureSRV(device, binding);
+    }
+
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal()
     {
         if (!g_rendererData) {

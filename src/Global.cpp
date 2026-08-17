@@ -374,8 +374,14 @@ std::string GetCommonShaderHeaderHLSLTop()
             int   g_CurrentWeatherClass;
 
             int   g_OutgoingWeatherClass;
-            float _enbPadding0;
-            float _enbPadding1;
+            // Former ENB padding, repurposed WITHOUT changing the stride
+            // (growing this struct once pushed FXC's unroll budget over in
+            // visualDOFAutoFocus and dropped that pass entirely).
+            // g_WaterHeight: absolute Z of the player cell's water plane, or
+            // -1e9 when the cell has none. g_CameraUnderwater: 1 when the
+            // camera sits below that plane. Consumers: underwater caustics.
+            float g_WaterHeight;
+            float g_CameraUnderwater;
             float _enbPadding2;
 
             float4 g_CameraLocalRow0;
@@ -710,21 +716,64 @@ std::filesystem::path GetCacheDir() {
 // done once per ComputeKey) and the include-file contents (read via ifstream
 // on every #include from D3DCompile) used to be recomputed on every shader
 // compile. With N matched shaders bound back-to-back at world load that's
-// N copies of the same disk traffic. Memoize both, drop the memo on Shader.ini
-// reload (where the include-dir contents may have changed).
+// N copies of the same disk traffic.
+//
+// STALENESS CONTRACT (2026-08-16): the memos are NOT trusted blindly for a
+// whole session. Shader development deploys land while the game is running,
+// and a session-lifetime memo then keys new compiles with an old include
+// hash or feeds D3DCompile old include bytes - compiled output silently
+// diverges from what is on disk. Every consumer now revalidates against a
+// cheap stat probe (name+size+mtime) and only reuses the memo when the
+// probe is unchanged: changed files ALWAYS recompile, unchanged files
+// still skip the disk traffic.
 
-std::mutex                                            g_includeMemoMutex;
-bool                                                  g_includeHashCached = false;
-uint64_t                                              g_includeHashValue  = 0;
-std::unordered_map<std::string, std::vector<char>>    g_includeContentCache;
+std::mutex g_includeMemoMutex;
+
+// Freshness probe over the include dir: order-independent accumulation of
+// (name, size, mtime) per file. Stat-only - no file contents are read.
+uint64_t ProbeCommonIncludeDir() {
+    if (g_commonShaderHeaderPath.empty()) return 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(g_commonShaderHeaderPath, ec)) return 0;
+    uint64_t probe = kFnvOffset;
+    for (auto& e : std::filesystem::directory_iterator(g_commonShaderHeaderPath, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const auto name = e.path().filename().string();
+        uint64_t fileHash = kFnvOffset;
+        fileHash = FnvUpdate(fileHash, name.data(), name.size());
+        const uint64_t size = static_cast<uint64_t>(e.file_size(ec));
+        fileHash = FnvUpdate(fileHash, &size, sizeof(size));
+        const int64_t mtime =
+            e.last_write_time(ec).time_since_epoch().count();
+        fileHash = FnvUpdate(fileHash, &mtime, sizeof(mtime));
+        // XOR-fold so directory iteration order cannot change the probe.
+        probe ^= fileHash;
+    }
+    return probe;
+}
+
+bool     g_includeHashCached = false;
+uint64_t g_includeHashProbe  = 0;
+uint64_t g_includeHashValue  = 0;
+
+struct CachedInclude {
+    std::vector<char> bytes;
+    uint64_t          size = 0;
+    int64_t           mtime = 0;
+};
+std::unordered_map<std::string, CachedInclude> g_includeContentCache;
 
 // Hash every regular file inside g_commonShaderHeaderPath (filename + body)
 // in sorted order so any change to a shared include invalidates dependent
-// caches without us needing to track per-shader include graphs.
+// caches without us needing to track per-shader include graphs. Memoized
+// against the stat probe: any file add/remove/edit reruns the content pass.
 uint64_t HashCommonIncludeDir() {
+    const uint64_t probe = ProbeCommonIncludeDir();
     {
         std::lock_guard lk(g_includeMemoMutex);
-        if (g_includeHashCached) return g_includeHashValue;
+        if (g_includeHashCached && g_includeHashProbe == probe) {
+            return g_includeHashValue;
+        }
     }
     if (g_commonShaderHeaderPath.empty()) return 0;
     std::error_code ec;
@@ -746,6 +795,7 @@ uint64_t HashCommonIncludeDir() {
     {
         std::lock_guard lk(g_includeMemoMutex);
         g_includeHashValue  = h;
+        g_includeHashProbe  = probe;
         g_includeHashCached = true;
     }
     return h;
@@ -755,6 +805,77 @@ uint64_t HashCommonIncludeDir() {
 
 namespace ShaderCache {
 
+namespace {
+
+// Per-folder equivalent of HashCommonIncludeDir for the shader's OWN folder:
+// closes the sibling-include hole (a HachiToon shader whose body is only a
+// `#include` of another HachiToon file never changes its assembled source
+// when the included file changes). Only shader-source extensions are
+// content-hashed - Values.ini already reaches the key via the generated
+// define header, and hashing textures/INIs here would force pointless
+// folder-wide recompiles. Memoized per folder against a stat probe.
+struct FolderHashMemo { uint64_t probe = 0; uint64_t hash = 0; };
+std::mutex g_folderHashMutex;
+std::unordered_map<std::string, FolderHashMemo> g_folderHashMemo;
+
+bool IsShaderSourceFile(const std::filesystem::path& p) {
+    auto ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".hlsl" || ext == ".hlsli" || ext == ".inc" || ext == ".h";
+}
+
+uint64_t HashShaderFolder(const std::filesystem::path& folder) {
+    if (folder.empty()) return 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(folder, ec)) return 0;
+
+    // Stat probe (order-independent) over shader-source files only.
+    uint64_t probe = kFnvOffset;
+    for (auto& e : std::filesystem::directory_iterator(folder, ec)) {
+        if (!e.is_regular_file(ec) || !IsShaderSourceFile(e.path())) continue;
+        const auto name = e.path().filename().string();
+        uint64_t fileHash = kFnvOffset;
+        fileHash = FnvUpdate(fileHash, name.data(), name.size());
+        const uint64_t size = static_cast<uint64_t>(e.file_size(ec));
+        fileHash = FnvUpdate(fileHash, &size, sizeof(size));
+        const int64_t mtime = e.last_write_time(ec).time_since_epoch().count();
+        fileHash = FnvUpdate(fileHash, &mtime, sizeof(mtime));
+        probe ^= fileHash;
+    }
+
+    const std::string memoKey = folder.string();
+    {
+        std::lock_guard lk(g_folderHashMutex);
+        auto it = g_folderHashMemo.find(memoKey);
+        if (it != g_folderHashMemo.end() && it->second.probe == probe) {
+            return it->second.hash;
+        }
+    }
+
+    std::vector<std::filesystem::path> files;
+    for (auto& e : std::filesystem::directory_iterator(folder, ec)) {
+        if (e.is_regular_file(ec) && IsShaderSourceFile(e.path())) files.push_back(e.path());
+    }
+    std::sort(files.begin(), files.end());
+    uint64_t h = kFnvOffset;
+    for (auto& f : files) {
+        auto name = f.filename().string();
+        h = FnvUpdate(h, name.data(), name.size());
+        std::ifstream ifs(f, std::ios::binary);
+        if (!ifs) continue;
+        std::string body((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        h = FnvUpdate(h, body.data(), body.size());
+    }
+    {
+        std::lock_guard lk(g_folderHashMutex);
+        g_folderHashMemo[memoKey] = { probe, h };
+    }
+    return h;
+}
+
+}  // namespace
+
 std::string ComputeKey(const CompileInputs& inputs) {
     uint64_t h = kFnvOffset;
     h = FnvUpdate(h, inputs.assembledSource.data(), inputs.assembledSource.size());
@@ -763,6 +884,8 @@ std::string ComputeKey(const CompileInputs& inputs) {
     h = FnvUpdate(h, &inputs.flags,                 sizeof(inputs.flags));
     const uint64_t inc = HashCommonIncludeDir();
     h = FnvUpdate(h, &inc, sizeof(inc));
+    const uint64_t folder = HashShaderFolder(inputs.shaderFolder);
+    h = FnvUpdate(h, &folder, sizeof(folder));
     return std::format("{:016x}", h);
 }
 
@@ -876,13 +999,27 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
                                              UINT* pBytes) {
     if (!ppData || !pBytes || !pFileName) return E_FAIL;
     const std::string key = pFileName;
+    const std::filesystem::path includePath = g_commonShaderHeaderPath / pFileName;
 
-    // Hot path: serve a copy from the in-memory cache.
+    // Freshness stat: the memo is only served while size+mtime still match
+    // the file on disk, so an include edited mid-session (deploys land while
+    // the game runs) is re-read instead of feeding D3DCompile stale bytes.
+    std::error_code ec;
+    const uint64_t diskSize = static_cast<uint64_t>(
+        std::filesystem::file_size(includePath, ec));
+    const int64_t diskMtime = ec
+        ? 0
+        : std::filesystem::last_write_time(includePath, ec)
+              .time_since_epoch().count();
+
+    // Hot path: serve a copy from the in-memory cache when still current.
     {
         std::lock_guard lk(g_includeMemoMutex);
         auto it = g_includeContentCache.find(key);
-        if (it != g_includeContentCache.end()) {
-            const auto& src = it->second;
+        if (it != g_includeContentCache.end() &&
+            it->second.size == diskSize &&
+            it->second.mtime == diskMtime) {
+            const auto& src = it->second.bytes;
             char* out = new char[src.size()];
             std::memcpy(out, src.data(), src.size());
             *ppData = out;
@@ -891,8 +1028,7 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
         }
     }
 
-    // Cold path: read from disk and populate the cache.
-    const std::filesystem::path includePath = g_commonShaderHeaderPath / pFileName;
+    // Cold path: read from disk and (re)populate the cache.
     std::ifstream file(includePath, std::ios::binary);
     if (!file.good()) {
         REX::WARN("ShaderIncludeHandler: Failed to open include file: {}", includePath.string());
@@ -913,8 +1049,10 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
 
     {
         std::lock_guard lk(g_includeMemoMutex);
-        // Insert if still absent (another thread may have populated meanwhile).
-        g_includeContentCache.try_emplace(key, std::move(body));
+        auto& entry = g_includeContentCache[key];
+        entry.bytes = std::move(body);
+        entry.size  = diskSize;
+        entry.mtime = diskMtime;
     }
     return S_OK;
 }
