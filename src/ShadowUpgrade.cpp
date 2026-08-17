@@ -21,6 +21,15 @@ namespace CustomPass {
 void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context);
 }
 
+// Refreshes GFXInjected with the CURRENT frame's camera matrices (idempotent
+// per frame). The draw-batch path calls this from Plugin.cpp so screen-space
+// tracing sees the camera that produced the current depth; the
+// afterDeferredLights path did NOT, so passes there (wetness, contact
+// shadows) reconstructed world position with the PREVIOUS frame's camera and
+// the whole field slid with the camera during a pan. Declared here (global
+// scope) rather than including d3dhooks.h, matching the pattern above.
+void RefreshCustomBufferForCustomPass();
+
 namespace ShadowUpgrade {
 namespace {
 
@@ -105,10 +114,102 @@ struct ScopedDeferredLighting
     }
 };
 
+// Snapshot of the per-frame constant buffer the deferred lights had bound at
+// PS b12. Custom passes firing after DeferredComposite need the deferred
+// lights' cb12 rows 20-27 (screen -> camera-relative world reconstruction,
+// same space as the gbuffer normal - pixelDeferredLightOG.hlsl dots the
+// decoded normal against normalize(-reconstructedPos) with no basis change),
+// but by the time they fire, DeferredComposite has drawn with its OWN b12
+// binding, so "read whatever is at b12" sampled the wrong buffer. The copy is
+// taken with CopyResource on the GPU timeline immediately after the light
+// draws, freezing exactly the contents the lights read even if the engine
+// rewrites that buffer later in the frame.
+struct LightsCBSnapshot
+{
+    UINT slot = 0;
+    REX::W32::ID3D11Buffer* copy = nullptr;
+    UINT copySize = 0;
+    bool valid = false;
+    bool warnedMissing = false;
+
+    void Capture(REX::W32::ID3D11DeviceContext* context,
+                 REX::W32::ID3D11Device* device)
+    {
+        REX::W32::ID3D11Buffer* source = nullptr;
+        context->PSGetConstantBuffers(slot, 1, &source);
+        if (!source) {
+            if (!warnedMissing) {
+                warnedMissing = true;
+                REX::WARN(
+                    "ShadowUpgrade: no PS b{} bound at end of "
+                    "DeferredLightsImpl; afterDeferredLights passes get no "
+                    "engine cb{} snapshot",
+                    slot, slot);
+            }
+            valid = false;
+            return;
+        }
+
+        REX::W32::D3D11_BUFFER_DESC sourceDesc{};
+        source->GetDesc(&sourceDesc);
+        if (copy && copySize != sourceDesc.byteWidth) {
+            copy->Release();
+            copy = nullptr;
+        }
+        if (!copy) {
+            REX::W32::D3D11_BUFFER_DESC copyDesc{};
+            copyDesc.byteWidth           = sourceDesc.byteWidth;
+            copyDesc.usage               = REX::W32::D3D11_USAGE_DEFAULT;
+            copyDesc.bindFlags           = REX::W32::D3D11_BIND_CONSTANT_BUFFER;
+            copyDesc.cpuAccessFlags      = 0;
+            copyDesc.miscFlags           = 0;
+            copyDesc.structureByteStride = 0;
+            const HRESULT hr = device->CreateBuffer(&copyDesc, nullptr, &copy);
+            if (FAILED(hr) || !copy) {
+                copy = nullptr;
+                valid = false;
+                source->Release();
+                return;
+            }
+            copySize = sourceDesc.byteWidth;
+            REX::INFO(
+                "ShadowUpgrade: deferred-lights cb{} snapshot buffer created "
+                "({} bytes = {} float4 rows)",
+                slot, sourceDesc.byteWidth, sourceDesc.byteWidth / 16);
+        }
+
+        context->CopyResource(copy, source);
+        valid = true;
+        source->Release();
+    }
+};
+
+// cb12 = the reconstruction rows (20-27); cb2 = the lights' per-draw scale
+// factors (row 0 = 1/renderSize for clip coords, row 27 = dynamic-res subrect
+// scale) plus shadow matrices and sun direction. Both are needed for a fully
+// engine-verbatim world reconstruction: cb12 alone fixed the matrix content
+// but the clip normalization still came from g_RenderInfo, which can disagree
+// with the actual light-pass extent under dynamic resolution - a screen-scale
+// error that makes the reconstructed field slide during camera rotation.
+LightsCBSnapshot s_lightsCB2Snapshot{ 2 };
+LightsCBSnapshot s_lightsCB12Snapshot{ 12 };
+
+void CaptureDeferredLightsConstants()
+{
+    if (!g_rendererData || !g_rendererData->context || !g_rendererData->device) {
+        return;
+    }
+    s_lightsCB2Snapshot.Capture(g_rendererData->context, g_rendererData->device);
+    s_lightsCB12Snapshot.Capture(g_rendererData->context, g_rendererData->device);
+}
+
 void HookedDeferredLightsImpl()
 {
-    ScopedDeferredLighting scope;
-    s_originalDeferredLightsImpl();
+    {
+        ScopedDeferredLighting scope;
+        s_originalDeferredLightsImpl();
+    }
+    CaptureDeferredLightsConstants();
 }
 
 void HookedDeferredComposite()
@@ -202,7 +303,37 @@ void HookedDeferredComposite()
     }
 
     if (mainSceneTarget) {
+        // Give the afterDeferredLights passes the current frame's camera
+        // matrices (matching this frame's depth) before they reconstruct
+        // world position. Idempotent per frame: a no-op if a draw-batch pass
+        // already refreshed earlier this frame.
+        ::RefreshCustomBufferForCustomPass();
+        // Bind the deferred lights' cb2/cb12 snapshots for the batch. The
+        // composite draw that just ran left its OWN bindings there, so
+        // without this a pass declaring `cbuffer cb12 : register(b12)` (or
+        // cb2) reads the composite's buffers, not the reconstruction rows
+        // and clip scale factors the lights used. The pass executor never
+        // touches PS constant buffers, so the bindings hold for every pass
+        // in the batch.
+        REX::W32::ID3D11Buffer* previousB2 = nullptr;
+        REX::W32::ID3D11Buffer* previousB12 = nullptr;
+        context->PSGetConstantBuffers(2, 1, &previousB2);
+        context->PSGetConstantBuffers(12, 1, &previousB12);
+        if (s_lightsCB2Snapshot.valid && s_lightsCB2Snapshot.copy) {
+            context->PSSetConstantBuffers(2, 1, &s_lightsCB2Snapshot.copy);
+        }
+        if (s_lightsCB12Snapshot.valid && s_lightsCB12Snapshot.copy) {
+            context->PSSetConstantBuffers(12, 1, &s_lightsCB12Snapshot.copy);
+        }
         ::CustomPass::FireAfterDeferredLightsPasses(context);
+        context->PSSetConstantBuffers(2, 1, &previousB2);
+        context->PSSetConstantBuffers(12, 1, &previousB12);
+        if (previousB2) {
+            previousB2->Release();
+        }
+        if (previousB12) {
+            previousB12->Release();
+        }
     }
 }
 
