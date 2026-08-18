@@ -551,6 +551,28 @@ void UIDrawShaderSettingsOverlay() {
     }
     ImGui::Separator();
 
+    // Search bar: filters every setting below by label, id, or group name
+    // (case-insensitive; comma-separates multiple terms, "-term" excludes).
+    // While a filter is active the group headers are forced open and groups
+    // with no matches are hidden, so matches are always visible.
+    static ImGuiTextFilter settingsFilter;
+    settingsFilter.Draw("Search", ImGui::GetContentRegionAvail().x * 0.55f);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Filter all settings by label, id, or group name.\n"
+            "Comma separates multiple terms; -term excludes.");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear##settingsFilter")) {
+        settingsFilter.Clear();
+    }
+    const bool settingsFilterActive = settingsFilter.IsActive();
+    auto valueMatchesFilter = [&](const ShaderValue& v) {
+        return settingsFilter.PassFilter(v.label.c_str()) ||
+               settingsFilter.PassFilter(v.id.c_str());
+    };
+    ImGui::Separator();
+
     static std::string editingValueId;
     static bool focusEditInput = false;
 
@@ -624,64 +646,119 @@ void UIDrawShaderSettingsOverlay() {
         }
         ImGui::PopID();
     };
+    // Nested group renderer: a group named "Parent:Child" renders as a child
+    // header INSIDE the "Parent" header (e.g. every "Water:..." group becomes a
+    // subgroup of one Water section). Groups without a colon render flat as
+    // before. Children order alphabetically within the parent (the "1 ", "2 "
+    // prefixes in Values.ini control the sequence). Filtering: a matching
+    // parent shows everything under it, a matching child shows that child, and
+    // otherwise only matching controls survive; empty parents/children are
+    // hidden and surviving headers are forced open so matches stay visible.
+    auto renderGroupedTree = [&](std::vector<std::pair<std::string, ShaderValue*>> const& entries) {
+        std::map<std::string, std::map<std::string, std::vector<ShaderValue*>>> tree;
+        for (auto& e : entries) {
+            if (!e.second) continue;
+            std::string parent = e.first, child;
+            const size_t colon = e.first.find(':');
+            if (colon != std::string::npos) {
+                parent = e.first.substr(0, colon);
+                child = e.first.substr(colon + 1);
+            }
+            if (parent.empty()) parent = "Ungrouped";
+            tree[parent][child].push_back(e.second);
+        }
+        for (auto& pkv : tree) {
+            const std::string& parent = pkv.first;
+            const bool parentMatches =
+                settingsFilterActive && settingsFilter.PassFilter(parent.c_str());
+            // Decide what survives the filter, child by child.
+            std::map<std::string, std::vector<ShaderValue*>> shownTree;
+            size_t shownCount = 0;
+            for (auto& ckv : pkv.second) {
+                const bool childMatches = settingsFilterActive && !ckv.first.empty() &&
+                    settingsFilter.PassFilter(ckv.first.c_str());
+                std::vector<ShaderValue*> shown;
+                if (settingsFilterActive && !parentMatches && !childMatches) {
+                    for (auto* sValue : ckv.second) {
+                        if (sValue && valueMatchesFilter(*sValue)) shown.push_back(sValue);
+                    }
+                } else {
+                    shown = ckv.second;
+                }
+                if (!shown.empty()) {
+                    shownCount += shown.size();
+                    shownTree[ckv.first] = std::move(shown);
+                }
+            }
+            if (settingsFilterActive && shownCount == 0) continue;
+            if (settingsFilterActive) ImGui::SetNextItemOpen(true);
+            if (!ImGui::CollapsingHeader(parent.c_str())) continue;
+            ImGui::PushID(parent.c_str());
+            if (ImGui::SmallButton("Reset group")) {
+                for (auto& ckv : pkv.second) {
+                    for (auto* sValue : ckv.second) {
+                        if (sValue) sValue->ResetToDefault();
+                    }
+                }
+            }
+            // Ungrouped-within-parent controls first, then the child sections.
+            auto direct = shownTree.find(std::string());
+            if (direct != shownTree.end()) {
+                for (auto* sValue : direct->second) {
+                    if (sValue) renderRow(*sValue);
+                }
+            }
+            for (auto& ckv : shownTree) {
+                if (ckv.first.empty()) continue;
+                if (settingsFilterActive) ImGui::SetNextItemOpen(true);
+                ImGui::Indent();
+                if (ImGui::CollapsingHeader(ckv.first.c_str())) {
+                    ImGui::PushID(ckv.first.c_str());
+                    if (ImGui::SmallButton("Reset group")) {
+                        for (auto* sValue : pkv.second[ckv.first]) {
+                            if (sValue) sValue->ResetToDefault();
+                        }
+                    }
+                    for (auto* sValue : ckv.second) {
+                        if (sValue) renderRow(*sValue);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Unindent();
+            }
+            ImGui::PopID();
+        }
+    };
+
     // Collapsing header for global shader settings
+    if (settingsFilterActive) ImGui::SetNextItemOpen(true);
     if (ImGui::CollapsingHeader("Global Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SmallButton("Reset global")) {
             for (auto* sValue : g_shaderSettings.GetGlobalShaderValues()) {
                 if (sValue) sValue->ResetToDefault();
             }
         }
-        std::map<std::string, std::vector<ShaderValue*>> globalGroups;
+        std::vector<std::pair<std::string, ShaderValue*>> globalEntries;
         for (auto* sValue : g_shaderSettings.GetGlobalShaderValues()) {
             if (!sValue) continue;
-            const std::string groupName = sValue->group.empty() ? "Ungrouped" : sValue->group;
-            globalGroups[groupName].push_back(sValue);
+            globalEntries.emplace_back(
+                sValue->group.empty() ? "Ungrouped" : sValue->group, sValue);
         }
-        for (auto& kv : globalGroups) {
-            const std::string& groupName = kv.first;
-            auto& vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str())) {
-                ImGui::PushID(groupName.c_str());
-                if (ImGui::SmallButton("Reset group")) {
-                    for (auto* sValue : vals) {
-                        if (sValue) sValue->ResetToDefault();
-                    }
-                }
-                for (auto* sValue : vals) {
-                    if (sValue) renderRow(*sValue);
-                }
-                ImGui::PopID();
-            }
-        }
+        renderGroupedTree(globalEntries);
     }
     // Collapsing header for active shader definitions and their settings
+    if (settingsFilterActive) ImGui::SetNextItemOpen(true);
     if (ImGui::CollapsingHeader("Shader Settings", ImGuiTreeNodeFlags_DefaultOpen))
     {
         // Group local values by explicit Values.ini group, then folder/module.
-        std::map<std::string, std::vector<ShaderValue*>> settingsGroups;
+        std::vector<std::pair<std::string, ShaderValue*>> localEntries;
         for (auto* sValue : g_shaderSettings.GetLocalShaderValues()) {
             if (!sValue) continue;
             std::string groupName = !sValue->group.empty() ? sValue->group :
                 (sValue->folderName.empty() ? sValue->shaderDefinitionId : sValue->folderName);
-            settingsGroups[groupName].push_back(sValue);
+            localEntries.emplace_back(std::move(groupName), sValue);
         }
-        // Draw one collapsing header per definition and render children only if open
-        for (auto &kv : settingsGroups) {
-            const std::string &groupName = kv.first;
-            auto &vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str())) {
-                ImGui::PushID(groupName.c_str());
-                if (ImGui::SmallButton("Reset group")) {
-                    for (auto* sValue : vals) {
-                        if (sValue) sValue->ResetToDefault();
-                    }
-                }
-                for (auto* sValue : vals) {
-                    if (sValue) renderRow(*sValue);
-                }
-                ImGui::PopID();
-            }
-        }
+        renderGroupedTree(localEntries);
     }
 
     if (g_shaderSettingsSaveModalRequested) {
