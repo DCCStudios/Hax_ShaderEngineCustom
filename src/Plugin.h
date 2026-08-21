@@ -203,6 +203,8 @@ struct ShaderValue {
     std::string label = ""; // Label to show in UI
     std::string group = ""; // Optional group name to organize values in the UI
     std::string tooltip = ""; // Optional hover help loaded from Values.ini
+    std::string disabledWhen = ""; // Optional bool value ID that disables this UI row when true
+    std::vector<std::string> options; // Optional labels that render an int value as a dropdown
     enum class Type { Float, Int, Bool } type = Type::Float; // Type of the value for UI and storage
     // Value Tracking
     struct Data {
@@ -920,6 +922,11 @@ struct ShaderDB {
         auto it = entries.find(shader);
         return (it != entries.end()) ? it->second.GetMatchedDefinition() : nullptr;
     }
+    std::string GetShaderUID(REX::W32::ID3D11VertexShader* shader) {
+        std::shared_lock lock(mutex);
+        auto it = entries.find(shader);
+        return (it != entries.end()) ? it->second.shaderUID : std::string{};
+    }
     REX::W32::ID3D11PixelShader* GetReplacementShader(REX::W32::ID3D11PixelShader* shader) {
         std::shared_lock lock(mutex);
         auto it = entries.find(shader);
@@ -1051,6 +1058,8 @@ void ShutdownShaderDumping_Internal();
 void UILockShaderList_Internal();
 void UIUnlockShaderList_Internal();
 std::uint64_t GetD3DDrawCallsLastFrame_Internal();
+REX::W32::ID3D11VertexShader* GetCurrentOriginalVertexShader_Internal();
+REX::W32::ID3D11VertexShader* GetCurrentSelectedVertexShader_Internal();
 void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS);
 bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source);
 bool IsPrecombineShadowGeometry_Internal(RE::BSGeometry* geometry);

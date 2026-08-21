@@ -24,6 +24,7 @@ extern const char* flashPixelShaderHLSL;
 extern REX::W32::ID3D11PixelShader* g_flashPixelShader;
 // Global plugin path
 extern std::filesystem::path g_pluginPath;
+extern std::filesystem::path g_shaderFolderPath;
 // Global debug flag
 extern bool DEBUGGING;
 // Master runtime kill switch for shader replacements and custom passes.

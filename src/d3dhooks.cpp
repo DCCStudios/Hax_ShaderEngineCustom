@@ -13,6 +13,7 @@
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
 #include <ShadowTelemetry.h>
+#include <WaterTessellation.h>
 
 extern HWND g_outputWindow;
 extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
@@ -53,6 +54,29 @@ RE::Sky* g_sky = nullptr;
 static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
 static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
 static std::atomic_bool g_customBufferRefreshedBeforePresent{ false };
+// DEVELOPMENT-only proof for the water displacement prototype. Matching and
+// compiling an O5 object does not prove that the visible water draw used it.
+// VSSetShader marks the replacement active; the draw hook only reports success
+// when the simultaneously bound pixel shader is one of the water family.
+static std::atomic_bool g_waterO5ReplacementActive{ false };
+static std::atomic_bool g_waterO5DrawLogged{ false };
+static ShaderDefinition* g_waterO5ActiveDefinition = nullptr;
+// Track both sides of the VS hook. The original pointer identifies the engine
+// permutation in ShaderDB; the selected pointer proves what our hook passed to
+// D3D11. The draw diagnostic also queries the context to prove what remained
+// bound when a recognized visible-water pixel shader actually drew.
+static std::atomic<REX::W32::ID3D11VertexShader*> g_currentOriginalVertexShader{ nullptr };
+static std::atomic<REX::W32::ID3D11VertexShader*> g_currentSelectedVertexShader{ nullptr };
+
+REX::W32::ID3D11VertexShader* GetCurrentOriginalVertexShader_Internal()
+{
+    return g_currentOriginalVertexShader.load(std::memory_order_acquire);
+}
+
+REX::W32::ID3D11VertexShader* GetCurrentSelectedVertexShader_Internal()
+{
+    return g_currentSelectedVertexShader.load(std::memory_order_acquire);
+}
 
 namespace
 {
@@ -1189,7 +1213,10 @@ bool D3D11ShouldSuppressClearDepthStencilView_Internal(
             context, depthStencilView, clearFlags, depth, stencil);
 }
 
-void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* source)
+void D3D11OnDraw_Internal(
+    REX::W32::ID3D11DeviceContext* context,
+    const char* source,
+    UINT elementCount)
 {
     if (g_customPassRendering) {
         return;
@@ -1204,6 +1231,157 @@ void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* so
     // BindDrawTagForCurrentDraw(context);
     if (!SHADERENGINE_EFFECTS_ON) {
         return;
+    }
+    auto* pixelShader = g_currentOriginalPixelShader.load(std::memory_order_acquire);
+    auto* pixelDefinition = pixelShader
+        ? g_ShaderDB.GetMatchedDefinition(pixelShader)
+        : nullptr;
+    const bool waterPixel = pixelDefinition &&
+        (pixelDefinition->id == "visualWater" ||
+         pixelDefinition->id == "visualWaterMain2" ||
+         pixelDefinition->id == "visualWaterLOD");
+
+    if (DEVELOPMENT && waterPixel) {
+        // Bound the diagnostic work even if a scene never reaches 16 distinct
+        // permutations. The first 256 visible-water draws are enough to cover
+        // the lake's tiles and LOD transition without leaving a permanent
+        // VSGetShader call in every development frame.
+        static std::atomic_uint32_t diagnosticAttempts{ 0 };
+        const auto attempt = diagnosticAttempts.fetch_add(1, std::memory_order_relaxed);
+        if (attempt < 256) {
+            auto* originalVS = g_currentOriginalVertexShader.load(std::memory_order_acquire);
+            auto* selectedVS = g_currentSelectedVertexShader.load(std::memory_order_acquire);
+            REX::W32::ID3D11VertexShader* queriedVS = nullptr;
+            context->VSGetShader(&queriedVS, nullptr, nullptr);
+            REX::W32::D3D11_PRIMITIVE_TOPOLOGY topology{};
+            context->IAGetPrimitiveTopology(&topology);
+            REX::W32::ID3D11Buffer* vertexBuffer = nullptr;
+            UINT vertexStride = 0;
+            UINT vertexOffset = 0;
+            context->IAGetVertexBuffers(
+                0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
+            REX::W32::ID3D11Buffer* indexBuffer = nullptr;
+            REX::W32::DXGI_FORMAT indexFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
+            UINT indexOffset = 0;
+            context->IAGetIndexBuffer(&indexBuffer, &indexFormat, &indexOffset);
+            REX::W32::ID3D11HullShader* hullShader = nullptr;
+            REX::W32::ID3D11DomainShader* domainShader = nullptr;
+            context->HSGetShader(&hullShader, nullptr, nullptr);
+            context->DSGetShader(&domainShader, nullptr, nullptr);
+
+            struct WaterVertexBindKey {
+                REX::W32::ID3D11PixelShader* pixel = nullptr;
+                REX::W32::ID3D11VertexShader* original = nullptr;
+                REX::W32::ID3D11VertexShader* selected = nullptr;
+                REX::W32::ID3D11VertexShader* queried = nullptr;
+                REX::W32::D3D11_PRIMITIVE_TOPOLOGY topology{};
+
+                bool operator==(const WaterVertexBindKey&) const = default;
+            };
+            static std::mutex seenMutex;
+            static std::vector<WaterVertexBindKey> seen;
+            const WaterVertexBindKey key{
+                pixelShader, originalVS, selectedVS, queriedVS, topology
+            };
+            bool shouldLog = false;
+            {
+                std::scoped_lock lock(seenMutex);
+                if (seen.size() < 16 &&
+                    std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                    seen.push_back(key);
+                    shouldLog = true;
+                }
+            }
+
+            if (shouldLog) {
+                auto* vertexDefinition = originalVS
+                    ? g_ShaderDB.GetMatchedDefinition(originalVS)
+                    : nullptr;
+                auto* expectedReplacement = originalVS
+                    ? g_ShaderDB.GetReplacementShader(originalVS)
+                    : nullptr;
+                const auto vertexUID = originalVS
+                    ? g_ShaderDB.GetShaderUID(originalVS)
+                    : std::string{};
+                REX::INFO(
+                    "WaterVertexBindDiag: waterPS='{}' source={} originalVS={} "
+                    "uid='{}' definition='{}' expectedReplacement={} selectedVS={} "
+                    "queriedVS={} selectedIsReplacement={} queriedMatchesSelected={} "
+                    "elementCount={} topology={} vbStride={} vbOffset={} "
+                    "indexFormat={} indexOffset={} hs={} ds={}",
+                    pixelDefinition->id,
+                    source ? source : "unknown",
+                    static_cast<const void*>(originalVS),
+                    vertexUID.empty() ? "<untracked>" : vertexUID,
+                    vertexDefinition ? vertexDefinition->id : "<unmatched>",
+                    static_cast<const void*>(expectedReplacement),
+                    static_cast<const void*>(selectedVS),
+                    static_cast<const void*>(queriedVS),
+                    expectedReplacement && selectedVS == expectedReplacement,
+                    queriedVS == selectedVS,
+                    elementCount,
+                    static_cast<UINT>(topology),
+                    vertexStride,
+                    vertexOffset,
+                    static_cast<UINT>(indexFormat),
+                    indexOffset,
+                    static_cast<const void*>(hullShader),
+                    static_cast<const void*>(domainShader));
+            }
+            if (queriedVS) {
+                queriedVS->Release();
+            }
+            if (vertexBuffer) {
+                vertexBuffer->Release();
+            }
+            if (indexBuffer) {
+                indexBuffer->Release();
+            }
+            if (hullShader) {
+                hullShader->Release();
+            }
+            if (domainShader) {
+                domainShader->Release();
+            }
+        }
+    }
+
+    if (DEVELOPMENT &&
+        waterPixel &&
+        g_waterO5ReplacementActive.load(std::memory_order_acquire) &&
+        !g_waterO5DrawLogged.load(std::memory_order_acquire)) {
+        if (waterPixel && !g_waterO5DrawLogged.exchange(true, std::memory_order_acq_rel)) {
+            const auto findBool = [](std::string_view id, bool fallback) {
+                for (const auto* value : g_shaderSettings.GetBoolShaderValues()) {
+                    if (value && value->id == id) return value->current.b;
+                }
+                return fallback;
+            };
+            const auto findFloat = [](std::string_view id, float fallback) {
+                for (const auto* value : g_shaderSettings.GetFloatShaderValues()) {
+                    if (value && value->id == id) return value->current.f;
+                }
+                return fallback;
+            };
+            const auto* vertexDefinition = g_waterO5ActiveDefinition;
+            REX::INFO(
+                "WaterDisplacementDiag: O5 replacement reached '{}' draw via {}; "
+                "physical={} displacement={} amplitude={:.3f} wavelength={:.3f} "
+                "speed={:.3f} fadeNear={:.3f} fadeFar={:.3f} "
+                "usesInjected={} usesFloats={} usesBools={}",
+                pixelDefinition->id,
+                source ? source : "unknown",
+                findBool("vu_WaterPhysicalEnabled", false),
+                findBool("vu_WaterDisplacementEnabled", false),
+                findFloat("vu_WaterDisplacementAmplitude", -1.0f),
+                findFloat("vu_WaterDisplacementWavelength", -1.0f),
+                findFloat("vu_WaterDisplacementSpeed", -1.0f),
+                findFloat("vu_WaterDisplacementFadeNear", -1.0f),
+                findFloat("vu_WaterDisplacementFadeFar", -1.0f),
+                vertexDefinition ? vertexDefinition->usesGFXInjected : false,
+                vertexDefinition ? vertexDefinition->usesGFXModularFloats : false,
+                vertexDefinition ? vertexDefinition->usesGFXModularBools : false);
+        }
     }
     FireArmedCustomPassDrawBatch(context, source);
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
@@ -1954,6 +2132,8 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
     if (g_customPassRendering) {
         return vertexShader;
     }
+    g_waterO5ReplacementActive.store(false, std::memory_order_release);
+    g_waterO5ActiveDefinition = nullptr;
     if (!SHADERENGINE_EFFECTS_ON) {
         return vertexShader;
     }
@@ -1975,6 +2155,10 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                 ShaderResources::BindInjectedVertexShaderResources(context);
                 ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                 ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
+                if (matchedDefinition && matchedDefinition->id == "waterVertexDumpO5") {
+                    g_waterO5ActiveDefinition = matchedDefinition;
+                    g_waterO5ReplacementActive.store(true, std::memory_order_release);
+                }
             } else {
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING) {
@@ -1990,6 +2174,10 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                         ShaderResources::BindInjectedVertexShaderResources(context);
                         ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                         ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
+                        if (matchedDefinition->id == "waterVertexDumpO5") {
+                            g_waterO5ActiveDefinition = matchedDefinition;
+                            g_waterO5ReplacementActive.store(true, std::memory_order_release);
+                        }
                     } else {
                         REX::WARN("MyVSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true;
@@ -2287,15 +2475,18 @@ namespace
         UINT startIndexLocation,
         INT baseVertexLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawIndexed");
+        D3D11OnDraw_Internal(context, "d3d11-DrawIndexed", indexCount);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawIndexed(
-                    context,
-                    indexCount,
-                    startIndexLocation,
-                    baseVertexLocation);
+                if (!WaterTessellation::TryDrawIndexed(
+                        context, indexCount, startIndexLocation, baseVertexLocation)) {
+                    D3D11Hooks::OriginalDrawIndexed(
+                        context,
+                        indexCount,
+                        startIndexLocation,
+                        baseVertexLocation);
+                }
             });
     }
 
@@ -2304,7 +2495,7 @@ namespace
         UINT vertexCount,
         UINT startVertexLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-Draw");
+        D3D11OnDraw_Internal(context, "d3d11-Draw", vertexCount);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2321,7 +2512,8 @@ namespace
         INT baseVertexLocation,
         UINT startInstanceLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawIndexedInstanced");
+        D3D11OnDraw_Internal(
+            context, "d3d11-DrawIndexedInstanced", indexCountPerInstance);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2342,7 +2534,8 @@ namespace
         UINT startVertexLocation,
         UINT startInstanceLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawInstanced");
+        D3D11OnDraw_Internal(
+            context, "d3d11-DrawInstanced", vertexCountPerInstance);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2561,8 +2754,13 @@ namespace
         REX::W32::ID3D11ClassInstance* const* classInstances,
         UINT numClassInstances)
     {
+        auto* originalVertexShader = vertexShader;
         vertexShader = D3D11OnVSSetShader_Internal(context, vertexShader);
         D3D11Hooks::OriginalVSSetShader(context, vertexShader, classInstances, numClassInstances);
+        if (!g_customPassRendering) {
+            g_currentOriginalVertexShader.store(originalVertexShader, std::memory_order_release);
+            g_currentSelectedVertexShader.store(vertexShader, std::memory_order_release);
+        }
     }
 
     HRESULT STDMETHODCALLTYPE MyCreatePixelShader(

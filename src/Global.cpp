@@ -221,6 +221,7 @@ LIGHT_SORTER_MODE=off
 ;label="Some Float Value" ; the label to show in the menu for this setting
 ;group=Example            ; optional group name to organize this setting in the menu
 ;tooltip=Hover help text   ; optional wrapped help shown while hovering the control
+;disabledWhen=g_Master    ; optional bool ID; greys and locks this row while true
 ;type=float               ; the type of the variable (bool, int, float)
 ;value=0.5                ; the default value to set (true/false for bool, numeric value for int and float)
 ;min=0.0                  ; optional minimum value for float and int types

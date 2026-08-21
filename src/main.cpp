@@ -4,6 +4,7 @@
 #include <LightCullPolicy.h>
 #include "ContactShadowBridge.h"
 #include "RenderDocBridge.h"
+#include "WaterTessellation.h"
 #include <LocalLightBridge.h>
 #include <SunCascadeBridge.h>
 #include <LightTracker.h>
@@ -1090,6 +1091,26 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                             }
                         }
                     }
+                    else if (lowerKey == "disabledwhen") {
+                        shaderV.disabledWhen = value;
+                    }
+                    else if (lowerKey == "options") {
+                        shaderV.options.clear();
+                        size_t optionStart = 0;
+                        while (optionStart <= value.size()) {
+                            const size_t optionEnd = value.find('|', optionStart);
+                            const std::string option = value.substr(
+                                optionStart,
+                                optionEnd == std::string::npos
+                                    ? std::string::npos
+                                    : optionEnd - optionStart);
+                            if (!option.empty()) {
+                                shaderV.options.push_back(option);
+                            }
+                            if (optionEnd == std::string::npos) break;
+                            optionStart = optionEnd + 1;
+                        }
+                    }
                     else if (lowerKey == "type") {
                         std::string type = ToLower(value);
                         if (type == "bool") {
@@ -1564,6 +1585,9 @@ void ReloadAllShaderDefinitions_Internal() {
     // there's no chance of a worker-thread CompileShader_Internal touching
     // a deleted ShaderDefinition*.
     if (g_precompileWorker) g_precompileWorker->Stop();
+    // Values.ini packing and the private tessellation source can both change
+    // during a full reload. Defer COM teardown to the next render-thread draw.
+    WaterTessellation::RequestReload();
     // Drop the include-dir hash and include-file content memo so the next
     // ComputeKey / D3DCompile picks up any include edits the user made
     // alongside their Shader.ini change.

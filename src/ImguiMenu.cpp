@@ -444,6 +444,60 @@ void UIDrawDebugViewCaption()
     ImGui::End();
 }
 
+ShaderValue* FindGlobalShaderValue(const char* id)
+{
+    for (auto* value : g_shaderSettings.GetGlobalShaderValues()) {
+        if (value && value->id == id) return value;
+    }
+    return nullptr;
+}
+
+void SetGlobalBool(const char* id, bool value)
+{
+    if (auto* setting = FindGlobalShaderValue(id);
+        setting && setting->type == ShaderValue::Type::Bool) {
+        setting->current.b = value;
+    }
+}
+
+void SetGlobalFloat(const char* id, float value)
+{
+    if (auto* setting = FindGlobalShaderValue(id);
+        setting && setting->type == ShaderValue::Type::Float) {
+        setting->current.f = std::clamp(value, setting->min.f, setting->max.f);
+    }
+}
+
+void ApplyWaterBodyPreset(int preset)
+{
+    preset = std::clamp(preset, 0, 2);
+
+    // Presets intentionally own only geometric displacement. Physical optics,
+    // reflection, refraction, absorption, normal detail, and foam must not jump
+    // when the user changes the water-body wave profile.
+    if (preset == 0) { // Lake: calm, broad, low-energy surface.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 2.0f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 420.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 0.35f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.0f);
+    } else if (preset == 1) { // River: aligned and faster.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 3.5f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 180.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 1.25f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.10f);
+    } else { // Ocean: long gravity waves with true Gerstner horizontal chop.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 12.0f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 820.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 0.80f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.42f);
+    }
+
+    REX::INFO("ShaderEngine Settings: applied water displacement preset {}", preset);
+}
+
 }  // namespace
 
 void UIRenderFrame()
@@ -576,11 +630,29 @@ void UIDrawShaderSettingsOverlay() {
     static std::string editingValueId;
     static bool focusEditInput = false;
 
+    auto valueIsDisabled = [&](const ShaderValue& value) {
+        if (value.disabledWhen.empty()) return false;
+        bool negate = value.disabledWhen[0] == '!';
+        const std::string id = negate
+            ? value.disabledWhen.substr(1) : value.disabledWhen;
+        for (auto* candidate : g_shaderSettings.GetBoolShaderValues()) {
+            if (candidate && candidate->id == id) {
+                return negate ? !candidate->current.b : candidate->current.b;
+            }
+        }
+        return false;
+    };
+
     // Render a row for each shader value with appropriate control based on type
     auto renderRow = [&](ShaderValue &sValue) {
         ImGui::PushID(sValue.id.c_str());
-        const bool canEditValue = sValue.type == ShaderValue::Type::Int || sValue.type == ShaderValue::Type::Float;
+        const bool rowDisabled = valueIsDisabled(sValue);
+        if (rowDisabled) ImGui::BeginDisabled();
+        const bool canEditValue =
+            (sValue.type == ShaderValue::Type::Int && sValue.options.empty()) ||
+            sValue.type == ShaderValue::Type::Float;
         const bool isEditingValue = canEditValue && editingValueId == sValue.id;
+        bool valueChanged = false;
 
         if (isEditingValue && focusEditInput) {
             ImGui::SetKeyboardFocusHere();
@@ -590,37 +662,59 @@ void UIDrawShaderSettingsOverlay() {
         switch (sValue.type) {
             case ShaderValue::Type::Bool:
                 if (ImGui::Checkbox(sValue.label.c_str(), &sValue.current.b)) {
-                    /* value changed if you need to react */
+                    valueChanged = true;
                 }
                 break;
             case ShaderValue::Type::Int:
-                if (isEditingValue) {
+                if (!sValue.options.empty()) {
+                    const int optionIndex = std::clamp(
+                        sValue.current.i, 0,
+                        static_cast<int>(sValue.options.size()) - 1);
+                    const char* preview = sValue.options[optionIndex].c_str();
+                    if (ImGui::BeginCombo(sValue.label.c_str(), preview)) {
+                        for (int i = 0; i < static_cast<int>(sValue.options.size()); ++i) {
+                            const bool selected = sValue.current.i == i;
+                            if (ImGui::Selectable(sValue.options[i].c_str(), selected)) {
+                                sValue.current.i = i;
+                                valueChanged = true;
+                            }
+                            if (selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                } else if (isEditingValue) {
                     if (ImGui::InputInt(sValue.label.c_str(), &sValue.current.i, 0, 0, ImGuiInputTextFlags_EnterReturnsTrue)) {
                         sValue.current.i = std::clamp(sValue.current.i, sValue.min.i, sValue.max.i);
+                        valueChanged = true;
                         editingValueId.clear();
                     } else if (ImGui::IsItemDeactivated()) {
                         sValue.current.i = std::clamp(sValue.current.i, sValue.min.i, sValue.max.i);
                         editingValueId.clear();
                     }
                 } else if (ImGui::SliderInt(sValue.label.c_str(), &sValue.current.i, sValue.min.i, sValue.max.i, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-                    /* value changed */
+                    valueChanged = true;
                 }
                 break;
             case ShaderValue::Type::Float:
                 if (isEditingValue) {
                     if (ImGui::InputFloat(sValue.label.c_str(), &sValue.current.f, 0.0f, 0.0f, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) {
                         sValue.current.f = std::clamp(sValue.current.f, sValue.min.f, sValue.max.f);
+                        valueChanged = true;
                         editingValueId.clear();
                     } else if (ImGui::IsItemDeactivated()) {
                         sValue.current.f = std::clamp(sValue.current.f, sValue.min.f, sValue.max.f);
                         editingValueId.clear();
                     }
                 } else if (ImGui::SliderFloat(sValue.label.c_str(), &sValue.current.f, sValue.min.f, sValue.max.f, "%.3f", ImGuiSliderFlags_AlwaysClamp)) {
-                    /* value changed */
+                    valueChanged = true;
                 }
                 break;
         }
-        if (!sValue.tooltip.empty() && ImGui::IsItemHovered()) {
+        if (valueChanged && sValue.id == "vu_WaterBodyPreset") {
+            ApplyWaterBodyPreset(sValue.current.i);
+        }
+        if (!sValue.tooltip.empty() &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::BeginTooltip();
             ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
             ImGui::TextUnformatted(sValue.tooltip.c_str());
@@ -640,10 +734,14 @@ void UIDrawShaderSettingsOverlay() {
         ImGui::SameLine();
         if (ImGui::SmallButton("R")) {
             sValue.ResetToDefault();
+            if (sValue.id == "vu_WaterBodyPreset") {
+                ApplyWaterBodyPreset(sValue.current.i);
+            }
             if (editingValueId == sValue.id) {
                 editingValueId.clear();
             }
         }
+        if (rowDisabled) ImGui::EndDisabled();
         ImGui::PopID();
     };
     // Nested group renderer: a group named "Parent:Child" renders as a child
