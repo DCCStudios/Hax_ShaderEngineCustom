@@ -11,6 +11,7 @@
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
 #include <ShadowUpgrade.h>
+#include <ShaderResources.h>
 #include <LightSorter.h>
 
 // Global logger pointer
@@ -236,6 +237,14 @@ bool ParseReplacementSRVBinding(const std::string& token, ReplacementSRVBinding&
     }
     if (lowerSource == "motionvectors") {
         out.kind = ReplacementSRVSourceKind::MotionVectors;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemap") {
+        out.kind = ReplacementSRVSourceKind::WaterReflectionCubemap;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemapmeta") {
+        out.kind = ReplacementSRVSourceKind::WaterReflectionCubemapMeta;
         return true;
     }
     if (lowerSource.rfind("customresource:", 0) == 0) {
@@ -1866,6 +1875,7 @@ extern "C"
         LightCullPolicy::Shutdown();
         // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
         GpuScalar::Shutdown();
+        ShaderResources::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }

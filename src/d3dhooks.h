@@ -41,6 +41,15 @@ namespace D3D11Hooks
         UINT,
         REX::W32::ID3D11RenderTargetView* const*,
         REX::W32::ID3D11DepthStencilView*);
+    using OMSetRenderTargetsAndUnorderedAccessViews_t = void(STDMETHODCALLTYPE*)(
+        REX::W32::ID3D11DeviceContext*,
+        UINT,
+        REX::W32::ID3D11RenderTargetView* const*,
+        REX::W32::ID3D11DepthStencilView*,
+        UINT,
+        UINT,
+        REX::W32::ID3D11UnorderedAccessView* const*,
+        const UINT*);
     using ClearDepthStencilView_t = void(STDMETHODCALLTYPE*)(
         REX::W32::ID3D11DeviceContext*,
         REX::W32::ID3D11DepthStencilView*,
@@ -145,6 +154,8 @@ namespace D3D11Hooks
     extern Present_t OriginalPresent;
     extern PSSetShaderResources_t OriginalPSSetShaderResources;
     extern OMSetRenderTargets_t OriginalOMSetRenderTargets;
+    extern OMSetRenderTargetsAndUnorderedAccessViews_t
+        OriginalOMSetRenderTargetsAndUnorderedAccessViews;
     extern ClearDepthStencilView_t OriginalClearDepthStencilView;
     extern DrawIndexed_t OriginalDrawIndexed;
     extern Draw_t OriginalDraw;

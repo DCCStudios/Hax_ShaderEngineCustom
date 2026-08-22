@@ -489,6 +489,8 @@ enum class ReplacementSRVSourceKind : uint8_t {
     GBufferAlbedo,
     GBufferMaterial,
     MotionVectors,
+    WaterReflectionCubemap,
+    WaterReflectionCubemapMeta,
     CustomResource
 };
 

@@ -25,6 +25,8 @@ namespace D3D11Hooks
     Present_t OriginalPresent = nullptr;
     PSSetShaderResources_t OriginalPSSetShaderResources = nullptr;
     OMSetRenderTargets_t OriginalOMSetRenderTargets = nullptr;
+    OMSetRenderTargetsAndUnorderedAccessViews_t
+        OriginalOMSetRenderTargetsAndUnorderedAccessViews = nullptr;
     ClearDepthStencilView_t OriginalClearDepthStencilView = nullptr;
     DrawIndexed_t OriginalDrawIndexed = nullptr;
     Draw_t OriginalDraw = nullptr;
@@ -67,6 +69,9 @@ static ShaderDefinition* g_waterO5ActiveDefinition = nullptr;
 // bound when a recognized visible-water pixel shader actually drew.
 static std::atomic<REX::W32::ID3D11VertexShader*> g_currentOriginalVertexShader{ nullptr };
 static std::atomic<REX::W32::ID3D11VertexShader*> g_currentSelectedVertexShader{ nullptr };
+static std::atomic<REX::W32::ID3D11PixelShader*> g_currentSelectedPixelShader{ nullptr };
+static thread_local bool g_restoreWaterPSAfterCube = false;
+static thread_local bool g_restoreWaterVSAfterCube = false;
 
 REX::W32::ID3D11VertexShader* GetCurrentOriginalVertexShader_Internal()
 {
@@ -1205,6 +1210,7 @@ void RefreshCustomBufferForCustomPass()
 
 void D3D11OnPresent_Internal()
 {
+    ShaderResources::EndWaterReflectionCubeFrame();
     g_d3dDrawCallsLastFrame.store(
         g_d3dDrawCallsThisFrame.exchange(0, std::memory_order_relaxed),
         std::memory_order_relaxed);
@@ -1297,6 +1303,89 @@ void D3D11OnDraw_Internal(
         (pixelDefinition->id == "visualWater" ||
          pixelDefinition->id == "visualWaterMain2" ||
          pixelDefinition->id == "visualWaterLOD");
+
+    // A cube face can become active without a fresh PS/VS bind. Enforce the
+    // engine water pair at draw time, then restore the selected replacements
+    // on the first main-view water draw after the latched cube scope ends.
+    if (waterPixel) {
+        const bool cubeCapture =
+            ShaderResources::WaterReflectionCubeCaptureActive();
+        auto* originalVS = g_currentOriginalVertexShader.load(
+            std::memory_order_acquire);
+        auto* vertexDefinition = originalVS
+            ? g_ShaderDB.GetMatchedDefinition(originalVS)
+            : nullptr;
+        const bool waterVertex = vertexDefinition &&
+            (vertexDefinition->id == "waterVertexDumpO5" ||
+             vertexDefinition->id == "waterVertexDumpO6");
+        if (cubeCapture) {
+            D3D11Hooks::OriginalPSSetShader(
+                context, pixelShader, nullptr, 0);
+            g_currentSelectedPixelShader.store(
+                pixelShader, std::memory_order_release);
+            g_restoreWaterPSAfterCube = true;
+            if (waterVertex) {
+                D3D11Hooks::OriginalVSSetShader(
+                    context, originalVS, nullptr, 0);
+                g_currentSelectedVertexShader.store(
+                    originalVS, std::memory_order_release);
+                g_restoreWaterVSAfterCube = true;
+            }
+            ShaderResources::SetActiveReplacementPixelShaderUsage(
+                nullptr, false);
+        } else if (g_restoreWaterPSAfterCube || g_restoreWaterVSAfterCube) {
+            auto* selectedPS = g_currentSelectedPixelShader.load(
+                std::memory_order_acquire);
+            auto* replacementPS =
+                g_ShaderDB.GetReplacementShader(pixelShader);
+            if (g_restoreWaterPSAfterCube && replacementPS) {
+                selectedPS = replacementPS;
+            }
+            if (g_restoreWaterPSAfterCube) {
+                D3D11Hooks::OriginalPSSetShader(
+                    context, selectedPS ? selectedPS : pixelShader, nullptr, 0);
+                g_currentSelectedPixelShader.store(
+                    selectedPS ? selectedPS : pixelShader,
+                    std::memory_order_release);
+            }
+            const bool usingReplacementPS =
+                replacementPS && selectedPS == replacementPS;
+            ShaderResources::SetActiveReplacementPixelShaderUsage(
+                usingReplacementPS ? pixelDefinition : nullptr,
+                usingReplacementPS);
+            if (usingReplacementPS) {
+                ShaderResources::BindInjectedPixelShaderResources(context);
+            }
+
+            if (g_restoreWaterVSAfterCube && waterVertex) {
+                auto* replacementVS =
+                    g_ShaderDB.GetReplacementShader(originalVS);
+                auto* selectedVS = replacementVS
+                    ? replacementVS
+                    : g_currentSelectedVertexShader.load(
+                        std::memory_order_acquire);
+                D3D11Hooks::OriginalVSSetShader(
+                    context, selectedVS ? selectedVS : originalVS, nullptr, 0);
+                g_currentSelectedVertexShader.store(
+                    selectedVS ? selectedVS : originalVS,
+                    std::memory_order_release);
+                if (replacementVS) {
+                    ShaderResources::BindInjectedVertexShaderResources(context);
+                    ShaderResources::BindReplacementSRVResources(
+                        context, vertexDefinition, false);
+                    ShaderResources::BindReplacementTextureResources(
+                        context, vertexDefinition, false);
+                    if (vertexDefinition->id == "waterVertexDumpO5") {
+                        g_waterO5ActiveDefinition = vertexDefinition;
+                        g_waterO5ReplacementActive.store(
+                            true, std::memory_order_release);
+                    }
+                }
+            }
+            g_restoreWaterPSAfterCube = false;
+            g_restoreWaterVSAfterCube = false;
+        }
+    }
 
     if (DEVELOPMENT && waterPixel) {
         // Bound the diagnostic work even if a scene never reaches 16 distinct
@@ -2106,6 +2195,18 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
             g_ShaderDB.SetEntryRecentlyUsed(pixelShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pixelShader);
             if (matchedDefinition &&
+                ShaderResources::WaterReflectionCubeCaptureActive() &&
+                (matchedDefinition->id == "visualWater" ||
+                 matchedDefinition->id == "visualWaterMain2" ||
+                 matchedDefinition->id == "visualWaterLOD")) {
+                // Cube-camera matrices cannot consume main-view SSR/depth
+                // snapshots. Retain the engine water shader during reflection
+                // face rendering and publish the replacement only in the main
+                // view after capture ends.
+                g_restoreWaterPSAfterCube = true;
+                return result;
+            }
+            if (matchedDefinition &&
                 matchedDefinition->shadowUpgrade &&
                 !SHADOW_UPGRADE_ON) {
                 return result;
@@ -2199,6 +2300,13 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
         if (g_ShaderDB.IsEntryMatched(vertexShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(vertexShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(vertexShader);
+            if (matchedDefinition &&
+                ShaderResources::WaterReflectionCubeCaptureActive() &&
+                (matchedDefinition->id == "waterVertexDumpO5" ||
+                 matchedDefinition->id == "waterVertexDumpO6")) {
+                g_restoreWaterVSAfterCube = true;
+                return vertexShader;
+            }
             // See PSSetShader for rationale: we evict cached compiled state
             // here, before reading the replacement, so the D3D11 Release runs
             // on the render thread.
@@ -2508,8 +2616,34 @@ namespace
         REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
         REX::W32::ID3D11DepthStencilView* depthStencilView)
     {
+        ShaderResources::PrepareWaterReflectionCubeOM(
+            context, numViews, renderTargetViews);
         D3D11Hooks::OriginalOMSetRenderTargets(context, numViews, renderTargetViews, depthStencilView);
         D3D11OnOMSetRenderTargets_Internal(context, numViews, renderTargetViews, depthStencilView);
+    }
+
+    void STDMETHODCALLTYPE MyOMSetRenderTargetsAndUnorderedAccessViews(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT numRTVs,
+        REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
+        REX::W32::ID3D11DepthStencilView* depthStencilView,
+        UINT uavStartSlot,
+        UINT numUAVs,
+        REX::W32::ID3D11UnorderedAccessView* const* unorderedAccessViews,
+        const UINT* uavInitialCounts)
+    {
+        const bool keepRenderTargets = numRTVs == UINT_MAX;
+        if (!keepRenderTargets) {
+            ShaderResources::PrepareWaterReflectionCubeOM(
+                context, numRTVs, renderTargetViews);
+        }
+        D3D11Hooks::OriginalOMSetRenderTargetsAndUnorderedAccessViews(
+            context, numRTVs, renderTargetViews, depthStencilView,
+            uavStartSlot, numUAVs, unorderedAccessViews, uavInitialCounts);
+        if (!keepRenderTargets) {
+            D3D11OnOMSetRenderTargets_Internal(
+                context, numRTVs, renderTargetViews, depthStencilView);
+        }
     }
 
     void STDMETHODCALLTYPE MyClearDepthStencilView(
@@ -2802,6 +2936,10 @@ namespace
         ResetReplayStateCache();
         auto result = D3D11OnPSSetShaderBefore_Internal(context, pixelShader);
         D3D11Hooks::OriginalPSSetShader(context, result.shader, classInstances, numClassInstances);
+        if (!g_customPassRendering) {
+            g_currentSelectedPixelShader.store(
+                result.shader, std::memory_order_release);
+        }
         D3D11OnPSSetShaderAfter_Internal(context, result);
     }
 
@@ -2991,6 +3129,7 @@ namespace D3D11Hooks
         Hooks::EnsureVTableSlot(vtable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), OriginalPSSetShaderResources);
         Hooks::EnsureVTableSlot(vtable, 10, reinterpret_cast<void*>(MyPSSetSamplers), OriginalPSSetSamplers);
         Hooks::EnsureVTableSlot(vtable, 35, reinterpret_cast<void*>(MyOMSetBlendState), OriginalOMSetBlendState);
+        Hooks::EnsureVTableSlot(vtable, 34, reinterpret_cast<void*>(MyOMSetRenderTargetsAndUnorderedAccessViews), OriginalOMSetRenderTargetsAndUnorderedAccessViews);
         Hooks::EnsureVTableSlot(vtable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), OriginalOMSetDepthStencilState);
         Hooks::EnsureVTableSlot(vtable, 43, reinterpret_cast<void*>(MyRSSetState), OriginalRSSetState);
 #if SHADERENGINE_ENABLE_PHASE_TELEMETRY
@@ -3033,6 +3172,7 @@ bool InstallGFXHooks_Internal()
         !installVTableHook(contextVTable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), D3D11Hooks::OriginalPSSetShaderResources, "PSSetShaderResources") ||
         !installVTableHook(contextVTable, 10, reinterpret_cast<void*>(MyPSSetSamplers), D3D11Hooks::OriginalPSSetSamplers, "PSSetSamplers") ||
         !installVTableHook(contextVTable, 33, reinterpret_cast<void*>(MyOMSetRenderTargets), D3D11Hooks::OriginalOMSetRenderTargets, "OMSetRenderTargets") ||
+        !installVTableHook(contextVTable, 34, reinterpret_cast<void*>(MyOMSetRenderTargetsAndUnorderedAccessViews), D3D11Hooks::OriginalOMSetRenderTargetsAndUnorderedAccessViews, "OMSetRenderTargetsAndUnorderedAccessViews") ||
         !installVTableHook(contextVTable, 35, reinterpret_cast<void*>(MyOMSetBlendState), D3D11Hooks::OriginalOMSetBlendState, "OMSetBlendState") ||
         !installVTableHook(contextVTable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), D3D11Hooks::OriginalOMSetDepthStencilState, "OMSetDepthStencilState") ||
         !installVTableHook(contextVTable, 43, reinterpret_cast<void*>(MyRSSetState), D3D11Hooks::OriginalRSSetState, "RSSetState") ||

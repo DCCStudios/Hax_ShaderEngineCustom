@@ -51,6 +51,13 @@ namespace ShaderResources
         UINT numViews,
         REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
         REX::W32::ID3D11DepthStencilView* depthStencilView);
+    void PrepareWaterReflectionCubeOM(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT numViews,
+        REX::W32::ID3D11RenderTargetView* const* renderTargetViews);
+    bool WaterReflectionCubeCaptureActive() noexcept;
+    void EndWaterReflectionCubeFrame() noexcept;
+    void Shutdown();
 
     UINT GetCurrentDepthTargetIndex() noexcept;
     bool HasCurrentRenderTarget() noexcept;
