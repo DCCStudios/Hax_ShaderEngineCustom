@@ -27,6 +27,9 @@ namespace D3D11Hooks
     OMSetRenderTargets_t OriginalOMSetRenderTargets = nullptr;
     OMSetRenderTargetsAndUnorderedAccessViews_t
         OriginalOMSetRenderTargetsAndUnorderedAccessViews = nullptr;
+    CopySubresourceRegion_t OriginalCopySubresourceRegion = nullptr;
+    CopyResource_t OriginalCopyResource = nullptr;
+    ResolveSubresource_t OriginalResolveSubresource = nullptr;
     ClearDepthStencilView_t OriginalClearDepthStencilView = nullptr;
     DrawIndexed_t OriginalDrawIndexed = nullptr;
     Draw_t OriginalDraw = nullptr;
@@ -2646,6 +2649,53 @@ namespace
         }
     }
 
+    void STDMETHODCALLTYPE MyCopySubresourceRegion(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        UINT destinationX,
+        UINT destinationY,
+        UINT destinationZ,
+        REX::W32::ID3D11Resource* source,
+        UINT sourceSubresource,
+        const REX::W32::D3D11_BOX* sourceBox)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalCopySubresourceRegion(
+            context, destination, destinationSubresource,
+            destinationX, destinationY, destinationZ,
+            source, sourceSubresource, sourceBox);
+        ShaderResources::CompleteWaterReflectionCubeSubresourceWrite(
+            destination, destinationSubresource, "copy-subresource");
+    }
+
+    void STDMETHODCALLTYPE MyCopyResource(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        REX::W32::ID3D11Resource* source)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalCopyResource(context, destination, source);
+        ShaderResources::CompleteWaterReflectionCubeResourceWrite(
+            destination, "copy-resource");
+    }
+
+    void STDMETHODCALLTYPE MyResolveSubresource(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        REX::W32::ID3D11Resource* source,
+        UINT sourceSubresource,
+        REX::W32::DXGI_FORMAT format)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalResolveSubresource(
+            context, destination, destinationSubresource,
+            source, sourceSubresource, format);
+        ShaderResources::CompleteWaterReflectionCubeSubresourceWrite(
+            destination, destinationSubresource, "resolve-subresource");
+    }
+
     void STDMETHODCALLTYPE MyClearDepthStencilView(
         REX::W32::ID3D11DeviceContext* context,
         REX::W32::ID3D11DepthStencilView* depthStencilView,
@@ -3132,6 +3182,9 @@ namespace D3D11Hooks
         Hooks::EnsureVTableSlot(vtable, 34, reinterpret_cast<void*>(MyOMSetRenderTargetsAndUnorderedAccessViews), OriginalOMSetRenderTargetsAndUnorderedAccessViews);
         Hooks::EnsureVTableSlot(vtable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), OriginalOMSetDepthStencilState);
         Hooks::EnsureVTableSlot(vtable, 43, reinterpret_cast<void*>(MyRSSetState), OriginalRSSetState);
+        Hooks::EnsureVTableSlot(vtable, 46, reinterpret_cast<void*>(MyCopySubresourceRegion), OriginalCopySubresourceRegion);
+        Hooks::EnsureVTableSlot(vtable, 47, reinterpret_cast<void*>(MyCopyResource), OriginalCopyResource);
+        Hooks::EnsureVTableSlot(vtable, 57, reinterpret_cast<void*>(MyResolveSubresource), OriginalResolveSubresource);
 #if SHADERENGINE_ENABLE_PHASE_TELEMETRY
         InstallCommandBufferResourceTelemetryHooks();
 #endif
@@ -3176,7 +3229,10 @@ bool InstallGFXHooks_Internal()
         !installVTableHook(contextVTable, 35, reinterpret_cast<void*>(MyOMSetBlendState), D3D11Hooks::OriginalOMSetBlendState, "OMSetBlendState") ||
         !installVTableHook(contextVTable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), D3D11Hooks::OriginalOMSetDepthStencilState, "OMSetDepthStencilState") ||
         !installVTableHook(contextVTable, 43, reinterpret_cast<void*>(MyRSSetState), D3D11Hooks::OriginalRSSetState, "RSSetState") ||
+        !installVTableHook(contextVTable, 46, reinterpret_cast<void*>(MyCopySubresourceRegion), D3D11Hooks::OriginalCopySubresourceRegion, "CopySubresourceRegion") ||
+        !installVTableHook(contextVTable, 47, reinterpret_cast<void*>(MyCopyResource), D3D11Hooks::OriginalCopyResource, "CopyResource") ||
         !installVTableHook(contextVTable, 53, reinterpret_cast<void*>(MyClearDepthStencilView), D3D11Hooks::OriginalClearDepthStencilView, "ClearDepthStencilView") ||
+        !installVTableHook(contextVTable, 57, reinterpret_cast<void*>(MyResolveSubresource), D3D11Hooks::OriginalResolveSubresource, "ResolveSubresource") ||
         !installVTableHook(contextVTable, 9, reinterpret_cast<void*>(MyPSSetShader), D3D11Hooks::OriginalPSSetShader, "PSSetShader") ||
         !installVTableHook(contextVTable, 11, reinterpret_cast<void*>(MyVSSetShader), D3D11Hooks::OriginalVSSetShader, "VSSetShader")) {
         return false;

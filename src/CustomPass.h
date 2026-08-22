@@ -149,6 +149,8 @@ enum class InputKind : uint8_t {
     GBufferMaterial,      // renderTargets[kGbufferMaterial=24].srView
     MotionVectors,        // renderTargets[kMotionVectors=29].srView
     SceneHDR,             // renderTargets[kMain=3].srView (engine HDR scene)
+    WaterReflectionCubemap,      // validated completed engine reflection cube
+    WaterReflectionCubemapMeta,  // native generation/freshness metadata
     DepthStencil,         // depthStencilTargets[N].srViewDepth (explicit index)
     File,                 // WIC-loaded texture file (path relative to the pass's folder)
 };

@@ -149,6 +149,14 @@ bool ParseInputBinding(const std::string& token, InputBinding& out) {
     if (lowerSource == "gbuffermaterial")  { out.kind = InputKind::GBufferMaterial; return true; }
     if (lowerSource == "motionvectors")    { out.kind = InputKind::MotionVectors; return true; }
     if (lowerSource == "scenehdr")         { out.kind = InputKind::SceneHDR; return true; }
+    if (lowerSource == "waterreflectioncubemap") {
+        out.kind = InputKind::WaterReflectionCubemap;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemapmeta") {
+        out.kind = InputKind::WaterReflectionCubemapMeta;
+        return true;
+    }
     if (lowerSource.rfind("currentpsrv:", 0) == 0) {
         out.kind = InputKind::CurrentPSRV;
         try { out.sourceSlot = std::stoi(source.substr(strlen("currentPSRV:"))); } catch (...) { return false; }
@@ -1624,6 +1632,14 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
                 break;
             case InputKind::SceneHDR:
                 s = g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].srView;
+                break;
+            case InputKind::WaterReflectionCubemap:
+                s = ShaderResources::GetWaterReflectionCubemapSRVForCustomPass(
+                    context);
+                break;
+            case InputKind::WaterReflectionCubemapMeta:
+                s = ShaderResources::GetWaterReflectionCubemapMetaSRVForCustomPass(
+                    context);
                 break;
             case InputKind::DepthStencil: {
                 // Stays nullptr when the engine has not allocated the target

@@ -50,6 +50,27 @@ namespace D3D11Hooks
         UINT,
         REX::W32::ID3D11UnorderedAccessView* const*,
         const UINT*);
+    using CopySubresourceRegion_t = void(STDMETHODCALLTYPE*)(
+        REX::W32::ID3D11DeviceContext*,
+        REX::W32::ID3D11Resource*,
+        UINT,
+        UINT,
+        UINT,
+        UINT,
+        REX::W32::ID3D11Resource*,
+        UINT,
+        const REX::W32::D3D11_BOX*);
+    using CopyResource_t = void(STDMETHODCALLTYPE*)(
+        REX::W32::ID3D11DeviceContext*,
+        REX::W32::ID3D11Resource*,
+        REX::W32::ID3D11Resource*);
+    using ResolveSubresource_t = void(STDMETHODCALLTYPE*)(
+        REX::W32::ID3D11DeviceContext*,
+        REX::W32::ID3D11Resource*,
+        UINT,
+        REX::W32::ID3D11Resource*,
+        UINT,
+        REX::W32::DXGI_FORMAT);
     using ClearDepthStencilView_t = void(STDMETHODCALLTYPE*)(
         REX::W32::ID3D11DeviceContext*,
         REX::W32::ID3D11DepthStencilView*,
@@ -156,6 +177,9 @@ namespace D3D11Hooks
     extern OMSetRenderTargets_t OriginalOMSetRenderTargets;
     extern OMSetRenderTargetsAndUnorderedAccessViews_t
         OriginalOMSetRenderTargetsAndUnorderedAccessViews;
+    extern CopySubresourceRegion_t OriginalCopySubresourceRegion;
+    extern CopyResource_t OriginalCopyResource;
+    extern ResolveSubresource_t OriginalResolveSubresource;
     extern ClearDepthStencilView_t OriginalClearDepthStencilView;
     extern DrawIndexed_t OriginalDrawIndexed;
     extern Draw_t OriginalDraw;
