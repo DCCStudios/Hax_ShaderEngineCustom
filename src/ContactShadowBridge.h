@@ -29,6 +29,16 @@ namespace ContactShadowBridge
     // One past SunCascadeBridge's shadow array at t38.
     inline constexpr UINT SRV_SLOT = 39;
 
+    // Kept separate from SEContactDispatch so shader-only deployments remain
+    // compatible with the old 64-byte t39 stride. One float4 is published:
+    // xyz = normalized world-space direction toward the sun/light,
+    // w = 1 when valid (including the bounded continuity cache), otherwise 0.
+    // For hachiViewmodelContactShadowTrace only, xyz remains the optional sun
+    // direction while w independently reports that the saved DeferredLights
+    // b2+b12 reconstruction pair is actively bound. That lets local-only
+    // interior lighting use the same safe near-layer reconstruction scope.
+    inline constexpr UINT WORLD_SUN_SRV_SLOT = 40;
+
     // Bend's maximum: four quadrants, each of which may split once.
     inline constexpr UINT MAX_DISPATCHES = 8;
 
@@ -43,8 +53,14 @@ namespace ContactShadowBridge
     void Shutdown();
 
     // Rebuilds the dispatch list for this frame and binds it for a custom pass.
-    // The custom-pass state snapshot restores the previous binding.
+    // savedSceneDepth and savedEngineRTV are the engine state captured before
+    // the custom batch mutates OM/SRV bindings. This lets the Bend dispatch use
+    // the same physical pixel domain as currentPSRV:30 under dynamic resolution.
+    // The custom-pass state snapshot restores the previous bindings.
     void BindCustomPassResource(
         REX::W32::ID3D11DeviceContext* context,
-        bool pixelStage);
+        bool pixelStage,
+        REX::W32::ID3D11ShaderResourceView* savedSceneDepth,
+        REX::W32::ID3D11RenderTargetView* savedEngineRTV,
+        const char* passName);
 }

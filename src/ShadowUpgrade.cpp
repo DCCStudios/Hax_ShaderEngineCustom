@@ -9,6 +9,7 @@
 #include <hooks.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -94,6 +95,7 @@ bool s_firstCascadeDistanceInstalled = false;
 bool s_installed = false;
 bool s_installAttempted = false;
 thread_local std::uint32_t s_deferredLightingDepth = 0;
+thread_local std::uint32_t s_deferredReconstructionBindingDepth = 0;
 
 struct ScopedDeferredLighting
 {
@@ -484,6 +486,79 @@ bool InstallFirstCascadeDistanceOverride()
 }
 
 }  // namespace
+
+bool BindDeferredReconstructionConstants(
+    REX::W32::ID3D11DeviceContext* context,
+    DeferredReconstructionBinding& binding) noexcept
+{
+    binding = {};
+    if (!context) {
+        return false;
+    }
+    const bool b2Ready =
+        s_lightsCB2Snapshot.valid && s_lightsCB2Snapshot.copy;
+    const bool b12Ready =
+        s_lightsCB12Snapshot.valid && s_lightsCB12Snapshot.copy;
+    if (!b2Ready || !b12Ready) {
+        static std::atomic_bool s_warnedMissingLateConstants{false};
+        if (!s_warnedMissingLateConstants.exchange(
+                true, std::memory_order_relaxed)) {
+            REX::WARN(
+                "ShadowUpgrade: late visualTonemap custom PS batch requested "
+                "DeferredLights reconstruction before both snapshots existed "
+                "(b2Ready={} b12Ready={}); viewmodel contact trace will fail "
+                "open",
+                b2Ready, b12Ready);
+        }
+        return false;
+    }
+
+    context->PSGetConstantBuffers(2, 1, &binding.previousB2);
+    context->PSGetConstantBuffers(12, 1, &binding.previousB12);
+    context->PSSetConstantBuffers(2, 1, &s_lightsCB2Snapshot.copy);
+    context->PSSetConstantBuffers(12, 1, &s_lightsCB12Snapshot.copy);
+    binding.active = true;
+    ++s_deferredReconstructionBindingDepth;
+
+    static std::atomic_bool s_loggedLateConstantsBind{false};
+    if (!s_loggedLateConstantsBind.exchange(
+            true, std::memory_order_relaxed)) {
+        REX::INFO(
+            "ShadowUpgrade: publishing DeferredLights b2+b12 snapshots to late "
+            "visualTonemap custom PS batches ({} + {} bytes)",
+            s_lightsCB2Snapshot.copySize,
+            s_lightsCB12Snapshot.copySize);
+    }
+    return true;
+}
+
+void RestoreDeferredReconstructionConstants(
+    REX::W32::ID3D11DeviceContext* context,
+    DeferredReconstructionBinding& binding) noexcept
+{
+    if (!binding.active) {
+        return;
+    }
+    if (context) {
+        context->PSSetConstantBuffers(2, 1, &binding.previousB2);
+        context->PSSetConstantBuffers(12, 1, &binding.previousB12);
+    }
+    if (binding.previousB2) {
+        binding.previousB2->Release();
+    }
+    if (binding.previousB12) {
+        binding.previousB12->Release();
+    }
+    binding = {};
+    if (s_deferredReconstructionBindingDepth > 0) {
+        --s_deferredReconstructionBindingDepth;
+    }
+}
+
+bool IsDeferredReconstructionBoundForCurrentThread() noexcept
+{
+    return s_deferredReconstructionBindingDepth > 0;
+}
 
 bool Initialize()
 {

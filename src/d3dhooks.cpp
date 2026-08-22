@@ -487,6 +487,71 @@ void UpdateCustomBuffer_Internal() {
     lastFrameTime = currentTime;
     // Calculate total elapsed time
     float totalTime = static_cast<float>(currentTime.QuadPart - startTime.QuadPart) / static_cast<float>(frequency.QuadPart);
+
+    // Physical Water owns a persistent phase clock and a source parameter bank.
+    // Integrating speed per frame avoids retroactively multiplying all historic
+    // phase by a newly selected speed. Parameter changes cross-fade from the
+    // currently visible bank, so presets and sliders cannot reset the surface.
+    const auto findWaterFloat = [](std::string_view id, float fallback) {
+        for (const auto* value : g_shaderSettings.GetFloatShaderValues()) {
+            if (value && value->id == id) return value->current.f;
+        }
+        return fallback;
+    };
+    const auto findWaterInt = [](std::string_view id, int fallback) {
+        for (const auto* value : g_shaderSettings.GetIntShaderValues()) {
+            if (value && value->id == id) return value->current.i;
+        }
+        return fallback;
+    };
+    struct WaterWaveState
+    {
+        double phase = 0.0;
+        DirectX::XMFLOAT4 source{};
+        DirectX::XMFLOAT4 target{};
+        float blend = 1.0f;
+        bool initialized = false;
+    };
+    static WaterWaveState waterWaves{};
+    const DirectX::XMFLOAT4 requestedWaterBank{
+        std::clamp(findWaterFloat("vu_WaterDisplacementAmplitude", 2.0f), 0.0f, 48.0f),
+        (std::max)(findWaterFloat("vu_WaterDisplacementWavelength", 420.0f), 32.0f),
+        std::clamp(findWaterFloat("vu_WaterDisplacementChoppiness", 0.0f), 0.0f, 0.85f),
+        static_cast<float>(std::clamp(findWaterInt("vu_WaterBodyPreset", 0), 0, 2))
+    };
+    if (!waterWaves.initialized) {
+        waterWaves.source = requestedWaterBank;
+        waterWaves.target = requestedWaterBank;
+        waterWaves.initialized = true;
+    }
+    const auto bankChanged = [](const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b) {
+        return std::abs(a.x - b.x) > 1.0e-4f ||
+            std::abs(a.y - b.y) > 1.0e-3f ||
+            std::abs(a.z - b.z) > 1.0e-4f ||
+            std::abs(a.w - b.w) > 0.25f;
+    };
+    const auto lerpBank = [](const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b, float t) {
+        return DirectX::XMFLOAT4{
+            std::lerp(a.x, b.x, t), std::lerp(a.y, b.y, t),
+            std::lerp(a.z, b.z, t), t < 0.5f ? a.w : b.w
+        };
+    };
+    if (bankChanged(requestedWaterBank, waterWaves.target)) {
+        waterWaves.source = lerpBank(waterWaves.source, waterWaves.target, waterWaves.blend);
+        waterWaves.target = requestedWaterBank;
+        waterWaves.blend = 0.0f;
+    }
+    const float safeWaterDelta = std::clamp(deltaTime, 0.0f, 0.1f);
+    waterWaves.phase += static_cast<double>(safeWaterDelta) *
+        std::clamp(findWaterFloat("vu_WaterDisplacementSpeed", 0.35f), 0.0f, 4.0f);
+    waterWaves.blend = (std::min)(waterWaves.blend + safeWaterDelta / 2.5f, 1.0f);
+    constexpr double kWaterPhaseBlockSize = 4096.0;
+    const double waterPhaseBlock = std::floor(waterWaves.phase / kWaterPhaseBlockSize);
+    g_customBufferData.waterPhaseBlock = static_cast<float>(waterPhaseBlock);
+    g_customBufferData.waterPhaseRemainder = static_cast<float>(
+        waterWaves.phase - waterPhaseBlock * kWaterPhaseBlockSize);
+    g_customBufferData.g_WaterState0 = waterWaves.source;
+    g_customBufferData.g_WaterTransition = 2.0f + waterWaves.blend;
     // Calculate Instant FPS
     // We use a small epsilon (0.0001) to prevent any potential division by zero
     float instantFPS = (deltaTime > 0.0001f) ? (1.0f / deltaTime) : 0.0f;
@@ -749,7 +814,6 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_SunDirY = sunDir.y;
     g_customBufferData.g_SunDirZ = sunDir.z;
     g_customBufferData.g_SunValid = sunValid;
-    g_customBufferData.g_SunPadding = 0.0f;
 
     auto Normalize3 = [](DirectX::XMFLOAT3 v) {
         const float lenSq = v.x * v.x + v.y * v.y + v.z * v.z;
@@ -1028,7 +1092,6 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.random  = randomValue;
     g_customBufferData.inCombat = g_inCombat ? 1.0f : 0.0f;
     g_customBufferData.inInterior = g_inInterior ? 1.0f : 0.0f;
-    g_customBufferData._padding = 0.0f; // just in case, to avoid any potential uninitialized data issues in shaders
     DirectX::XMStoreFloat4(
         &g_customBufferData.g_PrevViewProjRow0,
         previousViewProj.r[0]);
@@ -1075,7 +1138,6 @@ void UpdateCustomBuffer_Internal() {
         g_customBufferData.waterHeight = waterHeight;
         g_customBufferData.cameraUnderwater = cameraUnderwater;
     }
-    g_customBufferData.enbPadding2 = 0.0f;
     if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->cameraRoot) {
         const auto* cameraNode = playerCamera->cameraRoot.get();
         StoreCameraTransform(cameraNode->local, g_customBufferData.cameraLocalRow0, g_customBufferData.cameraLocalRow1, g_customBufferData.cameraLocalRow2, g_customBufferData.cameraLocalRow3);
@@ -1107,11 +1169,6 @@ void UpdateCustomBuffer_Internal() {
         g_customBufferData.g_FogDistances1 = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
         g_customBufferData.g_FogParams     = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
     }
-    // Per-weather blended fog color requires sampling currentWeather + lastWeather
-    // colorData[][] arrays at the current time-of-day and blending by
-    // currentWeatherPct. Left at zero for now -- shaders should treat (0,0,0,0)
-    // as "no engine-supplied color, use Values.ini knobs".
-    g_customBufferData.g_FogColor = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
     // Pack Values.ini shader settings into separate 16-byte elements to avoid the structured-buffer stride limit.
     ShaderResources::PackModularShaderValues(g_shaderSettings);
 

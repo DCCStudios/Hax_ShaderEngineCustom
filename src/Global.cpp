@@ -190,7 +190,7 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_FogDistances0; // x=near, y=far, z=waterNear, w=waterFar
 ;    float4   GFXInjected[0].g_FogDistances1; // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
 ;    float4   GFXInjected[0].g_FogParams; // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-;    float4   GFXInjected[0].g_FogColor; // xyz=reserved fog RGB, currently zero; w=reserved
+;    float4   GFXInjected[0].g_WaterState0; // source wave bank: amplitude, wavelength, chop, preset
 ;    float    GFXInjected[0].g_SunR; // dominant stylized light red
 ;    float    GFXInjected[0].g_SunG; // dominant stylized light green
 ;    float    GFXInjected[0].g_SunB; // dominant stylized light blue
@@ -349,7 +349,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float    g_Random;
             float    g_Combat;
             float    g_Interior;
-            float    _padding;
+            float    g_WaterPhaseBlock;
 
             // Block 8 (Bytes 176-239)
             float4   g_ViewProjRow0;
@@ -383,7 +383,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             // camera sits below that plane. Consumers: underwater caustics.
             float g_WaterHeight;
             float g_CameraUnderwater;
-            float _enbPadding2;
+            float g_WaterPhaseRemainder;
 
             float4 g_CameraLocalRow0;
             float4 g_CameraLocalRow1;
@@ -404,7 +404,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_FogDistances0;  // x=near, y=far, z=waterNear, w=waterFar
             float4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
             float4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-            float4 g_FogColor;       // xyz=blended RGB (0 until per-weather blend lands), w=reserved
+            float4 g_WaterState0;    // source wave bank: amplitude, wavelength, chop, preset
 
             float  g_SunR;
             float  g_SunG;
@@ -414,7 +414,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float  g_SunDirY;
             float  g_SunDirZ;
             float  g_SunValid;
-            float  _sunPadding;
+            float  g_WaterTransition; // 2 + source-to-live-bank blend
 
             // L1 SH coefficients per color channel, computed plugin-side from
             // RE::Sky::directionalAmbientColorsA (6-axis directional ambient

@@ -1303,7 +1303,7 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderFloat4("g_FogDistances0", data.g_FogDistances0, previousData.g_FogDistances0, 50.0f);
             renderFloat4("g_FogDistances1", data.g_FogDistances1, previousData.g_FogDistances1, 50.0f);
             renderFloat4("g_FogParams", data.g_FogParams, previousData.g_FogParams, 0.25f);
-            renderFloat4("g_FogColor", data.g_FogColor, previousData.g_FogColor, 0.05f);
+            renderFloat4("g_WaterState0", data.g_WaterState0, previousData.g_WaterState0, 0.05f);
             renderFloat("g_SunR", data.g_SunR, previousData.g_SunR, 0.05f);
             renderFloat("g_SunG", data.g_SunG, previousData.g_SunG, 0.05f);
             renderFloat("g_SunB", data.g_SunB, previousData.g_SunB, 0.05f);

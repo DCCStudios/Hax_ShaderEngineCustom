@@ -60,7 +60,7 @@ struct alignas(16) GFXBoosterAccessData
     float random;    // 28
     float  inCombat;     // 29
     float  inInterior;   // 30
-    float _padding;   // 31
+    float waterPhaseBlock; // persistent wave phase, high part in 4096-second blocks
 
     // Forward view-projection rows (needed for SSR world ??clip reprojection)
     DirectX::XMFLOAT4 g_ViewProjRow0; // 32
@@ -89,7 +89,7 @@ struct alignas(16) GFXBoosterAccessData
     int32_t  outgoingWeatherClass;
     float    waterHeight;       // absolute Z of the player cell's water plane, -1e9 = none
     float    cameraUnderwater;  // 1 when the camera is below that plane
-    float    enbPadding2;
+    float    waterPhaseRemainder; // persistent wave phase, low part in seconds
 
     DirectX::XMFLOAT4 cameraLocalRow0;
     DirectX::XMFLOAT4 cameraLocalRow1;
@@ -113,7 +113,7 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_FogDistances0;  // x=near, y=far, z=waterNear, w=waterFar
     DirectX::XMFLOAT4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
     DirectX::XMFLOAT4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-    DirectX::XMFLOAT4 g_FogColor;       // x,y,z=blended fog RGB (0 until per-weather blend lands), w=reserved
+    DirectX::XMFLOAT4 g_WaterState0;    // x=source amplitude, y=wavelength, z=chop, w=preset
 
     // Dominant stylized world light. Exterior color is Sky::GetSunLightColor
     // (skyColor[4], Sky+0x0D8); interior color resolves cell/template
@@ -127,7 +127,7 @@ struct alignas(16) GFXBoosterAccessData
     float g_SunDirY;
     float g_SunDirZ;
     float g_SunValid;
-    float g_SunPadding;
+    float g_WaterTransition; // 2 + source-to-live-bank blend; <2 means legacy fallback
 
     // L1 spherical-harmonics ambient, computed from RE::Sky's 6-axis
     // directional ambient cube (Sky+0x3B8, NiColor[3][2]). The engine's own
@@ -171,6 +171,8 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_WorldSH_G;
     DirectX::XMFLOAT4 g_WorldSH_B;
 };
+static_assert(sizeof(GFXBoosterAccessData) == 848,
+    "GFXBoosterAccessData is a fixed CPU/HLSL structured-buffer ABI");
 
 struct alignas(16) DrawTagData
 {

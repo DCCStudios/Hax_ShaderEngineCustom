@@ -4,18 +4,20 @@
 #include "Global.h"
 #include "Plugin.h"
 #include "RenderTargets.h"
+#include "ShadowUpgrade.h"
 #include "ShadowTelemetry.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace ContactShadowBridge
 {
 namespace
 {
-    // Mirrors SEContactDispatch in contactShadowRaymarch.hlsl (48 bytes).
+    // Mirrors SEContactDispatch in contactShadowRaymarch.hlsl (64 bytes).
     struct GpuContactDispatch
     {
         float lightCoordinate[4] = {};
@@ -45,9 +47,20 @@ namespace
     };
     static_assert(sizeof(GpuContactDispatch) == 64,
                   "SEContactDispatch layout must match HLSL");
+    static_assert(WORLD_SUN_SRV_SLOT == SRV_SLOT + 1,
+                  "Contact bridge SRVs must remain contiguous");
 
     REX::W32::ID3D11Buffer*             g_buffer = nullptr;
     REX::W32::ID3D11ShaderResourceView* g_srv    = nullptr;
+    REX::W32::ID3D11Buffer*             g_worldSunBuffer = nullptr;
+    REX::W32::ID3D11ShaderResourceView* g_worldSunSrv    = nullptr;
+
+    struct PixelExtent
+    {
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        bool valid = false;
+    };
 
     // ---- Bend Studio's BuildDispatchList -----------------------------------
     //
@@ -236,6 +249,133 @@ namespace
         return d ? ((v + d - 1) / d) : 1u;
     }
 
+    PixelExtent Texture2DExtent(
+        REX::W32::ID3D11Resource* resource,
+        std::uint32_t mipLevel)
+    {
+        PixelExtent result{};
+        if (!resource) {
+            return result;
+        }
+
+        REX::W32::ID3D11Texture2D* texture = nullptr;
+        resource->QueryInterface(
+            REX::W32::IID_ID3D11Texture2D,
+            reinterpret_cast<void**>(&texture));
+        if (!texture) {
+            return result;
+        }
+
+        REX::W32::D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        texture->Release();
+        if (!desc.width || !desc.height) {
+            return result;
+        }
+
+        const std::uint32_t highestMip = desc.mipLevels > 0
+            ? desc.mipLevels - 1
+            : 0;
+        const std::uint32_t safeMip =
+            (std::min)((std::min)(mipLevel, highestMip), 31u);
+        result.width = (std::max)(1u, desc.width >> safeMip);
+        result.height = (std::max)(1u, desc.height >> safeMip);
+        result.valid = result.width >= 16 && result.height >= 16;
+        return result;
+    }
+
+    PixelExtent ExtentFromSRV(REX::W32::ID3D11ShaderResourceView* srv)
+    {
+        if (!srv) {
+            return {};
+        }
+
+        REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+        srv->GetDesc(&viewDesc);
+        std::uint32_t mipLevel = 0;
+        switch (viewDesc.viewDimension) {
+        case REX::W32::D3D11_SRV_DIMENSION_TEXTURE2D:
+            mipLevel = viewDesc.texture2D.mostDetailedMip;
+            break;
+        case REX::W32::D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+            mipLevel = viewDesc.texture2DArray.mostDetailedMip;
+            break;
+        case REX::W32::D3D11_SRV_DIMENSION_TEXTURE2DMS:
+        case REX::W32::D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+            break;
+        default:
+            return {};
+        }
+
+        REX::W32::ID3D11Resource* resource = nullptr;
+        srv->GetResource(&resource);
+        const PixelExtent result = Texture2DExtent(resource, mipLevel);
+        if (resource) {
+            resource->Release();
+        }
+        return result;
+    }
+
+    PixelExtent ExtentFromRTV(REX::W32::ID3D11RenderTargetView* rtv)
+    {
+        if (!rtv) {
+            return {};
+        }
+
+        REX::W32::D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+        rtv->GetDesc(&viewDesc);
+        std::uint32_t mipLevel = 0;
+        switch (viewDesc.viewDimension) {
+        case REX::W32::D3D11_RTV_DIMENSION_TEXTURE2D:
+            mipLevel = viewDesc.texture2D.mipSlice;
+            break;
+        case REX::W32::D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
+            mipLevel = viewDesc.texture2DArray.mipSlice;
+            break;
+        case REX::W32::D3D11_RTV_DIMENSION_TEXTURE2DMS:
+        case REX::W32::D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY:
+            break;
+        default:
+            return {};
+        }
+
+        REX::W32::ID3D11Resource* resource = nullptr;
+        rtv->GetResource(&resource);
+        const PixelExtent result = Texture2DExtent(resource, mipLevel);
+        if (resource) {
+            resource->Release();
+        }
+        return result;
+    }
+
+    PixelExtent CurrentOMExtent(REX::W32::ID3D11DeviceContext* context)
+    {
+        if (!context) {
+            return {};
+        }
+        REX::W32::ID3D11RenderTargetView* rtv = nullptr;
+        context->OMGetRenderTargets(1, &rtv, nullptr);
+        const PixelExtent result = ExtentFromRTV(rtv);
+        if (rtv) {
+            rtv->Release();
+        }
+        return result;
+    }
+
+    void ClampExtent(PixelExtent& extent, const PixelExtent& candidate)
+    {
+        if (!candidate.valid) {
+            return;
+        }
+        if (!extent.valid) {
+            extent = candidate;
+            return;
+        }
+        extent.width = (std::min)(extent.width, candidate.width);
+        extent.height = (std::min)(extent.height, candidate.height);
+        extent.valid = extent.width >= 16 && extent.height >= 16;
+    }
+
     bool EnsureGpuResource(REX::W32::ID3D11Device* device)
     {
         if (!device) {
@@ -277,12 +417,59 @@ namespace
             }
         }
 
+        // Deliberately separate from GpuContactDispatch. Growing t39 would
+        // make newly deployed shaders reinterpret the old DLL's 64-byte
+        // structured stride. A one-element float4 at t40 lets old DLLs leave
+        // the late viewmodel trace invalid/fail-open instead.
+        if (!g_worldSunBuffer) {
+            REX::W32::D3D11_BUFFER_DESC desc{};
+            desc.usage               = REX::W32::D3D11_USAGE_DEFAULT;
+            desc.byteWidth           = sizeof(float) * 4;
+            desc.bindFlags           = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+            desc.miscFlags           = REX::W32::D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            desc.structureByteStride = sizeof(float) * 4;
+            const HRESULT hr =
+                device->CreateBuffer(&desc, nullptr, &g_worldSunBuffer);
+            if (FAILED(hr)) {
+                REX::WARN(
+                    "ContactShadowBridge: failed to create world-sun buffer "
+                    "for t{} (HRESULT 0x{:08X}); late trace will fail open",
+                    WORLD_SUN_SRV_SLOT,
+                    static_cast<std::uint32_t>(hr));
+            }
+        }
+
+        if (g_worldSunBuffer && !g_worldSunSrv) {
+            REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+            desc.format              = REX::W32::DXGI_FORMAT_UNKNOWN;
+            desc.viewDimension       = REX::W32::D3D11_SRV_DIMENSION_BUFFER;
+            desc.buffer.firstElement = 0;
+            desc.buffer.numElements  = 1;
+            const HRESULT hr = device->CreateShaderResourceView(
+                g_worldSunBuffer, &desc, &g_worldSunSrv);
+            if (FAILED(hr)) {
+                REX::WARN(
+                    "ContactShadowBridge: failed to create t{} world-sun SRV "
+                    "(HRESULT 0x{:08X}); late trace will fail open",
+                    WORLD_SUN_SRV_SLOT,
+                    static_cast<std::uint32_t>(hr));
+            }
+        }
+
         return g_buffer && g_srv;
     }
 }
 
 void Shutdown()
 {
+    if (g_worldSunSrv) {
+        g_worldSunSrv->Release();
+        g_worldSunSrv = nullptr;
+    }
+    if (g_worldSunBuffer) {
+        g_worldSunBuffer->Release();
+        g_worldSunBuffer = nullptr;
+    }
     if (g_srv) {
         g_srv->Release();
         g_srv = nullptr;
@@ -295,7 +482,10 @@ void Shutdown()
 
 void BindCustomPassResource(
     REX::W32::ID3D11DeviceContext* context,
-    bool pixelStage)
+    bool pixelStage,
+    REX::W32::ID3D11ShaderResourceView* savedSceneDepth,
+    REX::W32::ID3D11RenderTargetView* savedEngineRTV,
+    const char* passName)
 {
     if (!context) {
         return;
@@ -322,18 +512,100 @@ void BindCustomPassResource(
     std::uint32_t backbufferH = 0;
     const auto& gfx = g_customBufferData;
 
-    // The wavefront march works entirely in pixels, so the light's pixel
-    // coordinate and the depth reads must agree on which pixel space that is.
-    // The grid width follows CustomPass, which measures renderTargets[kMain],
-    // but the light coordinate must be expressed in RENDER pixels: under DLSS
-    // the depth allocation is display-sized and only its top-left subrect is
-    // rendered. Deriving the light position from the allocation instead would
-    // shift it by the upscale ratio and skew every ray in the frame.
+    // The wavefront march works entirely in physical pixels, so the light
+    // coordinate, Bend bounds and t30 depth reads must share a domain. The
+    // custom pass has already changed its OM state by the time this bridge is
+    // called; savedSceneDepth/savedEngineRTV are the pre-batch engine state.
+    // In the observed DLSS frame t30 is 2258x1270 while kMain and the custom
+    // class output are 3840x2160, making t30 the only direct authority for the
+    // pixels that the ray shader actually loads.
+    const bool backbufferValid = BackbufferExtent(backbufferW, backbufferH);
+    PixelExtent backbufferExtent{
+        backbufferW,
+        backbufferH,
+        backbufferValid && backbufferW >= 16 && backbufferH >= 16,
+    };
+
     constexpr float kMinimumRenderExtent = 16.0f;
-    const bool renderExtentValid =
+    const bool injectedExtentValid =
         std::isfinite(gfx.g_RenderInfo.x) && std::isfinite(gfx.g_RenderInfo.y) &&
         gfx.g_RenderInfo.x >= kMinimumRenderExtent &&
         gfx.g_RenderInfo.y >= kMinimumRenderExtent;
+    PixelExtent injectedExtent{};
+    if (injectedExtentValid) {
+        injectedExtent.width = static_cast<std::uint32_t>(
+            std::lround(gfx.g_RenderInfo.x));
+        injectedExtent.height = static_cast<std::uint32_t>(
+            std::lround(gfx.g_RenderInfo.y));
+        injectedExtent.valid = injectedExtent.width >= 16 &&
+            injectedExtent.height >= 16;
+    }
+
+    const PixelExtent savedDepthExtent = ExtentFromSRV(savedSceneDepth);
+    const PixelExtent savedEngineOMExtent = ExtentFromRTV(savedEngineRTV);
+    const PixelExtent liveCustomOMExtent = CurrentOMExtent(context);
+
+    // t30 is primary. Smaller saved-engine or injected extents still clamp it
+    // for the full-allocation plus rendered-subrect case. The display-sized
+    // backbuffer is only an upper bound and the live custom OM is diagnostic:
+    // a PS class pass deliberately binds its own full-size RTV and a CS pass
+    // may have no OM target at all.
+    PixelExtent chosenProxyExtent{};
+    const char* chosenAuthority = "none";
+    if (savedDepthExtent.valid) {
+        chosenProxyExtent = savedDepthExtent;
+        chosenAuthority = "savedDepthT30";
+    } else if (savedEngineOMExtent.valid) {
+        chosenProxyExtent = savedEngineOMExtent;
+        chosenAuthority = "savedEngineOM";
+    } else if (injectedExtent.valid) {
+        chosenProxyExtent = injectedExtent;
+        chosenAuthority = "injected";
+    } else if (backbufferExtent.valid) {
+        chosenProxyExtent = backbufferExtent;
+        chosenAuthority = "backbuffer";
+    }
+    ClampExtent(chosenProxyExtent, savedDepthExtent);
+    ClampExtent(chosenProxyExtent, savedEngineOMExtent);
+    ClampExtent(chosenProxyExtent, injectedExtent);
+    ClampExtent(chosenProxyExtent, backbufferExtent);
+
+    // Runtime proof for the dynamic-resolution decision. Restrict the dump to
+    // contact passes so unrelated tonemap custom passes do not obscure the
+    // early afterDeferred state. The first dump occurs immediately, then at
+    // most once every five seconds.
+    if (passName && std::strstr(passName, "Contact")) {
+        static std::atomic<std::uint64_t> s_lastDomainLogMs{0};
+        const auto nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        const auto previous =
+            s_lastDomainLogMs.load(std::memory_order_relaxed);
+        if (nowMs - previous > 5000u) {
+            s_lastDomainLogMs.store(nowMs, std::memory_order_relaxed);
+            REX::INFO(
+                "ContactShadowBridge: pixel domains pass={} stage={} | "
+                "savedDepth(t30)={}x{} valid={} | savedEngineOM={}x{} "
+                "valid={} | injected={}x{} valid={} | liveCustomOM={}x{} "
+                "valid={} | backbuffer={}x{} valid={} | chosen={}x{} "
+                "authority={} | t40Ready={}",
+                passName,
+                pixelStage ? "PS" : "CS",
+                savedDepthExtent.width, savedDepthExtent.height,
+                savedDepthExtent.valid,
+                savedEngineOMExtent.width, savedEngineOMExtent.height,
+                savedEngineOMExtent.valid,
+                injectedExtent.width, injectedExtent.height,
+                injectedExtent.valid,
+                liveCustomOMExtent.width, liveCustomOMExtent.height,
+                liveCustomOMExtent.valid,
+                backbufferExtent.width, backbufferExtent.height,
+                backbufferExtent.valid,
+                chosenProxyExtent.width, chosenProxyExtent.height,
+                chosenAuthority,
+                g_worldSunSrv != nullptr);
+        }
+    }
 
     // The sun direction comes from the captured shadow cascade, NOT from
     // g_SunDirX/Y/Z. That triple is HachiToon's *stylized* dominant light
@@ -447,66 +719,53 @@ void BindCustomPassResource(
         }
     }
 
+    // The late viewmodel trace reconstructs camera-relative position from the
+    // captured DeferredLights b2+b12 pair. Its t40.w therefore reports that
+    // paired scope independently of sun availability so local-only interiors
+    // can trace safely. Other contact passes retain the original sun-valid w.
+    const bool isLateViewmodelContactTrace = passName &&
+        std::strcmp(passName, "hachiViewmodelContactShadowTrace") == 0;
+    const bool lateReconstructionReady =
+        ShadowUpgrade::IsDeferredReconstructionBoundForCurrentThread();
+    const bool worldSunContractReadyForPass =
+        isLateViewmodelContactTrace
+            ? lateReconstructionReady
+            : sunDirValid;
+
+    if (isLateViewmodelContactTrace) {
+        static int s_lastLateVmPublicationState = -1;
+        const int state = worldSunContractReadyForPass ? 1 : 0;
+        if (state != s_lastLateVmPublicationState) {
+            s_lastLateVmPublicationState = state;
+            if (state != 0) {
+                REX::INFO(
+                    "ContactShadowBridge: late VM reconstruction ready "
+                    "(sunValid={} deferredB2B12Bound={})",
+                    sunDirValid, lateReconstructionReady);
+            } else {
+                REX::WARN(
+                    "ContactShadowBridge: late VM reconstruction unavailable; trace "
+                    "will fail open (sunValid={} deferredB2B12Bound={})",
+                    sunDirValid, lateReconstructionReady);
+            }
+        }
+    }
+
     // No valid cascade (interior, night without a shadow-casting light, or
     // capture disabled - and nothing cached recently) publishes zero work;
     // the composite reads that as identity, so the correct "no sun contact
     // shadows here" falls out.
     const bool inputsValid =
-        BackbufferExtent(backbufferW, backbufferH) && sunDirValid;
+        backbufferExtent.valid && chosenProxyExtent.valid && sunDirValid;
 
     int totalGroups = 0;
     float directionStability = 1.0f;
     const std::uint32_t gridWidth = CeilDiv(backbufferW, GRID_DIV_X);
 
     int renderExtent[2] = {
-        static_cast<int>(renderExtentValid
-            ? std::lround(gfx.g_RenderInfo.x)
-            : static_cast<long>(backbufferW)),
-        static_cast<int>(renderExtentValid
-            ? std::lround(gfx.g_RenderInfo.y)
-            : static_cast<long>(backbufferH)),
+        static_cast<int>(chosenProxyExtent.width),
+        static_cast<int>(chosenProxyExtent.height),
     };
-
-    // Clamp to the live render target. The engine composites the scene into
-    // different textures on different frames - a display-sized buffer or a
-    // smaller upscaler proxy (2560x1440 under a 3840x2160 display, in game
-    // 2026-08-14) - and g_RenderInfo does not track the proxy: it reported
-    // full size while the proxy was bound, so the light coordinate was
-    // computed in the wrong pixel space and the border test marched rays
-    // through unrendered depth. At bind time the pass's destination is on OM
-    // slot 0 (the engine's own target during the CS fire; the pass's
-    // currentRTV output during the PS fire - the same texture either way), so
-    // its dimensions are the authoritative pixel space for this fire.
-    // Component-wise min handles both shapes: a physically smaller proxy
-    // (bound < info) and subrect rendering inside a full-size allocation
-    // (info < bound).
-    {
-        REX::W32::ID3D11RenderTargetView* rtv0 = nullptr;
-        context->OMGetRenderTargets(1, &rtv0, nullptr);
-        if (rtv0) {
-            REX::W32::ID3D11Resource* resource = nullptr;
-            rtv0->GetResource(&resource);
-            if (resource) {
-                REX::W32::ID3D11Texture2D* texture = nullptr;
-                resource->QueryInterface(
-                    REX::W32::IID_ID3D11Texture2D,
-                    reinterpret_cast<void**>(&texture));
-                if (texture) {
-                    REX::W32::D3D11_TEXTURE2D_DESC desc{};
-                    texture->GetDesc(&desc);
-                    if (desc.width >= 16 && desc.height >= 16) {
-                        renderExtent[0] = (std::min)(
-                            renderExtent[0], static_cast<int>(desc.width));
-                        renderExtent[1] = (std::min)(
-                            renderExtent[1], static_cast<int>(desc.height));
-                    }
-                    texture->Release();
-                }
-                resource->Release();
-            }
-            rtv0->Release();
-        }
-    }
 
     if (inputsValid) {
         // sunDir is already unit length from the cascade extraction.
@@ -597,6 +856,16 @@ void BindCustomPassResource(
     }
 
     context->UpdateSubresource(g_buffer, 0, nullptr, upload, 0, 0);
+    if (g_worldSunBuffer) {
+        const float worldSunUpload[4] = {
+            sunDir[0],
+            sunDir[1],
+            sunDir[2],
+            worldSunContractReadyForPass ? 1.0f : 0.0f,
+        };
+        context->UpdateSubresource(
+            g_worldSunBuffer, 0, nullptr, worldSunUpload, 0, 0);
+    }
 
     // Publish-state TRANSITIONS, unthrottled. The 5s dump below can sample
     // straight past a short no-work episode, which is exactly what happened
@@ -610,8 +879,11 @@ void BindCustomPassResource(
             if (publishState == 0) {
                 REX::WARN(
                     "ContactShadowBridge: transition -> NOT publishing "
-                    "(sunDirValid={} renderExtentValid={} backbuffer={}x{})",
-                    sunDirValid, renderExtentValid, backbufferW, backbufferH);
+                    "(sunDirValid={} proxyExtentValid={} chosen={}x{} "
+                    "authority={} backbuffer={}x{})",
+                    sunDirValid, chosenProxyExtent.valid,
+                    chosenProxyExtent.width, chosenProxyExtent.height,
+                    chosenAuthority, backbufferW, backbufferH);
             } else {
                 REX::INFO(
                     "ContactShadowBridge: transition -> publishing again "
@@ -651,16 +923,24 @@ void BindCustomPassResource(
                 REX::WARN(
                     "ContactShadowBridge: publishing NO work - contact shadows "
                     "will not be written this frame. backbuffer={}x{} "
-                    "cascadeSunDirValid={} renderExtentValid={}",
-                    backbufferW, backbufferH, sunDirValid, renderExtentValid);
+                    "cascadeSunDirValid={} proxyExtent={}x{} valid={} "
+                    "authority={} t40Ready={}",
+                    backbufferW, backbufferH, sunDirValid,
+                    chosenProxyExtent.width, chosenProxyExtent.height,
+                    chosenProxyExtent.valid, chosenAuthority,
+                    g_worldSunSrv != nullptr);
             }
         }
     }
 
+    REX::W32::ID3D11ShaderResourceView* bridgeSRVs[2] = {
+        g_srv,
+        g_worldSunSrv,
+    };
     if (pixelStage) {
-        context->PSSetShaderResources(SRV_SLOT, 1, &g_srv);
+        context->PSSetShaderResources(SRV_SLOT, 2, bridgeSRVs);
     } else {
-        context->CSSetShaderResources(SRV_SLOT, 1, &g_srv);
+        context->CSSetShaderResources(SRV_SLOT, 2, bridgeSRVs);
     }
 }
 }

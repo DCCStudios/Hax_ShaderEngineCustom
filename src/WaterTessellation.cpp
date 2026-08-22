@@ -441,7 +441,6 @@ bool TryDrawIndexed(
 {
     if (!context || !SHADERENGINE_EFFECTS_ON ||
         !FindBool("vu_WaterPhysicalEnabled", false) ||
-        !FindBool("vu_WaterDisplacementEnabled", false) ||
         !FindBool("vu_WaterTessellationEnabled", false)) {
         return false;
     }
@@ -470,7 +469,9 @@ bool TryDrawIndexed(
     auto constantBuffers = BindWaterConstantBuffers(context);
     D3D11Hooks::OriginalRSSetState(
         context,
-        wireframe ? pipeline.wireframeRaster : pipeline.noCullRaster);
+        wireframe ? pipeline.wireframeRaster :
+            (FindBool("vu_WaterDisplacementEnabled", false) ?
+                pipeline.noCullRaster : originalRaster));
     if (wireframe) {
         D3D11Hooks::OriginalPSSetShader(context, pipeline.debugPixel, nullptr, 0);
     }
