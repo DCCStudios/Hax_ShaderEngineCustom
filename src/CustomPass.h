@@ -273,13 +273,22 @@ public:
     std::unique_ptr<std::mutex>                 compileMutex = std::make_unique<std::mutex>();
 
     struct ActiveWhenTerm {
+        // Bool: a Values.ini bool ShaderValue*. WeatherRain: runtime-evaluated
+        // against g_customBufferData weather class (no shaderValue), so rain
+        // passes can be skipped entirely in clear weather.
+        enum class Kind : std::uint8_t { Bool, WeatherRain };
         void* shaderValue = nullptr;
-        bool negate = false;
+        bool  negate = false;
+        Kind  kind = Kind::Bool;
     };
-    // Every cached term must pass. Unknown ids retain the existing fire-open
-    // behavior for that term so legacy configurations do not turn off passes.
+    // Terms are AND-combined by default; a `|`-separated activeWhen sets
+    // activeWhenIsOr so any single true term satisfies the gate (used to fold
+    // several feature-gated copies of one pass into a single OR-gated pass).
+    // Unknown ids retain fire-open behavior so legacy configs never turn a pass
+    // off unexpectedly.
     std::vector<ActiveWhenTerm>                 activeWhenTerms;
     bool                                        activeWhenChecked = false;
+    bool                                        activeWhenIsOr = false;
 
     void Release();
 };

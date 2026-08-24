@@ -3,6 +3,8 @@
 #include <d3dhooks.h>
 #include <WaterTessellation.h>
 
+#include <atomic>
+#include <chrono>
 #include <limits>
 
 namespace WaterTessellation
@@ -65,6 +67,32 @@ namespace
             if (value && value->id == id) return value->current.i;
         }
         return fallback;
+    }
+
+    // Cached-pointer variants for the per-DrawIndexed hot path. Values.ini is
+    // parsed only at startup so the ShaderValue* is stable for the process; the
+    // caller keeps a static slot, so after the first resolve every subsequent
+    // draw is a single pointer deref instead of FindBool/FindInt's linear scan
+    // + string compare over ~77 bools / 30 ints. This runs on every DrawIndexed
+    // the game issues (thousands per frame), so the difference is real CPU.
+    bool CachedBool(const ShaderValue*& slot, std::string_view id, bool fallback)
+    {
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetBoolShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
+        }
+        return slot ? slot->current.b : fallback;
+    }
+
+    int CachedInt(const ShaderValue*& slot, std::string_view id, int fallback)
+    {
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetIntShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
+        }
+        return slot ? slot->current.i : fallback;
     }
 
     std::string BuildShaderHeader()
@@ -359,38 +387,74 @@ namespace
         }
     }
 
+    // Why a water-shaped draw did or did not qualify for tessellation. Ordered
+    // so the cheap geometry signature runs first: everything that is NOT a
+    // water quad exits as NotWaterShaped and is never counted, leaving the
+    // per-reason telemetry to describe only genuine water draws.
+    enum class O6MatchReason
+    {
+        Matched = 0,
+        NotWaterShaped,        // geometry signature miss (non-water; not logged)
+        StalePixelDefinition,  // tracked original PS is not visualWater
+        BoundPixelMismatch,    // bound PS is neither the Main1 replacement nor the
+                               // Main1 original - a foreign/Main2/LOD water-shaped
+                               // quad we correctly skip
+        VertexMismatch,        // original/selected VS is not the proven O6 pair
+        BoundStateNotClean,    // selected VS not bound, or a hull/domain is present
+        BoundIsUnreplacedMain1,// bound PS IS the Main1 water original but our
+                               // replacement is not swapped in - a REAL Main1 water
+                               // patch we are skipping (this is the blue flash)
+    };
+
+    // DIAGNOSTIC (temporary): aggregate the qualification outcome of every
+    // water-shaped draw and flush a one-line summary about once a second, so a
+    // normal play session's log shows whether patches intermittently fall
+    // through to the untessellated (flat) path and, if so, at which check.
+    // Strip this and the O6MatchReason plumbing once the flashing is root-caused.
+    void RecordO6MatchTelemetry(O6MatchReason reason)
+    {
+        static std::atomic<std::uint32_t> s_counts[7]{};
+        s_counts[static_cast<int>(reason)].fetch_add(1, std::memory_order_relaxed);
+
+        static std::atomic<std::uint64_t> s_lastFlushMs{ 0 };
+        const auto nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        auto prev = s_lastFlushMs.load(std::memory_order_relaxed);
+        if (nowMs - prev < 1000) return;
+        if (!s_lastFlushMs.compare_exchange_strong(
+                prev, nowMs, std::memory_order_relaxed)) {
+            return;
+        }
+
+        const std::uint32_t matched = s_counts[0].exchange(0, std::memory_order_relaxed);
+        const std::uint32_t staleDef = s_counts[2].exchange(0, std::memory_order_relaxed);
+        const std::uint32_t boundMiss = s_counts[3].exchange(0, std::memory_order_relaxed);
+        const std::uint32_t vsMiss = s_counts[4].exchange(0, std::memory_order_relaxed);
+        const std::uint32_t stateBad = s_counts[5].exchange(0, std::memory_order_relaxed);
+        const std::uint32_t unreplacedMain1 = s_counts[6].exchange(0, std::memory_order_relaxed);
+        REX::INFO(
+            "WaterTessDiag(~1s): matched={} | fell through -> stalePixelDef={} "
+            "boundPixelMismatch(foreign)={} vertexMismatch={} boundStateNotClean={} "
+            "unreplacedMain1(REAL flash)={}",
+            matched, staleDef, boundMiss, vsMiss, stateBad, unreplacedMain1);
+    }
+
     bool MatchesProvenO6Contract(
         REX::W32::ID3D11DeviceContext* context,
         UINT indexCount,
-        REX::W32::ID3D11VertexShader** selectedShader)
+        REX::W32::ID3D11VertexShader** selectedShader,
+        O6MatchReason& reason)
     {
-        auto* originalPS = g_currentOriginalPixelShader.load(std::memory_order_acquire);
-        auto* pixelDefinition = originalPS ? g_ShaderDB.GetMatchedDefinition(originalPS) : nullptr;
-        if (!pixelDefinition || pixelDefinition->id != "visualWater") return false;
-
-        // The tracker is process-wide, while a D3D11 device can expose more
-        // than one context.  Prove that this context actually has the expected
-        // physical-water replacement bound before changing its topology.
-        auto* expectedPixel = g_ShaderDB.GetReplacementShader(originalPS);
-        REX::W32::ID3D11PixelShader* boundPixel = nullptr;
-        UINT pixelClasses = 0;
-        context->PSGetShader(&boundPixel, nullptr, &pixelClasses);
-        const bool pixelMatches =
-            expectedPixel && boundPixel == expectedPixel && pixelClasses == 0;
-        if (boundPixel) boundPixel->Release();
-        if (!pixelMatches) return false;
-
-        auto* originalVS = GetCurrentOriginalVertexShader_Internal();
-        auto* selectedVS = GetCurrentSelectedVertexShader_Internal();
-        auto* vertexDefinition = originalVS ? g_ShaderDB.GetMatchedDefinition(originalVS) : nullptr;
-        auto* expectedReplacement = originalVS ? g_ShaderDB.GetReplacementShader(originalVS) : nullptr;
-        if (!vertexDefinition || vertexDefinition->id != "waterVertexDumpO6" ||
-            g_ShaderDB.GetShaderUID(originalVS) != "VSD0439849I2O6" ||
-            !expectedReplacement || selectedVS != expectedReplacement) {
-            return false;
-        }
-        // Runtime telemetry proved the visible O6 surface as one indexed quad:
-        // two triangles, six R16 indices. Do not generalize beyond that evidence.
+        // --- Cheap geometry signature first. Runtime telemetry proved the
+        // visible O6 surface as one indexed quad: two triangles, six R16
+        // indices, 20-byte vertices, triangle list. Anything else is not a
+        // water quad and must not be counted. Reordering the AND-chain does not
+        // change which draws match; it just filters the non-water majority
+        // before the identity/state probes and lets the telemetry attribute a
+        // reason to real water draws only.
+        reason = O6MatchReason::NotWaterShaped;
         if (indexCount != 6) return false;
 
         REX::W32::D3D11_PRIMITIVE_TOPOLOGY topology{};
@@ -411,18 +475,99 @@ namespace
         if (indexBuffer) indexBuffer->Release();
         if (indexFormat != REX::W32::DXGI_FORMAT_R16_UINT) return false;
 
+        // --- From here the draw is water-shaped; every exit is a real fall-
+        // through that the telemetry attributes to a specific cause.
+        //
+        // STALE-TRACKER FIX (2026-08-23): the process-wide original-PS/VS
+        // trackers are overwritten by every interleaved non-water bind, so at
+        // water-draw time they frequently do not point at the water shaders
+        // (telemetry: stalePixelDef ~1200-2200/s while every other bucket
+        // stayed 0 - the flat "blue flash" patches). The BOUND shaders on this
+        // context are the draw's ground truth; the trackers now only BOOTSTRAP
+        // a cache of the proven water original-shader identities. The cache is
+        // re-validated against the ShaderDB on every use (definition id, UID,
+        // current replacement), so a shader reload that remaps the definition
+        // makes the cache fail those checks and the tracker path re-learns it.
+        // Cached pointers are compared and passed to ShaderDB lookups only,
+        // never dereferenced.
+        static std::atomic<REX::W32::ID3D11PixelShader*> s_cachedWaterOriginalPS{ nullptr };
+        static std::atomic<REX::W32::ID3D11VertexShader*> s_cachedWaterOriginalVS{ nullptr };
+
+        reason = O6MatchReason::StalePixelDefinition;
+        auto* trackedPS = g_currentOriginalPixelShader.load(std::memory_order_acquire);
+        auto* trackedPSDefinition =
+            trackedPS ? g_ShaderDB.GetMatchedDefinition(trackedPS) : nullptr;
+        auto* originalPS = (trackedPSDefinition && trackedPSDefinition->id == "visualWater")
+            ? trackedPS
+            : s_cachedWaterOriginalPS.load(std::memory_order_acquire);
+        auto* pixelDefinition = originalPS ? g_ShaderDB.GetMatchedDefinition(originalPS) : nullptr;
+        if (!pixelDefinition || pixelDefinition->id != "visualWater") return false;
+
+        // The tracker is process-wide, while a D3D11 device can expose more
+        // than one context.  Prove that this context actually has the expected
+        // physical-water replacement bound before changing its topology. This
+        // bound-PS check is also what keeps the cache path safe: a water-shaped
+        // draw that is NOT water fails here (its bound PS is not the visualWater
+        // replacement) and falls through to the ordinary game draw.
+        reason = O6MatchReason::BoundPixelMismatch;
+        auto* expectedPixel = g_ShaderDB.GetReplacementShader(originalPS);
+        REX::W32::ID3D11PixelShader* boundPixel = nullptr;
+        UINT pixelClasses = 0;
+        context->PSGetShader(&boundPixel, nullptr, &pixelClasses);
+        const bool pixelMatches =
+            expectedPixel && boundPixel == expectedPixel && pixelClasses == 0;
+        // Diagnostic split: a bound PS that equals the Main1 water ORIGINAL is a
+        // real Main1 water patch whose replacement was not swapped in (a genuine
+        // skip = the blue flash). Anything else is a foreign / Main2 / LOD
+        // water-shaped quad we correctly reject.
+        const bool boundIsUnreplacedMain1 =
+            boundPixel != nullptr && boundPixel == originalPS;
+        if (boundPixel) boundPixel->Release();
+        if (!pixelMatches) {
+            reason = boundIsUnreplacedMain1
+                ? O6MatchReason::BoundIsUnreplacedMain1
+                : O6MatchReason::BoundPixelMismatch;
+            return false;
+        }
+        s_cachedWaterOriginalPS.store(originalPS, std::memory_order_release);
+
+        reason = O6MatchReason::VertexMismatch;
+        auto* trackedVS = GetCurrentOriginalVertexShader_Internal();
+        auto* trackedVSDefinition =
+            trackedVS ? g_ShaderDB.GetMatchedDefinition(trackedVS) : nullptr;
+        auto* originalVS = (trackedVSDefinition && trackedVSDefinition->id == "waterVertexDumpO6")
+            ? trackedVS
+            : s_cachedWaterOriginalVS.load(std::memory_order_acquire);
+        auto* vertexDefinition = originalVS ? g_ShaderDB.GetMatchedDefinition(originalVS) : nullptr;
+        auto* expectedReplacement = originalVS ? g_ShaderDB.GetReplacementShader(originalVS) : nullptr;
+        if (!vertexDefinition || vertexDefinition->id != "waterVertexDumpO6" ||
+            g_ShaderDB.GetShaderUID(originalVS) != "VSD0439849I2O6" ||
+            !expectedReplacement) {
+            return false;
+        }
+
+        // The BOUND vertex shader must be the current O6 replacement. The old
+        // additional equality against the selected-VS tracker is intentionally
+        // gone - it was the same stale-tracker dependence, and the bound VS
+        // matching the DB's current replacement is the stronger proof.
+        reason = O6MatchReason::BoundStateNotClean;
         REX::W32::ID3D11HullShader* hull = nullptr;
         REX::W32::ID3D11DomainShader* domain = nullptr;
         UINT vsClasses = 0;
         context->VSGetShader(selectedShader, nullptr, &vsClasses);
         context->HSGetShader(&hull, nullptr, nullptr);
         context->DSGetShader(&domain, nullptr, nullptr);
-        const bool matches = *selectedShader == selectedVS && vsClasses == 0 && !hull && !domain;
+        const bool matches =
+            *selectedShader == expectedReplacement && vsClasses == 0 && !hull && !domain;
         if (hull) hull->Release();
         if (domain) domain->Release();
         if (!matches && *selectedShader) {
             (*selectedShader)->Release();
             *selectedShader = nullptr;
+        }
+        if (matches) {
+            s_cachedWaterOriginalVS.store(originalVS, std::memory_order_release);
+            reason = O6MatchReason::Matched;
         }
         return matches;
     }
@@ -439,14 +584,26 @@ bool TryDrawIndexed(
     UINT startIndexLocation,
     INT baseVertexLocation)
 {
+    // Per-draw fast path: cached-pointer reads, not FindBool's linear scan.
+    static const ShaderValue* s_physicalEnabled = nullptr;
+    static const ShaderValue* s_tessEnabled = nullptr;
     if (!context || !SHADERENGINE_EFFECTS_ON ||
-        !FindBool("vu_WaterPhysicalEnabled", false) ||
-        !FindBool("vu_WaterTessellationEnabled", false)) {
+        !CachedBool(s_physicalEnabled, "vu_WaterPhysicalEnabled", false) ||
+        !CachedBool(s_tessEnabled, "vu_WaterTessellationEnabled", false)) {
         return false;
     }
 
     REX::W32::ID3D11VertexShader* selectedShader = nullptr;
-    if (!MatchesProvenO6Contract(context, indexCount, &selectedShader)) return false;
+    O6MatchReason matchReason = O6MatchReason::NotWaterShaped;
+    const bool contractMatched =
+        MatchesProvenO6Contract(context, indexCount, &selectedShader, matchReason);
+    // Count every water-shaped draw (matched or fell through) so the throttled
+    // summary shows the pass/fail split and the dominant failure cause. Non-
+    // water draws exit as NotWaterShaped and are skipped.
+    if (DEVELOPMENT && matchReason != O6MatchReason::NotWaterShaped) {
+        RecordO6MatchTelemetry(matchReason);
+    }
+    if (!contractMatched) return false;
 
     REX::W32::ID3D11RasterizerState* originalRaster = nullptr;
     context->RSGetState(&originalRaster);
@@ -461,7 +618,11 @@ bool TryDrawIndexed(
     }
     device->Release();
 
-    const bool wireframe = FindInt("vu_WaterTessellationDebugView", 0) == 1;
+    static const ShaderValue* s_debugView = nullptr;
+    static const ShaderValue* s_displacementEnabled = nullptr;
+    static const ShaderValue* s_subdivision = nullptr;
+    const bool wireframe =
+        CachedInt(s_debugView, "vu_WaterTessellationDebugView", 0) == 1;
     REX::W32::ID3D11PixelShader* originalPixel = nullptr;
     if (wireframe) context->PSGetShader(&originalPixel, nullptr, nullptr);
 
@@ -470,7 +631,8 @@ bool TryDrawIndexed(
     D3D11Hooks::OriginalRSSetState(
         context,
         wireframe ? pipeline.wireframeRaster :
-            (FindBool("vu_WaterDisplacementEnabled", false) ?
+            (CachedBool(s_displacementEnabled,
+                        "vu_WaterDisplacementEnabled", false) ?
                 pipeline.noCullRaster : originalRaster));
     if (wireframe) {
         D3D11Hooks::OriginalPSSetShader(context, pipeline.debugPixel, nullptr, 0);
@@ -480,8 +642,24 @@ bool TryDrawIndexed(
     context->DSSetShader(pipeline.domain, nullptr, 0);
     context->IASetPrimitiveTopology(REX::W32::D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
-    D3D11Hooks::OriginalDrawIndexed(
-        context, indexCount, startIndexLocation, baseVertexLocation);
+    // Instanced sub-patch subdivision. Each parent patch is drawn subdiv*subdiv
+    // times; the domain shader routes instance i to one barycentric sub-triangle
+    // (WaterSubTriangleBarycentrics), so effective density can exceed the D3D11
+    // factor-64 hardware cap. The shader reads the SAME slider to lay out the
+    // sub-triangles, so the instance count here must match it. subdiv=1 issues
+    // the ordinary single-instance draw (byte-identical to before).
+    const int subdivRequested =
+        CachedInt(s_subdivision, "vu_WaterTessellationSubdivision", 1);
+    const int subdiv = subdivRequested < 1 ? 1 : (subdivRequested > 4 ? 4 : subdivRequested);
+    const UINT instanceCount = (UINT)(subdiv * subdiv);
+    if (instanceCount > 1u && D3D11Hooks::OriginalDrawIndexedInstanced) {
+        D3D11Hooks::OriginalDrawIndexedInstanced(
+            context, indexCount, instanceCount,
+            startIndexLocation, baseVertexLocation, 0);
+    } else {
+        D3D11Hooks::OriginalDrawIndexed(
+            context, indexCount, startIndexLocation, baseVertexLocation);
+    }
 
     context->IASetPrimitiveTopology(REX::W32::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->DSSetShader(nullptr, nullptr, 0);

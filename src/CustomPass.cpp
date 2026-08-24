@@ -1,6 +1,7 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <algorithm>
 #include <chrono>
 
 #include "ContactShadowBridge.h"
@@ -1449,18 +1450,25 @@ bool Registry::FireSortedBatch(REX::W32::ID3D11DeviceContext* context, const std
     return firedAny;
 }
 
-// Evaluate the optional `activeWhen` runtime gate. Commas and `&&` both form
-// an AND-list, and each term may start with `!`. Resolved ShaderValue pointers
-// are cached on first use so the render-thread fast path only reads bools.
+// Evaluate the optional `activeWhen` runtime gate. Commas and `&&` form an
+// AND-list; a `|` anywhere makes the whole spec an OR-list instead (any one
+// true term satisfies it). Each term may start with `!`. The special token
+// `weatherRain` is evaluated per-frame against the current/outgoing weather
+// class rather than a Values.ini bool, so rain passes can be skipped entirely
+// in clear weather. Resolved pointers/kinds are cached on first use.
 static bool EvaluateActiveWhen(Pass& pass) {
     const std::string& spec = pass.spec.activeWhen;
     if (spec.empty()) return true;
 
     if (!pass.activeWhenChecked) {
+        pass.activeWhenIsOr = spec.find('|') != std::string::npos;
         std::string normalized = spec;
+        // Normalize every AND/OR separator (&&, |, ||) to a single comma; the
+        // AND-vs-OR decision is already captured in activeWhenIsOr above.
         for (size_t pos = 0; (pos = normalized.find("&&", pos)) != std::string::npos;) {
             normalized.replace(pos, 2, ",");
         }
+        std::replace(normalized.begin(), normalized.end(), '|', ',');
         std::stringstream terms(normalized);
         std::string token;
         while (std::getline(terms, token, ',')) {
@@ -1468,6 +1476,11 @@ static bool EvaluateActiveWhen(Pass& pass) {
             const bool negate = token[0] == '!';
             const std::string id = negate ? token.substr(1) : token;
             if (id.empty()) continue;
+            if (id == "weatherRain") {
+                pass.activeWhenTerms.push_back(
+                    { nullptr, negate, Pass::ActiveWhenTerm::Kind::WeatherRain });
+                continue;
+            }
             ShaderValue* resolved = nullptr;
             for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
                 if (sv && sv->id == id) { resolved = sv; break; }
@@ -1476,16 +1489,43 @@ static bool EvaluateActiveWhen(Pass& pass) {
                 REX::WARN("CustomPass[{}]: activeWhen term '{}' did not resolve to a Values.ini bool; that term will fire-open",
                     pass.spec.name, token);
             }
-            pass.activeWhenTerms.push_back({ resolved, negate });
+            pass.activeWhenTerms.push_back(
+                { resolved, negate, Pass::ActiveWhenTerm::Kind::Bool });
         }
         pass.activeWhenChecked  = true;
     }
 
-    for (const auto& term : pass.activeWhenTerms) {
+    // Resolve one term's boolean value (fire-open when a Bool term's pointer
+    // never resolved, so a typo cannot silently disable a pass).
+    auto termValue = [](const Pass::ActiveWhenTerm& term, bool& usable) -> bool {
+        usable = true;
+        if (term.kind == Pass::ActiveWhenTerm::Kind::WeatherRain) {
+            const bool raining = g_customBufferData.currentWeatherClass == 2 ||
+                                 g_customBufferData.outgoingWeatherClass == 2;
+            return term.negate ? !raining : raining;
+        }
         auto* sv = static_cast<ShaderValue*>(term.shaderValue);
-        if (!sv) continue;
-        const bool value = term.negate ? !sv->current.b : sv->current.b;
-        if (!value) return false;
+        if (!sv) { usable = false; return true; }
+        return term.negate ? !sv->current.b : sv->current.b;
+    };
+
+    if (pass.activeWhenIsOr) {
+        bool anyUsable = false;
+        for (const auto& term : pass.activeWhenTerms) {
+            bool usable = false;
+            const bool value = termValue(term, usable);
+            if (!usable) continue;
+            anyUsable = true;
+            if (value) return true;
+        }
+        // No term was true. An all-unresolved OR gate fires open.
+        return !anyUsable;
+    }
+
+    for (const auto& term : pass.activeWhenTerms) {
+        bool usable = false;
+        const bool value = termValue(term, usable);
+        if (usable && !value) return false;
     }
     return true;
 }

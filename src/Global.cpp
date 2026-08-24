@@ -1,6 +1,77 @@
 #include <PCH.h>
 #include <Global.h>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
+// ---- Shared HLSL file-watch poller ---------------------------------------
+// One background thread stats every registered shader file once a second, in
+// place of one thread per shader definition. See HlslFileWatchPoller in
+// Global.h for the rationale (thread count + instant reload teardown).
+HlslFileWatchPoller& HlslFileWatchPoller::Instance() {
+    // Leaked on purpose: a process-lifetime singleton whose detached thread
+    // must not race the watchers during static destruction at process exit.
+    static HlslFileWatchPoller* instance = new HlslFileWatchPoller();
+    return *instance;
+}
+
+void HlslFileWatchPoller::EnsureThreadStarted() {
+    if (threadStarted_.exchange(true)) {
+        return;
+    }
+    std::thread([this]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& e : entries_) {
+                try {
+                    if (!e.path || !std::filesystem::exists(*e.path)) {
+                        continue;
+                    }
+                    auto currentTime = std::filesystem::last_write_time(*e.path);
+                    if (currentTime != e.lastWrite) {
+                        e.lastWrite = currentTime;
+                        if (e.flag) {
+                            e.flag->store(true, std::memory_order_release);
+                        }
+                        REX::INFO("HlslFileWatcher: Shader file '{}' changed, marked for reload",
+                                  e.path->string());
+                    }
+                } catch (...) {
+                    // Ignore transient filesystem errors for this entry.
+                }
+            }
+        }
+    }).detach();
+}
+
+void HlslFileWatchPoller::Register(const std::filesystem::path* path,
+                                   std::atomic<bool>* reloadFlag) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry entry;
+        entry.path = path;
+        entry.flag = reloadFlag;
+        try {
+            if (path && std::filesystem::exists(*path)) {
+                entry.lastWrite = std::filesystem::last_write_time(*path);
+            }
+        } catch (...) {
+        }
+        entries_.push_back(entry);
+    }
+    EnsureThreadStarted();
+}
+
+void HlslFileWatchPoller::Deregister(std::atomic<bool>* reloadFlag) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.erase(
+        std::remove_if(entries_.begin(), entries_.end(),
+                       [&](const Entry& e) { return e.flag == reloadFlag; }),
+        entries_.end());
+}
+
 const char* defaultIni = R"(
 ; Enable/disable debugging of the plugin
 ; This is extensive debugging for the plugin
@@ -207,6 +278,7 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_WorldSH_R; // world-space L1 ambient cube for R; .xyz=directional bands, .w=DC
 ;    float4   GFXInjected[0].g_WorldSH_G; // world-space L1 ambient cube for G
 ;    float4   GFXInjected[0].g_WorldSH_B; // world-space L1 ambient cube for B
+;    float4   GFXInjected[0].g_ViewmodelDOF; // .x = viewmodel-DOF anim blend (1 full, 0 suppressed); yzw reserved
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -445,6 +517,12 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_WorldSH_R;
             float4 g_WorldSH_G;
             float4 g_WorldSH_B;
+
+            // Viewmodel DOF runtime state (appended to preserve ABI offsets).
+            // .x = weapon-animation DOF blend: 1 = full DOF, 0 = suppressed while
+            //      a discrete first-person animation (reload/inspect/equip/...) plays.
+            //      Smoothed on the CPU; consumed by visualViewmodelDOF.hlsl. yzw reserved.
+            float4 g_ViewmodelDOF;
 
         };
 

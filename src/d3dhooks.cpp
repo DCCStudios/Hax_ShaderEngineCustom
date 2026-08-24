@@ -14,6 +14,7 @@
 #include <ShaderResources.h>
 #include <ShadowTelemetry.h>
 #include <WaterTessellation.h>
+#include "ViewmodelDOFAnim.h"
 
 extern HWND g_outputWindow;
 extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
@@ -500,17 +501,29 @@ void UpdateCustomBuffer_Internal() {
     // Integrating speed per frame avoids retroactively multiplying all historic
     // phase by a newly selected speed. Parameter changes cross-fade from the
     // currently visible bank, so presets and sliders cannot reset the surface.
-    const auto findWaterFloat = [](std::string_view id, float fallback) {
-        for (const auto* value : g_shaderSettings.GetFloatShaderValues()) {
-            if (value && value->id == id) return value->current.f;
+    // Cached-pointer lookups: Values.ini is parsed only at startup, so the
+    // resolved ShaderValue* is stable for the process. The static map keeps this
+    // per-frame water-bank read O(1) after the first resolve instead of a linear
+    // scan of ~560 floats per call. Keys are string literals (stable storage).
+    const auto findWaterFloat = [](std::string_view id, float fallback) -> float {
+        static std::unordered_map<std::string_view, const ShaderValue*> cache;
+        const ShaderValue*& slot = cache[id];
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetFloatShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
         }
-        return fallback;
+        return slot ? slot->current.f : fallback;
     };
-    const auto findWaterInt = [](std::string_view id, int fallback) {
-        for (const auto* value : g_shaderSettings.GetIntShaderValues()) {
-            if (value && value->id == id) return value->current.i;
+    const auto findWaterInt = [](std::string_view id, int fallback) -> int {
+        static std::unordered_map<std::string_view, const ShaderValue*> cache;
+        const ShaderValue*& slot = cache[id];
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetIntShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
         }
-        return fallback;
+        return slot ? slot->current.i : fallback;
     };
     struct WaterWaveState
     {
@@ -794,6 +807,13 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.time     = totalTime;
     g_customBufferData.delta    = deltaTime;
     g_customBufferData.dayCycle = timeOfDay / 24.0f;
+    // Viewmodel-DOF weapon-animation blend (schedules a main-thread OAR clip query
+    // and smooths the result). ~0.12s blend keeps the transition snappy but not
+    // instant. The DOF shader decides whether to apply it (vu_ViewmodelDOFAnimSuppress).
+    g_customBufferData.g_ViewmodelDOF.x = ViewmodelDOFAnim::Update(deltaTime, 0.12f);
+    g_customBufferData.g_ViewmodelDOF.y = 0.0f;
+    g_customBufferData.g_ViewmodelDOF.z = 0.0f;
+    g_customBufferData.g_ViewmodelDOF.w = 0.0f;
     g_customBufferData.frame    = static_cast<float>(frameCounter++);
     g_customBufferData.fps      = smoothedFPS;
     g_customBufferData.resX     = resX;

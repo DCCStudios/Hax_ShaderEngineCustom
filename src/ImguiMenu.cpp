@@ -620,6 +620,11 @@ void UIDrawShaderSettingsOverlay() {
     if (ImGui::SmallButton("Clear##settingsFilter")) {
         settingsFilter.Clear();
     }
+    ImGui::Separator();
+    // Everything below scrolls inside this child so the header buttons and the
+    // search bar above stay pinned to the top of the window as the settings
+    // list is scrolled. ImVec2(0, 0) fills the remaining window height.
+    ImGui::BeginChild("##settingsBody", ImVec2(0.0f, 0.0f), false);
     const bool settingsFilterActive = settingsFilter.IsActive();
     auto valueMatchesFilter = [&](const ShaderValue& v) {
         return settingsFilter.PassFilter(v.label.c_str()) ||
@@ -744,6 +749,22 @@ void UIDrawShaderSettingsOverlay() {
         if (rowDisabled) ImGui::EndDisabled();
         ImGui::PopID();
     };
+    // Right-click "Collapse group" / "Collapse all" support. A right-click on a
+    // parent header writes a request into the persistent flags; the next frame
+    // snapshots them (clearing the persistent copy so the force-close lasts
+    // exactly one frame and the header can be reopened afterwards) and passes
+    // SetNextItemOpen(false) to the matching headers. Suppressed while a search
+    // filter is active, which force-opens everything instead.
+    static std::string s_collapseGroupPersist;
+    static std::string s_collapseChildPersist;
+    static bool s_collapseAllPersist = false;
+    const std::string collapseGroupThisFrame = s_collapseGroupPersist;
+    const std::string collapseChildThisFrame = s_collapseChildPersist;
+    const bool collapseAllThisFrame = s_collapseAllPersist;
+    s_collapseGroupPersist.clear();
+    s_collapseChildPersist.clear();
+    s_collapseAllPersist = false;
+
     // Nested group renderer: a group named "Parent:Child" renders as a child
     // header INSIDE the "Parent" header (e.g. every "Water:..." group becomes a
     // subgroup of one Water section). Groups without a colon render flat as
@@ -789,8 +810,25 @@ void UIDrawShaderSettingsOverlay() {
                 }
             }
             if (settingsFilterActive && shownCount == 0) continue;
-            if (settingsFilterActive) ImGui::SetNextItemOpen(true);
-            if (!ImGui::CollapsingHeader(parent.c_str())) continue;
+            // A search filter hides non-matching groups but does NOT force
+            // matching groups open - the user expands them by hand.
+            if (collapseAllThisFrame ||
+                (!collapseGroupThisFrame.empty() &&
+                 collapseGroupThisFrame == parent)) {
+                ImGui::SetNextItemOpen(false);
+            }
+            const bool parentOpen = ImGui::CollapsingHeader(parent.c_str());
+            // Right-click a group header for collapse actions.
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem("Collapse group")) {
+                    s_collapseGroupPersist = parent;
+                }
+                if (ImGui::MenuItem("Collapse all")) {
+                    s_collapseAllPersist = true;
+                }
+                ImGui::EndPopup();
+            }
+            if (!parentOpen) continue;
             ImGui::PushID(parent.c_str());
             if (ImGui::SmallButton("Reset group")) {
                 for (auto& ckv : pkv.second) {
@@ -808,9 +846,26 @@ void UIDrawShaderSettingsOverlay() {
             }
             for (auto& ckv : shownTree) {
                 if (ckv.first.empty()) continue;
-                if (settingsFilterActive) ImGui::SetNextItemOpen(true);
+                // Unique key so "Collapse group" on a child closes only that
+                // child (children share the parent's ImGui ID scope).
+                const std::string childKey = parent + '\x1f' + ckv.first;
+                // Filter does not auto-expand a matching child either.
+                if (collapseAllThisFrame ||
+                    collapseChildThisFrame == childKey) {
+                    ImGui::SetNextItemOpen(false);
+                }
                 ImGui::Indent();
-                if (ImGui::CollapsingHeader(ckv.first.c_str())) {
+                const bool childOpen = ImGui::CollapsingHeader(ckv.first.c_str());
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Collapse group")) {
+                        s_collapseChildPersist = childKey;
+                    }
+                    if (ImGui::MenuItem("Collapse all")) {
+                        s_collapseAllPersist = true;
+                    }
+                    ImGui::EndPopup();
+                }
+                if (childOpen) {
                     ImGui::PushID(ckv.first.c_str());
                     if (ImGui::SmallButton("Reset group")) {
                         for (auto* sValue : pkv.second[ckv.first]) {
@@ -829,7 +884,6 @@ void UIDrawShaderSettingsOverlay() {
     };
 
     // Collapsing header for global shader settings
-    if (settingsFilterActive) ImGui::SetNextItemOpen(true);
     if (ImGui::CollapsingHeader("Global Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SmallButton("Reset global")) {
             for (auto* sValue : g_shaderSettings.GetGlobalShaderValues()) {
@@ -845,7 +899,6 @@ void UIDrawShaderSettingsOverlay() {
         renderGroupedTree(globalEntries);
     }
     // Collapsing header for active shader definitions and their settings
-    if (settingsFilterActive) ImGui::SetNextItemOpen(true);
     if (ImGui::CollapsingHeader("Shader Settings", ImGuiTreeNodeFlags_DefaultOpen))
     {
         // Group local values by explicit Values.ini group, then folder/module.
@@ -879,6 +932,7 @@ void UIDrawShaderSettingsOverlay() {
         }
         ImGui::EndPopup();
     }
+    ImGui::EndChild();  // ##settingsBody (pinned header above)
     ImGui::End();
 }
 

@@ -219,49 +219,60 @@ namespace ShaderCache {
 // the CustomPass::FileWatcher design and avoids cross-thread Release on
 // shader objects that the immediate context may currently have bound — which
 // previously caused hard freezes on Shader.ini hot reload.
+class HlslFileWatcher;
+
+// One shared 1-second poller for EVERY HlslFileWatcher, instead of one polling
+// thread per shader definition (~128 threads, one filesystem stat each per
+// second, plus a sequential thread-join per watcher on every hot reload - the
+// old model's documented "10s+ reload stalls"). Watchers register/deregister a
+// pointer to their reload flag; the single poll thread stats all registered
+// files under one lock. Deregister is a vector erase, so reload teardown no
+// longer joins threads at all. A leaked singleton (never destructed) with a
+// detached thread sidesteps static-destruction-order issues at process exit.
+class HlslFileWatchPoller {
+public:
+    static HlslFileWatchPoller& Instance();
+    // path/flag point into the owning HlslFileWatcher, whose address is stable
+    // (held by unique_ptr) and which deregisters in its destructor before those
+    // members die, so the poll thread never touches freed memory.
+    void Register(const std::filesystem::path* path,
+                  std::atomic<bool>* reloadFlag);
+    void Deregister(std::atomic<bool>* reloadFlag);
+private:
+    struct Entry {
+        const std::filesystem::path* path = nullptr;
+        std::filesystem::file_time_type lastWrite{};
+        std::atomic<bool>* flag = nullptr;
+    };
+    void EnsureThreadStarted();
+    std::mutex mutex_;
+    std::vector<Entry> entries_;
+    std::atomic<bool> threadStarted_{ false };
+};
+
 class HlslFileWatcher {
 private:
     std::filesystem::path filePath;
-    std::filesystem::file_time_type lastWriteTime;
     std::atomic<bool> reloadRequested{ false };
-    std::atomic<bool> running{false};
-    std::thread watcherThread;
-    // Used so Stop() can interrupt the worker's 1s poll immediately instead
-    // of waiting up to a full second for the sleep to expire. Reload tears
-    // down every watcher sequentially, so the cumulative blocking time on a
-    // Shader.ini save scaled with watcher count (10s+ stalls were typical).
-    std::mutex stopMutex;
-    std::condition_variable stopCv;
+    std::atomic<bool> registered{ false };
 public:
     HlslFileWatcher(std::filesystem::path path)
         : filePath(std::move(path)) {
-        if (std::filesystem::exists(filePath)) {
-            lastWriteTime = std::filesystem::last_write_time(filePath);
-        }
     }
     ~HlslFileWatcher() {
         Stop();
     }
+    // Register with the shared poller (was: spawn a dedicated polling thread).
     void Start() {
-        running = true;
-        watcherThread = std::thread([this]() {
-            std::unique_lock lock(stopMutex);
-            while (running) {
-                lock.unlock();
-                Check();
-                lock.lock();
-                stopCv.wait_for(lock, std::chrono::seconds(1), [this]{ return !running; });
-            }
-        });
-    }
-    void Stop() {
-        {
-            std::lock_guard lock(stopMutex);
-            running = false;
+        if (!registered.exchange(true)) {
+            HlslFileWatchPoller::Instance().Register(&filePath, &reloadRequested);
         }
-        stopCv.notify_all();
-        if (watcherThread.joinable()) {
-            watcherThread.join();
+    }
+    // Deregister from the shared poller (was: join the dedicated thread). Must
+    // run before filePath/reloadRequested are destroyed - the destructor does.
+    void Stop() {
+        if (registered.exchange(false)) {
+            HlslFileWatchPoller::Instance().Deregister(&reloadRequested);
         }
     }
     // Returns true exactly once per disk-change event; the render thread uses
@@ -272,19 +283,7 @@ public:
     void RequestReload() {
         reloadRequested.store(true, std::memory_order_release);
     }
-    void Check() {
-        try {
-            if (!std::filesystem::exists(filePath)) return;
-            auto currentTime = std::filesystem::last_write_time(filePath);
-            if (currentTime != lastWriteTime) {
-                lastWriteTime = currentTime;
-                reloadRequested.store(true, std::memory_order_release);
-                REX::INFO("HlslFileWatcher: Shader file '{}' changed, marked for reload", filePath.string());
-            }
-        } catch (...) {
-            // Ignore errors during check
-        }
-    }
+    // The per-file stat now lives in HlslFileWatchPoller (shared thread).
 };
 // Shader.ini file watcher class to monitor shader files for changes and trigger recompile
 class ShaderIniFileWatcher {

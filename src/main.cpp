@@ -13,6 +13,7 @@
 #include <ShadowUpgrade.h>
 #include <ShaderResources.h>
 #include <LightSorter.h>
+#include "ViewmodelDOFAnim.h"
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -1702,6 +1703,8 @@ void F4SEMessageHandler(F4SE::MessagingInterface::Message *a_message) {
             } else {
                 REX::WARN("Failed to install GFX hooks on kMessage_GameDataReady.");
             }
+            // Viewmodel-DOF weapon-animation hooks (event sink + SetupSpecialIdle).
+            ViewmodelDOFAnim::Install();
             break;
         case F4SE::MessagingInterface::kPostLoadGame:
             REX::INFO("Received kMessage_PostLoadGame. A save game has been loaded.");

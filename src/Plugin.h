@@ -170,8 +170,15 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_WorldSH_R;
     DirectX::XMFLOAT4 g_WorldSH_G;
     DirectX::XMFLOAT4 g_WorldSH_B;
+
+    // Viewmodel DOF runtime state. Appended at the end to preserve every
+    // pre-existing structured-buffer offset. .x = weapon-animation DOF blend
+    // (1 = full DOF, 0 = suppressed while a discrete first-person animation
+    // plays), smoothed on the CPU and consumed by visualViewmodelDOF.hlsl.
+    // yzw reserved for future viewmodel-DOF runtime signals.
+    DirectX::XMFLOAT4 g_ViewmodelDOF;
 };
-static_assert(sizeof(GFXBoosterAccessData) == 848,
+static_assert(sizeof(GFXBoosterAccessData) == 864,
     "GFXBoosterAccessData is a fixed CPU/HLSL structured-buffer ABI");
 
 struct alignas(16) DrawTagData
