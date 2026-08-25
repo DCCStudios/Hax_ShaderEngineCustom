@@ -279,6 +279,7 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_WorldSH_G; // world-space L1 ambient cube for G
 ;    float4   GFXInjected[0].g_WorldSH_B; // world-space L1 ambient cube for B
 ;    float4   GFXInjected[0].g_ViewmodelDOF; // .x = viewmodel-DOF anim blend (1 full, 0 suppressed); yzw reserved
+;    float4   GFXInjected[0].g_WaterPlanes; // .x = height of the water IN VIEW (grid scan; -1e9 none); yzw reserved
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -523,6 +524,12 @@ std::string GetCommonShaderHeaderHLSLTop()
             //      a discrete first-person animation (reload/inspect/equip/...) plays.
             //      Smoothed on the CPU; consumed by visualViewmodelDOF.hlsl. yzw reserved.
             float4 g_ViewmodelDOF;
+
+            // Water planes (appended). .x = height of the water IN VIEW (grid
+            // scan, highest at/below camera; -1e9 sentinel). Consumed by the
+            // underwater-bed mask pass only; g_WaterHeight keeps its original
+            // player-cell semantics for the water surface shaders. yzw reserved.
+            float4 g_WaterPlanes;
 
         };
 

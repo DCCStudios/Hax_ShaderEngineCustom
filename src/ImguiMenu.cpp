@@ -1332,6 +1332,9 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderInt("outgoingWeatherClass", data.outgoingWeatherClass, previousData.outgoingWeatherClass);
             renderFloat("inInterior", data.inInterior, previousData.inInterior, 0.5f);
             renderFloat("inCombat", data.inCombat, previousData.inCombat, 0.5f);
+            renderFloat("waterHeight", data.waterHeight, previousData.waterHeight, 1.0f);
+            renderFloat("viewWaterHeight", data.g_WaterPlanes.x, previousData.g_WaterPlanes.x, 1.0f);
+            renderFloat("cameraUnderwater", data.cameraUnderwater, previousData.cameraUnderwater, 0.5f);
             endColumns();
         }
     }

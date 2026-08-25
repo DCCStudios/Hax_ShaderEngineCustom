@@ -1163,8 +1163,53 @@ void UpdateCustomBuffer_Internal() {
                 }
             }
         }
+        // g_WaterHeight keeps its ORIGINAL player-cell semantics: the water
+        // surface shaders' shore feather / vertical-depth math is calibrated
+        // to it and visibly broke when its meaning changed. The height of the
+        // water IN VIEW (needed by the underwater-bed mask so tonemap-time
+        // composites stop shading the bed through water seen from a cell with
+        // no/wrong water record) is published SEPARATELY in g_WaterPlanes.x:
+        // the highest loaded cell water plane at/below the camera.
+        float viewWaterHeight = -1e9f;
+        {
+            const float cameraZ = camState.currentPosAdjust.z;
+            if (waterHeight > -1e8f && waterHeight <= cameraZ) {
+                viewWaterHeight = waterHeight;
+            }
+            if (auto* tes = RE::TES::GetSingleton(); tes && tes->gridCells) {
+                auto* grid = tes->gridCells;
+                const std::uint32_t dim = grid->dimension;
+                float lowestAny = 1e9f;
+                for (std::uint32_t gy = 0; gy < dim; ++gy) {
+                    for (std::uint32_t gx = 0; gx < dim; ++gx) {
+                        RE::GridCell* gridCell = grid->Get(gx, gy);
+                        RE::TESObjectCELL* cell =
+                            gridCell ? gridCell->cell : nullptr;
+                        if (!cell) {
+                            continue;
+                        }
+                        const float h = cell->waterHeight;
+                        if (!(std::isfinite(h) && h > -1e8f && h < 1e8f)) {
+                            continue;
+                        }
+                        if (h <= cameraZ && h > viewWaterHeight) {
+                            viewWaterHeight = h;
+                        }
+                        if (h < lowestAny) {
+                            lowestAny = h;
+                        }
+                    }
+                }
+                // Camera below every candidate (e.g. submerged): lowest plane.
+                if (viewWaterHeight < -1e8f && lowestAny < 1e8f) {
+                    viewWaterHeight = lowestAny;
+                }
+            }
+        }
         g_customBufferData.waterHeight = waterHeight;
         g_customBufferData.cameraUnderwater = cameraUnderwater;
+        g_customBufferData.g_WaterPlanes =
+            DirectX::XMFLOAT4(viewWaterHeight, 0.0f, 0.0f, 0.0f);
     }
     if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->cameraRoot) {
         const auto* cameraNode = playerCamera->cameraRoot.get();

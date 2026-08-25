@@ -177,8 +177,18 @@ struct alignas(16) GFXBoosterAccessData
     // plays), smoothed on the CPU and consumed by visualViewmodelDOF.hlsl.
     // yzw reserved for future viewmodel-DOF runtime signals.
     DirectX::XMFLOAT4 g_ViewmodelDOF;
+
+    // Water planes (appended; ABI append-only). .x = the height of the water
+    // IN VIEW: the highest loaded cell water plane at/below the camera from a
+    // grid scan (sentinel -1e9 when none). Consumed ONLY by the underwater-bed
+    // mask pass, so the tonemap-time composites stop shading the bed through
+    // water seen from a cell with no/wrong water record (cliff-over-lake).
+    // g_WaterHeight itself keeps its ORIGINAL player-cell semantics - the
+    // water surface shaders' shore feather math is calibrated to it and broke
+    // when its meaning changed. yzw reserved.
+    DirectX::XMFLOAT4 g_WaterPlanes;
 };
-static_assert(sizeof(GFXBoosterAccessData) == 864,
+static_assert(sizeof(GFXBoosterAccessData) == 880,
     "GFXBoosterAccessData is a fixed CPU/HLSL structured-buffer ABI");
 
 struct alignas(16) DrawTagData
