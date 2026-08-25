@@ -7,6 +7,7 @@ set_version("0.2.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
+set_defaultmode("releasedbg")
 
 -- add common rules
 add_rules("mode.debug", "mode.releasedbg")
@@ -49,3 +50,12 @@ target("ShaderEngineCL")
     add_packages("imgui")
     add_syslinks("d3d11", "d3dcompiler", "dxgi", "windowscodecs", "ole32")
     set_pcxxheader("src/PCH.h")
+
+    after_build(function(target)
+        local plugins = path.join(os.projectdir(), "Compile", "F4SE", "Plugins")
+        os.mkdir(plugins)
+        os.cp(target:targetfile(), plugins)
+        if os.isfile(target:symbolfile()) then
+            os.cp(target:symbolfile(), plugins)
+        end
+    end)

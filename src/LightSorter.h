@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 // LightSorter — stable-partitions the point-light array on
@@ -50,6 +51,23 @@ void OnEnter();
 // sees the unmodified array. No-op when mode == Off OR when OnEnter didn't sort
 // (e.g. ShadowSceneNode pointer was null, or array was empty).
 void OnExit();
+
+// Returns true when the light is present in the engine's dedicated
+// shadow-light array. Callers use this to avoid applying approximate
+// visibility to lights that already own a Bethesda shadow map.
+bool IsShadowMappedLight(const void* light) noexcept;
+
+// Diagnostic count from the same validated engine array used by
+// IsShadowMappedLight. Zero is also returned when the array is unavailable.
+std::uint32_t GetShadowLightCount() noexcept;
+
+// Copies the current validated engine shadow-light pointers into caller-owned
+// storage. This lets bridge records captured through a different render path
+// be correlated by their stable light properties instead of pointer identity.
+// Returns the number copied, capped by capacity.
+std::size_t CopyShadowLightPointers(
+    void** destination,
+    std::size_t capacity) noexcept;
 
 void Initialize();
 

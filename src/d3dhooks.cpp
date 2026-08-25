@@ -13,6 +13,8 @@
 #include <ShaderPipeline.h>
 #include <ShaderResources.h>
 #include <ShadowTelemetry.h>
+#include <WaterTessellation.h>
+#include "ViewmodelDOFAnim.h"
 
 extern HWND g_outputWindow;
 extern std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader;
@@ -24,6 +26,11 @@ namespace D3D11Hooks
     Present_t OriginalPresent = nullptr;
     PSSetShaderResources_t OriginalPSSetShaderResources = nullptr;
     OMSetRenderTargets_t OriginalOMSetRenderTargets = nullptr;
+    OMSetRenderTargetsAndUnorderedAccessViews_t
+        OriginalOMSetRenderTargetsAndUnorderedAccessViews = nullptr;
+    CopySubresourceRegion_t OriginalCopySubresourceRegion = nullptr;
+    CopyResource_t OriginalCopyResource = nullptr;
+    ResolveSubresource_t OriginalResolveSubresource = nullptr;
     ClearDepthStencilView_t OriginalClearDepthStencilView = nullptr;
     DrawIndexed_t OriginalDrawIndexed = nullptr;
     Draw_t OriginalDraw = nullptr;
@@ -53,6 +60,32 @@ RE::Sky* g_sky = nullptr;
 static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
 static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
 static std::atomic_bool g_customBufferRefreshedBeforePresent{ false };
+// DEVELOPMENT-only proof for the water displacement prototype. Matching and
+// compiling an O5 object does not prove that the visible water draw used it.
+// VSSetShader marks the replacement active; the draw hook only reports success
+// when the simultaneously bound pixel shader is one of the water family.
+static std::atomic_bool g_waterO5ReplacementActive{ false };
+static std::atomic_bool g_waterO5DrawLogged{ false };
+static ShaderDefinition* g_waterO5ActiveDefinition = nullptr;
+// Track both sides of the VS hook. The original pointer identifies the engine
+// permutation in ShaderDB; the selected pointer proves what our hook passed to
+// D3D11. The draw diagnostic also queries the context to prove what remained
+// bound when a recognized visible-water pixel shader actually drew.
+static std::atomic<REX::W32::ID3D11VertexShader*> g_currentOriginalVertexShader{ nullptr };
+static std::atomic<REX::W32::ID3D11VertexShader*> g_currentSelectedVertexShader{ nullptr };
+static std::atomic<REX::W32::ID3D11PixelShader*> g_currentSelectedPixelShader{ nullptr };
+static thread_local bool g_restoreWaterPSAfterCube = false;
+static thread_local bool g_restoreWaterVSAfterCube = false;
+
+REX::W32::ID3D11VertexShader* GetCurrentOriginalVertexShader_Internal()
+{
+    return g_currentOriginalVertexShader.load(std::memory_order_acquire);
+}
+
+REX::W32::ID3D11VertexShader* GetCurrentSelectedVertexShader_Internal()
+{
+    return g_currentSelectedVertexShader.load(std::memory_order_acquire);
+}
 
 namespace
 {
@@ -318,26 +351,82 @@ static const RE::NiAVObject* GetPlayerCameraRoot()
     return playerCamera->cameraRoot.get();
 }
 
+// A cached camera is a plausible MAIN-SCENE camera only if its projection's
+// vertical FOV is in gameplay range. The cache also holds render-to-texture
+// cameras - live forensics (2026-08-16) captured MagnaScope's scope camera
+// at 24 degrees and the viewmodel at 54.5 alongside the 72.5-degree world
+// camera - and selecting one of those hands every injected camera quantity
+// (reconstruction matrices, position adjust, underwater flag) to the wrong
+// view. That misselection, flipping with cache order as RTT cameras spawn
+// (e.g. wading into water), was the root cause of the "warped
+// reconstruction" saga: the matrix algebra itself was verified exact
+// (|view*proj - VP| = 0).
+static bool CameraStatePlausibleForScene(const RE::BSGraphics::CameraStateData& cachedCamera)
+{
+    const float m11 = DirectX::XMVectorGetY(cachedCamera.camViewData.projMat[1]);
+    if (std::fabs(m11) < 1e-4f) {
+        return false;
+    }
+    const float fovDeg = 2.0f * std::atan(1.0f / std::fabs(m11)) * 57.29578f;
+    // Wider than the 54.5-degree viewmodel, narrower than fisheye garbage.
+    // Gameplay world FOV in this setup reads 72.5; users run 70-120.
+    return fovDeg > 58.0f && fovDeg < 140.0f;
+}
+
+// SAFETY CONTRACT (crash 2026-08-17, ADS with MagnaScope): entries in
+// cameraDataCache can reference cameras that are being created or destroyed
+// - the old hierarchy fallback (IsNodeInHierarchy over referenceCamera)
+// dereferenced a dangling pointer the moment the plausibility filter made
+// that path reachable. Selection therefore uses ONLY pointer equality and
+// the entry's inline matrix data; cached referenceCamera pointers are never
+// dereferenced.
 static const RE::BSGraphics::CameraStateData* SelectGameplayCameraState(const RE::BSGraphics::State& gfxState)
 {
+    // m11 of the last confirmed world-camera projection. Lets the fallback
+    // recognize "the same camera's data under a different/expired reference"
+    // purely from inline data while the world pointer is unavailable.
+    static float s_lastWorldM11 = 0.0f;
+
     const auto* worldCamera = RE::Main::WorldRootCamera();
+    const RE::BSGraphics::CameraStateData* worldMatch = nullptr;
     if (worldCamera) {
         for (const auto& cachedCamera : gfxState.cameraDataCache) {
             if (cachedCamera.referenceCamera == worldCamera) {
-                return std::addressof(cachedCamera);
+                if (CameraStatePlausibleForScene(cachedCamera)) {
+                    s_lastWorldM11 = std::fabs(DirectX::XMVectorGetY(
+                        cachedCamera.camViewData.projMat[1]));
+                    return std::addressof(cachedCamera);
+                }
+                if (!worldMatch) worldMatch = std::addressof(cachedCamera);
             }
         }
     }
 
-    const auto* playerCameraRoot = GetPlayerCameraRoot();
-    if (playerCameraRoot) {
-        for (const auto& cachedCamera : gfxState.cameraDataCache) {
-            if (cachedCamera.referenceCamera && IsNodeInHierarchy(cachedCamera.referenceCamera, playerCameraRoot)) {
-                return std::addressof(cachedCamera);
-            }
+    // Fallback: among plausible entries (inline data only), prefer the one
+    // whose projection is closest to the last confirmed world camera.
+    const RE::BSGraphics::CameraStateData* best = nullptr;
+    float bestDiff = 1e9f;
+    for (const auto& cachedCamera : gfxState.cameraDataCache) {
+        if (!CameraStatePlausibleForScene(cachedCamera)) continue;
+        const float m11 = std::fabs(DirectX::XMVectorGetY(
+            cachedCamera.camViewData.projMat[1]));
+        const float diff = s_lastWorldM11 > 0.0f
+            ? std::fabs(m11 - s_lastWorldM11)
+            : 0.0f;
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = std::addressof(cachedCamera);
         }
     }
+    if (best) {
+        return best;
+    }
 
+    // Nothing plausible anywhere: keep the old preference order rather than
+    // inventing one (menus/loading legitimately have odd cameras).
+    if (worldMatch) {
+        return worldMatch;
+    }
     return std::addressof(gfxState.cameraState);
 }
 struct SHRows
@@ -407,6 +496,83 @@ void UpdateCustomBuffer_Internal() {
     lastFrameTime = currentTime;
     // Calculate total elapsed time
     float totalTime = static_cast<float>(currentTime.QuadPart - startTime.QuadPart) / static_cast<float>(frequency.QuadPart);
+
+    // Physical Water owns a persistent phase clock and a source parameter bank.
+    // Integrating speed per frame avoids retroactively multiplying all historic
+    // phase by a newly selected speed. Parameter changes cross-fade from the
+    // currently visible bank, so presets and sliders cannot reset the surface.
+    // Cached-pointer lookups: Values.ini is parsed only at startup, so the
+    // resolved ShaderValue* is stable for the process. The static map keeps this
+    // per-frame water-bank read O(1) after the first resolve instead of a linear
+    // scan of ~560 floats per call. Keys are string literals (stable storage).
+    const auto findWaterFloat = [](std::string_view id, float fallback) -> float {
+        static std::unordered_map<std::string_view, const ShaderValue*> cache;
+        const ShaderValue*& slot = cache[id];
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetFloatShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
+        }
+        return slot ? slot->current.f : fallback;
+    };
+    const auto findWaterInt = [](std::string_view id, int fallback) -> int {
+        static std::unordered_map<std::string_view, const ShaderValue*> cache;
+        const ShaderValue*& slot = cache[id];
+        if (!slot) {
+            for (const auto* v : g_shaderSettings.GetIntShaderValues()) {
+                if (v && v->id == id) { slot = v; break; }
+            }
+        }
+        return slot ? slot->current.i : fallback;
+    };
+    struct WaterWaveState
+    {
+        double phase = 0.0;
+        DirectX::XMFLOAT4 source{};
+        DirectX::XMFLOAT4 target{};
+        float blend = 1.0f;
+        bool initialized = false;
+    };
+    static WaterWaveState waterWaves{};
+    const DirectX::XMFLOAT4 requestedWaterBank{
+        std::clamp(findWaterFloat("vu_WaterDisplacementAmplitude", 2.0f), 0.0f, 48.0f),
+        (std::max)(findWaterFloat("vu_WaterDisplacementWavelength", 420.0f), 32.0f),
+        std::clamp(findWaterFloat("vu_WaterDisplacementChoppiness", 0.0f), 0.0f, 0.85f),
+        static_cast<float>(std::clamp(findWaterInt("vu_WaterBodyPreset", 0), 0, 2))
+    };
+    if (!waterWaves.initialized) {
+        waterWaves.source = requestedWaterBank;
+        waterWaves.target = requestedWaterBank;
+        waterWaves.initialized = true;
+    }
+    const auto bankChanged = [](const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b) {
+        return std::abs(a.x - b.x) > 1.0e-4f ||
+            std::abs(a.y - b.y) > 1.0e-3f ||
+            std::abs(a.z - b.z) > 1.0e-4f ||
+            std::abs(a.w - b.w) > 0.25f;
+    };
+    const auto lerpBank = [](const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b, float t) {
+        return DirectX::XMFLOAT4{
+            std::lerp(a.x, b.x, t), std::lerp(a.y, b.y, t),
+            std::lerp(a.z, b.z, t), t < 0.5f ? a.w : b.w
+        };
+    };
+    if (bankChanged(requestedWaterBank, waterWaves.target)) {
+        waterWaves.source = lerpBank(waterWaves.source, waterWaves.target, waterWaves.blend);
+        waterWaves.target = requestedWaterBank;
+        waterWaves.blend = 0.0f;
+    }
+    const float safeWaterDelta = std::clamp(deltaTime, 0.0f, 0.1f);
+    waterWaves.phase += static_cast<double>(safeWaterDelta) *
+        std::clamp(findWaterFloat("vu_WaterDisplacementSpeed", 0.35f), 0.0f, 4.0f);
+    waterWaves.blend = (std::min)(waterWaves.blend + safeWaterDelta / 2.5f, 1.0f);
+    constexpr double kWaterPhaseBlockSize = 4096.0;
+    const double waterPhaseBlock = std::floor(waterWaves.phase / kWaterPhaseBlockSize);
+    g_customBufferData.waterPhaseBlock = static_cast<float>(waterPhaseBlock);
+    g_customBufferData.waterPhaseRemainder = static_cast<float>(
+        waterWaves.phase - waterPhaseBlock * kWaterPhaseBlockSize);
+    g_customBufferData.g_WaterState0 = waterWaves.source;
+    g_customBufferData.g_WaterTransition = 2.0f + waterWaves.blend;
     // Calculate Instant FPS
     // We use a small epsilon (0.0001) to prevent any potential division by zero
     float instantFPS = (deltaTime > 0.0001f) ? (1.0f / deltaTime) : 0.0f;
@@ -507,6 +673,66 @@ void UpdateCustomBuffer_Internal() {
     // Use the game-provided view-projection matrix directly.
     auto& VPM = camView.viewProjMat;
     DirectX::XMMATRIX viewProj = DirectX::XMMATRIX(VPM[0], VPM[1], VPM[2], VPM[3]);
+    // Camera-matrix forensics. The injected reconstruction was proven
+    // ABSOLUTELY warped in game (2026-08-16: world-Z contours bend with
+    // camera pitch - only absolute consumers like the water-caustics plane
+    // test ever noticed; every local/round-trip consumer is insensitive).
+    // This block self-reports the facts needed to root-cause it from a
+    // normal play session's log, no in-game testing required:
+    //  - the SELECTED camera's projection m00/m11 and the vertical FOV they
+    //    imply (a viewmodel-FOV projection here would explain the warp),
+    //  - whether view*proj or proj*view reproduces the game's own
+    //    viewProjMat (multiplication-convention ground truth),
+    //  - every cameraDataCache entry's implied FOV, and which was selected.
+    // Re-fires only when the selected FOV changes by > 0.5 degrees.
+    {
+        const float m00 = DirectX::XMVectorGetX(PM[0]);
+        const float m11 = DirectX::XMVectorGetY(PM[1]);
+        const float fovDeg = (std::fabs(m11) > 1e-4f)
+            ? 2.0f * std::atan(1.0f / std::fabs(m11)) * 57.29578f
+            : 0.0f;
+        static float s_lastLoggedFov = -1000.0f;
+        if (std::fabs(fovDeg - s_lastLoggedFov) > 0.5f) {
+            s_lastLoggedFov = fovDeg;
+            auto residual = [](const DirectX::XMMATRIX& a,
+                               const DirectX::XMMATRIX& b) {
+                float worst = 0.0f;
+                for (int r = 0; r < 4; ++r) {
+                    DirectX::XMFLOAT4 fa, fb;
+                    DirectX::XMStoreFloat4(&fa, a.r[r]);
+                    DirectX::XMStoreFloat4(&fb, b.r[r]);
+                    worst = (std::max)({ worst,
+                        std::fabs(fa.x - fb.x), std::fabs(fa.y - fb.y),
+                        std::fabs(fa.z - fb.z), std::fabs(fa.w - fb.w) });
+                }
+                return worst;
+            };
+            const float dVP = residual(
+                DirectX::XMMatrixMultiply(view, proj), viewProj);
+            const float dPV = residual(
+                DirectX::XMMatrixMultiply(proj, view), viewProj);
+            REX::INFO(
+                "CameraForensics: selected proj m00={:.4f} m11={:.4f} "
+                "vFOV={:.1f}deg |view*proj-VP|={:.4f} |proj*view-VP|={:.4f}",
+                m00, m11, fovDeg, dVP, dPV);
+            int cacheIndex = 0;
+            for (const auto& cachedCamera : gfxState.cameraDataCache) {
+                const auto& cachedPM = cachedCamera.camViewData.projMat;
+                const float cm11 = DirectX::XMVectorGetY(cachedPM[1]);
+                const float cachedFov = (std::fabs(cm11) > 1e-4f)
+                    ? 2.0f * std::atan(1.0f / std::fabs(cm11)) * 57.29578f
+                    : 0.0f;
+                REX::INFO(
+                    "CameraForensics: cache[{}] refCam={} vFOV={:.1f}deg "
+                    "selected={}",
+                    cacheIndex,
+                    static_cast<const void*>(cachedCamera.referenceCamera),
+                    cachedFov,
+                    std::addressof(cachedCamera) == std::addressof(camState));
+                ++cacheIndex;
+            }
+        }
+    }
     // BSGraphics::ViewData+0x190 is the renderer-maintained previous
     // unjittered view-projection. It is paired with
     // CameraStateData::previousPosAdjust (+0x228). Live OG 1.10.163 memory
@@ -581,6 +807,13 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.time     = totalTime;
     g_customBufferData.delta    = deltaTime;
     g_customBufferData.dayCycle = timeOfDay / 24.0f;
+    // Viewmodel-DOF weapon-animation blend (schedules a main-thread OAR clip query
+    // and smooths the result). ~0.12s blend keeps the transition snappy but not
+    // instant. The DOF shader decides whether to apply it (vu_ViewmodelDOFAnimSuppress).
+    g_customBufferData.g_ViewmodelDOF.x = ViewmodelDOFAnim::Update(deltaTime, 0.12f);
+    g_customBufferData.g_ViewmodelDOF.y = 0.0f;
+    g_customBufferData.g_ViewmodelDOF.z = 0.0f;
+    g_customBufferData.g_ViewmodelDOF.w = 0.0f;
     g_customBufferData.frame    = static_cast<float>(frameCounter++);
     g_customBufferData.fps      = smoothedFPS;
     g_customBufferData.resX     = resX;
@@ -609,7 +842,6 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_SunDirY = sunDir.y;
     g_customBufferData.g_SunDirZ = sunDir.z;
     g_customBufferData.g_SunValid = sunValid;
-    g_customBufferData.g_SunPadding = 0.0f;
 
     auto Normalize3 = [](DirectX::XMFLOAT3 v) {
         const float lenSq = v.x * v.x + v.y * v.y + v.z * v.z;
@@ -685,6 +917,9 @@ void UpdateCustomBuffer_Internal() {
     DirectX::XMFLOAT4 shR(0.0f, 0.0f, 0.0f, 0.0f);
     DirectX::XMFLOAT4 shG(0.0f, 0.0f, 0.0f, 0.0f);
     DirectX::XMFLOAT4 shB(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShR(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShG(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 worldShB(0.0f, 0.0f, 0.0f, 0.0f);
     if (g_sky) {
         const auto& dac = g_sky->directionalAmbientColorsA;
 
@@ -705,10 +940,93 @@ void UpdateCustomBuffer_Internal() {
             dac[1][0].b, dac[1][1].b,
             dac[2][0].b, dac[2][1].b,
             skyToNormalBasis);
+
+        // Voxel and screen-space ray passes reconstruct world-space normals
+        // and directions. Publish the same blended ambient cube in its native
+        // world basis so those passes do not inherit camera rotation from the
+        // legacy deferred-light packing above.
+        constexpr float identityBasis[3][3] = {
+            { 1.0f, 0.0f, 0.0f },
+            { 0.0f, 1.0f, 0.0f },
+            { 0.0f, 0.0f, 1.0f },
+        };
+        worldShR = PackChannel(
+            dac[0][0].r, dac[0][1].r,
+            dac[1][0].r, dac[1][1].r,
+            dac[2][0].r, dac[2][1].r,
+            identityBasis);
+        worldShG = PackChannel(
+            dac[0][0].g, dac[0][1].g,
+            dac[1][0].g, dac[1][1].g,
+            dac[2][0].g, dac[2][1].g,
+            identityBasis);
+        worldShB = PackChannel(
+            dac[0][0].b, dac[0][1].b,
+            dac[1][0].b, dac[1][1].b,
+            dac[2][0].b, dac[2][1].b,
+            identityBasis);
     }
     g_customBufferData.g_SH_R = shR;
     g_customBufferData.g_SH_G = shG;
     g_customBufferData.g_SH_B = shB;
+    g_customBufferData.g_WorldSH_R = worldShR;
+    g_customBufferData.g_WorldSH_G = worldShG;
+    g_customBufferData.g_WorldSH_B = worldShB;
+
+    // Sun shadow cascade diagnostic.
+    //
+    // The transforms are captured but deliberately NOT published through
+    // GFXInjected: appending 13 float4s to that struct grew the shared
+    // structured-buffer stride enough to push FXC's loop-unroll heuristic
+    // over budget in visualDOFAutoFocus, which dropped the pass and blacked
+    // the frame. GFXInjected is read by every shader, so it is the wrong
+    // place for data one pass needs. Transport is moving to a dedicated
+    // buffer; this block stays as the capture health check.
+    {
+        ShadowTelemetry::DirectionalCascade cascades[ShadowTelemetry::kMaxPublishedCascades]{};
+        const std::uint32_t published =
+            ShadowTelemetry::SunCascadesLookValid()
+                ? ShadowTelemetry::GetDirectionalCascades(cascades, 3u)
+                : 0u;
+
+        // Time throttled rather than change gated. The cascades follow the
+        // camera, so the matrices change every frame while the live count
+        // stays at 3 - an earlier count-gated version logged once and then
+        // never again, which hid exactly the sun-angle comparison this dump
+        // exists to make.
+        static std::uint32_t s_lastLoggedCascadeCount = 0xFFFFFFFFu;
+        static std::chrono::steady_clock::time_point s_lastCascadeLog{};
+        const auto nowSteady = std::chrono::steady_clock::now();
+        const bool dueByTime =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                nowSteady - s_lastCascadeLog).count() >= 5;
+        if (published != s_lastLoggedCascadeCount || dueByTime) {
+            s_lastLoggedCascadeCount = published;
+            s_lastCascadeLog = nowSteady;
+            if (published > 0) {
+                REX::INFO("SunCascades: {} live, slots {}/{}/{}",
+                          published, cascades[0].mapSlot, cascades[1].mapSlot,
+                          cascades[2].mapSlot);
+                // Full matrices, once per state change. Row 3 is the decisive
+                // one: a row-major orthographic projection carries the
+                // translation there, so if row3.xyz is large and row3.w is 1
+                // the matrix is row-major and shaders want mul(float4(pos,1), M).
+                // If instead column 3 holds the translation, it is transposed.
+                for (std::uint32_t c = 0; c < published; ++c) {
+                    for (std::uint32_t r = 0; r < 4u; ++r) {
+                        const float* row = cascades[c].transform + r * 4u;
+                        REX::INFO(
+                            "  cascade{} row{} = [{: .6f} {: .6f} {: .6f} {: .6f}]",
+                            c, r, row[0], row[1], row[2], row[3]);
+                    }
+                }
+            } else {
+                REX::INFO(
+                    "SunCascades: none published (no directional shadow, or "
+                    "the transforms failed the validity check)");
+            }
+        }
+    }
     g_customBufferData.g_CurrentCameraPositionAdjust = {
         camState.currentPosAdjust.x,
         camState.currentPosAdjust.y,
@@ -802,7 +1120,6 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.random  = randomValue;
     g_customBufferData.inCombat = g_inCombat ? 1.0f : 0.0f;
     g_customBufferData.inInterior = g_inInterior ? 1.0f : 0.0f;
-    g_customBufferData._padding = 0.0f; // just in case, to avoid any potential uninitialized data issues in shaders
     DirectX::XMStoreFloat4(
         &g_customBufferData.g_PrevViewProjRow0,
         previousViewProj.r[0]);
@@ -828,9 +1145,72 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.skyMode = skyMode;
     g_customBufferData.currentWeatherClass = currentWeatherClass;
     g_customBufferData.outgoingWeatherClass = outgoingWeatherClass;
-    g_customBufferData.enbPadding0 = 0.0f;
-    g_customBufferData.enbPadding1 = 0.0f;
-    g_customBufferData.enbPadding2 = 0.0f;
+    // Water plane state for the underwater caustics pass. The cell reports
+    // FLT_MAX-family sentinels when it has no water, so validity is a range
+    // check on both sides. The camera's absolute position is the position
+    // adjust (BGS view matrices are rotation-only; skylighting relies on the
+    // same identity).
+    {
+        float waterHeight = -1e9f;
+        float cameraUnderwater = 0.0f;
+        if (g_player) {
+            if (auto* cell = g_player->GetParentCell()) {
+                const float h = cell->waterHeight;
+                if (std::isfinite(h) && h > -1e8f && h < 1e8f) {
+                    waterHeight = h;
+                    cameraUnderwater =
+                        camState.currentPosAdjust.z < h ? 1.0f : 0.0f;
+                }
+            }
+        }
+        // g_WaterHeight keeps its ORIGINAL player-cell semantics: the water
+        // surface shaders' shore feather / vertical-depth math is calibrated
+        // to it and visibly broke when its meaning changed. The height of the
+        // water IN VIEW (needed by the underwater-bed mask so tonemap-time
+        // composites stop shading the bed through water seen from a cell with
+        // no/wrong water record) is published SEPARATELY in g_WaterPlanes.x:
+        // the highest loaded cell water plane at/below the camera.
+        float viewWaterHeight = -1e9f;
+        {
+            const float cameraZ = camState.currentPosAdjust.z;
+            if (waterHeight > -1e8f && waterHeight <= cameraZ) {
+                viewWaterHeight = waterHeight;
+            }
+            if (auto* tes = RE::TES::GetSingleton(); tes && tes->gridCells) {
+                auto* grid = tes->gridCells;
+                const std::uint32_t dim = grid->dimension;
+                float lowestAny = 1e9f;
+                for (std::uint32_t gy = 0; gy < dim; ++gy) {
+                    for (std::uint32_t gx = 0; gx < dim; ++gx) {
+                        RE::GridCell* gridCell = grid->Get(gx, gy);
+                        RE::TESObjectCELL* cell =
+                            gridCell ? gridCell->cell : nullptr;
+                        if (!cell) {
+                            continue;
+                        }
+                        const float h = cell->waterHeight;
+                        if (!(std::isfinite(h) && h > -1e8f && h < 1e8f)) {
+                            continue;
+                        }
+                        if (h <= cameraZ && h > viewWaterHeight) {
+                            viewWaterHeight = h;
+                        }
+                        if (h < lowestAny) {
+                            lowestAny = h;
+                        }
+                    }
+                }
+                // Camera below every candidate (e.g. submerged): lowest plane.
+                if (viewWaterHeight < -1e8f && lowestAny < 1e8f) {
+                    viewWaterHeight = lowestAny;
+                }
+            }
+        }
+        g_customBufferData.waterHeight = waterHeight;
+        g_customBufferData.cameraUnderwater = cameraUnderwater;
+        g_customBufferData.g_WaterPlanes =
+            DirectX::XMFLOAT4(viewWaterHeight, 0.0f, 0.0f, 0.0f);
+    }
     if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->cameraRoot) {
         const auto* cameraNode = playerCamera->cameraRoot.get();
         StoreCameraTransform(cameraNode->local, g_customBufferData.cameraLocalRow0, g_customBufferData.cameraLocalRow1, g_customBufferData.cameraLocalRow2, g_customBufferData.cameraLocalRow3);
@@ -862,11 +1242,6 @@ void UpdateCustomBuffer_Internal() {
         g_customBufferData.g_FogDistances1 = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
         g_customBufferData.g_FogParams     = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
     }
-    // Per-weather blended fog color requires sampling currentWeather + lastWeather
-    // colorData[][] arrays at the current time-of-day and blending by
-    // currentWeatherPct. Left at zero for now -- shaders should treat (0,0,0,0)
-    // as "no engine-supplied color, use Values.ini knobs".
-    g_customBufferData.g_FogColor = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
     // Pack Values.ini shader settings into separate 16-byte elements to avoid the structured-buffer stride limit.
     ShaderResources::PackModularShaderValues(g_shaderSettings);
 
@@ -903,6 +1278,7 @@ void RefreshCustomBufferForCustomPass()
 
 void D3D11OnPresent_Internal()
 {
+    ShaderResources::EndWaterReflectionCubeFrame();
     g_d3dDrawCallsLastFrame.store(
         g_d3dDrawCallsThisFrame.exchange(0, std::memory_order_relaxed),
         std::memory_order_relaxed);
@@ -968,7 +1344,10 @@ bool D3D11ShouldSuppressClearDepthStencilView_Internal(
             context, depthStencilView, clearFlags, depth, stencil);
 }
 
-void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* source)
+void D3D11OnDraw_Internal(
+    REX::W32::ID3D11DeviceContext* context,
+    const char* source,
+    UINT elementCount)
 {
     if (g_customPassRendering) {
         return;
@@ -983,6 +1362,240 @@ void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* so
     // BindDrawTagForCurrentDraw(context);
     if (!SHADERENGINE_EFFECTS_ON) {
         return;
+    }
+    auto* pixelShader = g_currentOriginalPixelShader.load(std::memory_order_acquire);
+    auto* pixelDefinition = pixelShader
+        ? g_ShaderDB.GetMatchedDefinition(pixelShader)
+        : nullptr;
+    const bool waterPixel = pixelDefinition &&
+        (pixelDefinition->id == "visualWater" ||
+         pixelDefinition->id == "visualWaterMain2" ||
+         pixelDefinition->id == "visualWaterLOD");
+
+    // A cube face can become active without a fresh PS/VS bind. Enforce the
+    // engine water pair at draw time, then restore the selected replacements
+    // on the first main-view water draw after the latched cube scope ends.
+    if (waterPixel) {
+        const bool cubeCapture =
+            ShaderResources::WaterReflectionCubeCaptureActive();
+        auto* originalVS = g_currentOriginalVertexShader.load(
+            std::memory_order_acquire);
+        auto* vertexDefinition = originalVS
+            ? g_ShaderDB.GetMatchedDefinition(originalVS)
+            : nullptr;
+        const bool waterVertex = vertexDefinition &&
+            (vertexDefinition->id == "waterVertexDumpO5" ||
+             vertexDefinition->id == "waterVertexDumpO6");
+        if (cubeCapture) {
+            D3D11Hooks::OriginalPSSetShader(
+                context, pixelShader, nullptr, 0);
+            g_currentSelectedPixelShader.store(
+                pixelShader, std::memory_order_release);
+            g_restoreWaterPSAfterCube = true;
+            if (waterVertex) {
+                D3D11Hooks::OriginalVSSetShader(
+                    context, originalVS, nullptr, 0);
+                g_currentSelectedVertexShader.store(
+                    originalVS, std::memory_order_release);
+                g_restoreWaterVSAfterCube = true;
+            }
+            ShaderResources::SetActiveReplacementPixelShaderUsage(
+                nullptr, false);
+        } else if (g_restoreWaterPSAfterCube || g_restoreWaterVSAfterCube) {
+            auto* selectedPS = g_currentSelectedPixelShader.load(
+                std::memory_order_acquire);
+            auto* replacementPS =
+                g_ShaderDB.GetReplacementShader(pixelShader);
+            if (g_restoreWaterPSAfterCube && replacementPS) {
+                selectedPS = replacementPS;
+            }
+            if (g_restoreWaterPSAfterCube) {
+                D3D11Hooks::OriginalPSSetShader(
+                    context, selectedPS ? selectedPS : pixelShader, nullptr, 0);
+                g_currentSelectedPixelShader.store(
+                    selectedPS ? selectedPS : pixelShader,
+                    std::memory_order_release);
+            }
+            const bool usingReplacementPS =
+                replacementPS && selectedPS == replacementPS;
+            ShaderResources::SetActiveReplacementPixelShaderUsage(
+                usingReplacementPS ? pixelDefinition : nullptr,
+                usingReplacementPS);
+            if (usingReplacementPS) {
+                ShaderResources::BindInjectedPixelShaderResources(context);
+            }
+
+            if (g_restoreWaterVSAfterCube && waterVertex) {
+                auto* replacementVS =
+                    g_ShaderDB.GetReplacementShader(originalVS);
+                auto* selectedVS = replacementVS
+                    ? replacementVS
+                    : g_currentSelectedVertexShader.load(
+                        std::memory_order_acquire);
+                D3D11Hooks::OriginalVSSetShader(
+                    context, selectedVS ? selectedVS : originalVS, nullptr, 0);
+                g_currentSelectedVertexShader.store(
+                    selectedVS ? selectedVS : originalVS,
+                    std::memory_order_release);
+                if (replacementVS) {
+                    ShaderResources::BindInjectedVertexShaderResources(context);
+                    ShaderResources::BindReplacementSRVResources(
+                        context, vertexDefinition, false);
+                    ShaderResources::BindReplacementTextureResources(
+                        context, vertexDefinition, false);
+                    if (vertexDefinition->id == "waterVertexDumpO5") {
+                        g_waterO5ActiveDefinition = vertexDefinition;
+                        g_waterO5ReplacementActive.store(
+                            true, std::memory_order_release);
+                    }
+                }
+            }
+            g_restoreWaterPSAfterCube = false;
+            g_restoreWaterVSAfterCube = false;
+        }
+    }
+
+    if (DEVELOPMENT && waterPixel) {
+        // Bound the diagnostic work even if a scene never reaches 16 distinct
+        // permutations. The first 256 visible-water draws are enough to cover
+        // the lake's tiles and LOD transition without leaving a permanent
+        // VSGetShader call in every development frame.
+        static std::atomic_uint32_t diagnosticAttempts{ 0 };
+        const auto attempt = diagnosticAttempts.fetch_add(1, std::memory_order_relaxed);
+        if (attempt < 256) {
+            auto* originalVS = g_currentOriginalVertexShader.load(std::memory_order_acquire);
+            auto* selectedVS = g_currentSelectedVertexShader.load(std::memory_order_acquire);
+            REX::W32::ID3D11VertexShader* queriedVS = nullptr;
+            context->VSGetShader(&queriedVS, nullptr, nullptr);
+            REX::W32::D3D11_PRIMITIVE_TOPOLOGY topology{};
+            context->IAGetPrimitiveTopology(&topology);
+            REX::W32::ID3D11Buffer* vertexBuffer = nullptr;
+            UINT vertexStride = 0;
+            UINT vertexOffset = 0;
+            context->IAGetVertexBuffers(
+                0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
+            REX::W32::ID3D11Buffer* indexBuffer = nullptr;
+            REX::W32::DXGI_FORMAT indexFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
+            UINT indexOffset = 0;
+            context->IAGetIndexBuffer(&indexBuffer, &indexFormat, &indexOffset);
+            REX::W32::ID3D11HullShader* hullShader = nullptr;
+            REX::W32::ID3D11DomainShader* domainShader = nullptr;
+            context->HSGetShader(&hullShader, nullptr, nullptr);
+            context->DSGetShader(&domainShader, nullptr, nullptr);
+
+            struct WaterVertexBindKey {
+                REX::W32::ID3D11PixelShader* pixel = nullptr;
+                REX::W32::ID3D11VertexShader* original = nullptr;
+                REX::W32::ID3D11VertexShader* selected = nullptr;
+                REX::W32::ID3D11VertexShader* queried = nullptr;
+                REX::W32::D3D11_PRIMITIVE_TOPOLOGY topology{};
+
+                bool operator==(const WaterVertexBindKey&) const = default;
+            };
+            static std::mutex seenMutex;
+            static std::vector<WaterVertexBindKey> seen;
+            const WaterVertexBindKey key{
+                pixelShader, originalVS, selectedVS, queriedVS, topology
+            };
+            bool shouldLog = false;
+            {
+                std::scoped_lock lock(seenMutex);
+                if (seen.size() < 16 &&
+                    std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                    seen.push_back(key);
+                    shouldLog = true;
+                }
+            }
+
+            if (shouldLog) {
+                auto* vertexDefinition = originalVS
+                    ? g_ShaderDB.GetMatchedDefinition(originalVS)
+                    : nullptr;
+                auto* expectedReplacement = originalVS
+                    ? g_ShaderDB.GetReplacementShader(originalVS)
+                    : nullptr;
+                const auto vertexUID = originalVS
+                    ? g_ShaderDB.GetShaderUID(originalVS)
+                    : std::string{};
+                REX::INFO(
+                    "WaterVertexBindDiag: waterPS='{}' source={} originalVS={} "
+                    "uid='{}' definition='{}' expectedReplacement={} selectedVS={} "
+                    "queriedVS={} selectedIsReplacement={} queriedMatchesSelected={} "
+                    "elementCount={} topology={} vbStride={} vbOffset={} "
+                    "indexFormat={} indexOffset={} hs={} ds={}",
+                    pixelDefinition->id,
+                    source ? source : "unknown",
+                    static_cast<const void*>(originalVS),
+                    vertexUID.empty() ? "<untracked>" : vertexUID,
+                    vertexDefinition ? vertexDefinition->id : "<unmatched>",
+                    static_cast<const void*>(expectedReplacement),
+                    static_cast<const void*>(selectedVS),
+                    static_cast<const void*>(queriedVS),
+                    expectedReplacement && selectedVS == expectedReplacement,
+                    queriedVS == selectedVS,
+                    elementCount,
+                    static_cast<UINT>(topology),
+                    vertexStride,
+                    vertexOffset,
+                    static_cast<UINT>(indexFormat),
+                    indexOffset,
+                    static_cast<const void*>(hullShader),
+                    static_cast<const void*>(domainShader));
+            }
+            if (queriedVS) {
+                queriedVS->Release();
+            }
+            if (vertexBuffer) {
+                vertexBuffer->Release();
+            }
+            if (indexBuffer) {
+                indexBuffer->Release();
+            }
+            if (hullShader) {
+                hullShader->Release();
+            }
+            if (domainShader) {
+                domainShader->Release();
+            }
+        }
+    }
+
+    if (DEVELOPMENT &&
+        waterPixel &&
+        g_waterO5ReplacementActive.load(std::memory_order_acquire) &&
+        !g_waterO5DrawLogged.load(std::memory_order_acquire)) {
+        if (waterPixel && !g_waterO5DrawLogged.exchange(true, std::memory_order_acq_rel)) {
+            const auto findBool = [](std::string_view id, bool fallback) {
+                for (const auto* value : g_shaderSettings.GetBoolShaderValues()) {
+                    if (value && value->id == id) return value->current.b;
+                }
+                return fallback;
+            };
+            const auto findFloat = [](std::string_view id, float fallback) {
+                for (const auto* value : g_shaderSettings.GetFloatShaderValues()) {
+                    if (value && value->id == id) return value->current.f;
+                }
+                return fallback;
+            };
+            const auto* vertexDefinition = g_waterO5ActiveDefinition;
+            REX::INFO(
+                "WaterDisplacementDiag: O5 replacement reached '{}' draw via {}; "
+                "physical={} displacement={} amplitude={:.3f} wavelength={:.3f} "
+                "speed={:.3f} fadeNear={:.3f} fadeFar={:.3f} "
+                "usesInjected={} usesFloats={} usesBools={}",
+                pixelDefinition->id,
+                source ? source : "unknown",
+                findBool("vu_WaterPhysicalEnabled", false),
+                findBool("vu_WaterDisplacementEnabled", false),
+                findFloat("vu_WaterDisplacementAmplitude", -1.0f),
+                findFloat("vu_WaterDisplacementWavelength", -1.0f),
+                findFloat("vu_WaterDisplacementSpeed", -1.0f),
+                findFloat("vu_WaterDisplacementFadeNear", -1.0f),
+                findFloat("vu_WaterDisplacementFadeFar", -1.0f),
+                vertexDefinition ? vertexDefinition->usesGFXInjected : false,
+                vertexDefinition ? vertexDefinition->usesGFXModularFloats : false,
+                vertexDefinition ? vertexDefinition->usesGFXModularBools : false);
+        }
     }
     FireArmedCustomPassDrawBatch(context, source);
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
@@ -1650,6 +2263,18 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
             g_ShaderDB.SetEntryRecentlyUsed(pixelShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pixelShader);
             if (matchedDefinition &&
+                ShaderResources::WaterReflectionCubeCaptureActive() &&
+                (matchedDefinition->id == "visualWater" ||
+                 matchedDefinition->id == "visualWaterMain2" ||
+                 matchedDefinition->id == "visualWaterLOD")) {
+                // Cube-camera matrices cannot consume main-view SSR/depth
+                // snapshots. Retain the engine water shader during reflection
+                // face rendering and publish the replacement only in the main
+                // view after capture ends.
+                g_restoreWaterPSAfterCube = true;
+                return result;
+            }
+            if (matchedDefinition &&
                 matchedDefinition->shadowUpgrade &&
                 !SHADOW_UPGRADE_ON) {
                 return result;
@@ -1733,6 +2358,8 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
     if (g_customPassRendering) {
         return vertexShader;
     }
+    g_waterO5ReplacementActive.store(false, std::memory_order_release);
+    g_waterO5ActiveDefinition = nullptr;
     if (!SHADERENGINE_EFFECTS_ON) {
         return vertexShader;
     }
@@ -1741,6 +2368,13 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
         if (g_ShaderDB.IsEntryMatched(vertexShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(vertexShader, true);
             auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(vertexShader);
+            if (matchedDefinition &&
+                ShaderResources::WaterReflectionCubeCaptureActive() &&
+                (matchedDefinition->id == "waterVertexDumpO5" ||
+                 matchedDefinition->id == "waterVertexDumpO6")) {
+                g_restoreWaterVSAfterCube = true;
+                return vertexShader;
+            }
             // See PSSetShader for rationale: we evict cached compiled state
             // here, before reading the replacement, so the D3D11 Release runs
             // on the render thread.
@@ -1754,6 +2388,10 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                 ShaderResources::BindInjectedVertexShaderResources(context);
                 ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                 ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
+                if (matchedDefinition && matchedDefinition->id == "waterVertexDumpO5") {
+                    g_waterO5ActiveDefinition = matchedDefinition;
+                    g_waterO5ReplacementActive.store(true, std::memory_order_release);
+                }
             } else {
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING) {
@@ -1769,6 +2407,10 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                         ShaderResources::BindInjectedVertexShaderResources(context);
                         ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                         ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
+                        if (matchedDefinition->id == "waterVertexDumpO5") {
+                            g_waterO5ActiveDefinition = matchedDefinition;
+                            g_waterO5ReplacementActive.store(true, std::memory_order_release);
+                        }
                     } else {
                         REX::WARN("MyVSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true;
@@ -2042,8 +2684,81 @@ namespace
         REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
         REX::W32::ID3D11DepthStencilView* depthStencilView)
     {
+        ShaderResources::PrepareWaterReflectionCubeOM(
+            context, numViews, renderTargetViews);
         D3D11Hooks::OriginalOMSetRenderTargets(context, numViews, renderTargetViews, depthStencilView);
         D3D11OnOMSetRenderTargets_Internal(context, numViews, renderTargetViews, depthStencilView);
+    }
+
+    void STDMETHODCALLTYPE MyOMSetRenderTargetsAndUnorderedAccessViews(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT numRTVs,
+        REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
+        REX::W32::ID3D11DepthStencilView* depthStencilView,
+        UINT uavStartSlot,
+        UINT numUAVs,
+        REX::W32::ID3D11UnorderedAccessView* const* unorderedAccessViews,
+        const UINT* uavInitialCounts)
+    {
+        const bool keepRenderTargets = numRTVs == UINT_MAX;
+        if (!keepRenderTargets) {
+            ShaderResources::PrepareWaterReflectionCubeOM(
+                context, numRTVs, renderTargetViews);
+        }
+        D3D11Hooks::OriginalOMSetRenderTargetsAndUnorderedAccessViews(
+            context, numRTVs, renderTargetViews, depthStencilView,
+            uavStartSlot, numUAVs, unorderedAccessViews, uavInitialCounts);
+        if (!keepRenderTargets) {
+            D3D11OnOMSetRenderTargets_Internal(
+                context, numRTVs, renderTargetViews, depthStencilView);
+        }
+    }
+
+    void STDMETHODCALLTYPE MyCopySubresourceRegion(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        UINT destinationX,
+        UINT destinationY,
+        UINT destinationZ,
+        REX::W32::ID3D11Resource* source,
+        UINT sourceSubresource,
+        const REX::W32::D3D11_BOX* sourceBox)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalCopySubresourceRegion(
+            context, destination, destinationSubresource,
+            destinationX, destinationY, destinationZ,
+            source, sourceSubresource, sourceBox);
+        ShaderResources::CompleteWaterReflectionCubeSubresourceWrite(
+            destination, destinationSubresource, "copy-subresource");
+    }
+
+    void STDMETHODCALLTYPE MyCopyResource(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        REX::W32::ID3D11Resource* source)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalCopyResource(context, destination, source);
+        ShaderResources::CompleteWaterReflectionCubeResourceWrite(
+            destination, "copy-resource");
+    }
+
+    void STDMETHODCALLTYPE MyResolveSubresource(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        REX::W32::ID3D11Resource* source,
+        UINT sourceSubresource,
+        REX::W32::DXGI_FORMAT format)
+    {
+        ShaderResources::PrepareWaterReflectionCubeWrite(context, destination);
+        D3D11Hooks::OriginalResolveSubresource(
+            context, destination, destinationSubresource,
+            source, sourceSubresource, format);
+        ShaderResources::CompleteWaterReflectionCubeSubresourceWrite(
+            destination, destinationSubresource, "resolve-subresource");
     }
 
     void STDMETHODCALLTYPE MyClearDepthStencilView(
@@ -2066,15 +2781,18 @@ namespace
         UINT startIndexLocation,
         INT baseVertexLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawIndexed");
+        D3D11OnDraw_Internal(context, "d3d11-DrawIndexed", indexCount);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
-                D3D11Hooks::OriginalDrawIndexed(
-                    context,
-                    indexCount,
-                    startIndexLocation,
-                    baseVertexLocation);
+                if (!WaterTessellation::TryDrawIndexed(
+                        context, indexCount, startIndexLocation, baseVertexLocation)) {
+                    D3D11Hooks::OriginalDrawIndexed(
+                        context,
+                        indexCount,
+                        startIndexLocation,
+                        baseVertexLocation);
+                }
             });
     }
 
@@ -2083,7 +2801,7 @@ namespace
         UINT vertexCount,
         UINT startVertexLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-Draw");
+        D3D11OnDraw_Internal(context, "d3d11-Draw", vertexCount);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2100,7 +2818,8 @@ namespace
         INT baseVertexLocation,
         UINT startInstanceLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawIndexedInstanced");
+        D3D11OnDraw_Internal(
+            context, "d3d11-DrawIndexedInstanced", indexCountPerInstance);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2121,7 +2840,8 @@ namespace
         UINT startVertexLocation,
         UINT startInstanceLocation)
     {
-        D3D11OnDraw_Internal(context, "d3d11-DrawInstanced");
+        D3D11OnDraw_Internal(
+            context, "d3d11-DrawInstanced", vertexCountPerInstance);
         ProfileCommandBufferD3DCall(
             PhaseTelemetry::CommandBufferD3DCallKind::Draw,
             [&]() {
@@ -2331,6 +3051,10 @@ namespace
         ResetReplayStateCache();
         auto result = D3D11OnPSSetShaderBefore_Internal(context, pixelShader);
         D3D11Hooks::OriginalPSSetShader(context, result.shader, classInstances, numClassInstances);
+        if (!g_customPassRendering) {
+            g_currentSelectedPixelShader.store(
+                result.shader, std::memory_order_release);
+        }
         D3D11OnPSSetShaderAfter_Internal(context, result);
     }
 
@@ -2340,8 +3064,13 @@ namespace
         REX::W32::ID3D11ClassInstance* const* classInstances,
         UINT numClassInstances)
     {
+        auto* originalVertexShader = vertexShader;
         vertexShader = D3D11OnVSSetShader_Internal(context, vertexShader);
         D3D11Hooks::OriginalVSSetShader(context, vertexShader, classInstances, numClassInstances);
+        if (!g_customPassRendering) {
+            g_currentOriginalVertexShader.store(originalVertexShader, std::memory_order_release);
+            g_currentSelectedVertexShader.store(vertexShader, std::memory_order_release);
+        }
     }
 
     HRESULT STDMETHODCALLTYPE MyCreatePixelShader(
@@ -2515,8 +3244,12 @@ namespace D3D11Hooks
         Hooks::EnsureVTableSlot(vtable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), OriginalPSSetShaderResources);
         Hooks::EnsureVTableSlot(vtable, 10, reinterpret_cast<void*>(MyPSSetSamplers), OriginalPSSetSamplers);
         Hooks::EnsureVTableSlot(vtable, 35, reinterpret_cast<void*>(MyOMSetBlendState), OriginalOMSetBlendState);
+        Hooks::EnsureVTableSlot(vtable, 34, reinterpret_cast<void*>(MyOMSetRenderTargetsAndUnorderedAccessViews), OriginalOMSetRenderTargetsAndUnorderedAccessViews);
         Hooks::EnsureVTableSlot(vtable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), OriginalOMSetDepthStencilState);
         Hooks::EnsureVTableSlot(vtable, 43, reinterpret_cast<void*>(MyRSSetState), OriginalRSSetState);
+        Hooks::EnsureVTableSlot(vtable, 46, reinterpret_cast<void*>(MyCopySubresourceRegion), OriginalCopySubresourceRegion);
+        Hooks::EnsureVTableSlot(vtable, 47, reinterpret_cast<void*>(MyCopyResource), OriginalCopyResource);
+        Hooks::EnsureVTableSlot(vtable, 57, reinterpret_cast<void*>(MyResolveSubresource), OriginalResolveSubresource);
 #if SHADERENGINE_ENABLE_PHASE_TELEMETRY
         InstallCommandBufferResourceTelemetryHooks();
 #endif
@@ -2557,10 +3290,14 @@ bool InstallGFXHooks_Internal()
         !installVTableHook(contextVTable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), D3D11Hooks::OriginalPSSetShaderResources, "PSSetShaderResources") ||
         !installVTableHook(contextVTable, 10, reinterpret_cast<void*>(MyPSSetSamplers), D3D11Hooks::OriginalPSSetSamplers, "PSSetSamplers") ||
         !installVTableHook(contextVTable, 33, reinterpret_cast<void*>(MyOMSetRenderTargets), D3D11Hooks::OriginalOMSetRenderTargets, "OMSetRenderTargets") ||
+        !installVTableHook(contextVTable, 34, reinterpret_cast<void*>(MyOMSetRenderTargetsAndUnorderedAccessViews), D3D11Hooks::OriginalOMSetRenderTargetsAndUnorderedAccessViews, "OMSetRenderTargetsAndUnorderedAccessViews") ||
         !installVTableHook(contextVTable, 35, reinterpret_cast<void*>(MyOMSetBlendState), D3D11Hooks::OriginalOMSetBlendState, "OMSetBlendState") ||
         !installVTableHook(contextVTable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), D3D11Hooks::OriginalOMSetDepthStencilState, "OMSetDepthStencilState") ||
         !installVTableHook(contextVTable, 43, reinterpret_cast<void*>(MyRSSetState), D3D11Hooks::OriginalRSSetState, "RSSetState") ||
+        !installVTableHook(contextVTable, 46, reinterpret_cast<void*>(MyCopySubresourceRegion), D3D11Hooks::OriginalCopySubresourceRegion, "CopySubresourceRegion") ||
+        !installVTableHook(contextVTable, 47, reinterpret_cast<void*>(MyCopyResource), D3D11Hooks::OriginalCopyResource, "CopyResource") ||
         !installVTableHook(contextVTable, 53, reinterpret_cast<void*>(MyClearDepthStencilView), D3D11Hooks::OriginalClearDepthStencilView, "ClearDepthStencilView") ||
+        !installVTableHook(contextVTable, 57, reinterpret_cast<void*>(MyResolveSubresource), D3D11Hooks::OriginalResolveSubresource, "ResolveSubresource") ||
         !installVTableHook(contextVTable, 9, reinterpret_cast<void*>(MyPSSetShader), D3D11Hooks::OriginalPSSetShader, "PSSetShader") ||
         !installVTableHook(contextVTable, 11, reinterpret_cast<void*>(MyVSSetShader), D3D11Hooks::OriginalVSSetShader, "VSSetShader")) {
         return false;

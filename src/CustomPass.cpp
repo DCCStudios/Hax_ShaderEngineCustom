@@ -1,7 +1,13 @@
 #include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <algorithm>
+#include <chrono>
+
+#include "ContactShadowBridge.h"
+#include "ShadowUpgrade.h"
 #include <LocalLightBridge.h>
+#include <SunCascadeBridge.h>
 #include <RenderTargets.h>
 #include <ShaderResources.h>
 #include <d3d11.h>
@@ -87,6 +93,7 @@ REX::W32::DXGI_FORMAT ParseFormat(const std::string& s) {
         { "R32G32B32A32_FLOAT", REX::W32::DXGI_FORMAT_R32G32B32A32_FLOAT },
         { "R32G32_FLOAT",       REX::W32::DXGI_FORMAT_R32G32_FLOAT },
         { "R32_FLOAT",          REX::W32::DXGI_FORMAT_R32_FLOAT },
+        { "R32_UINT",           REX::W32::DXGI_FORMAT_R32_UINT },
         { "R8_UNORM",           REX::W32::DXGI_FORMAT_R8_UNORM },
     };
     auto it = table.find(s);
@@ -96,6 +103,7 @@ REX::W32::DXGI_FORMAT ParseFormat(const std::string& s) {
 void ParseScale(const std::string& s, ScaleMode& mode, uint32_t& div, uint32_t& w, uint32_t& h) {
     mode = ScaleMode::Screen; div = 1; w = 0; h = 0;
     if (s.empty()) return;
+    if (s == "saved")  { mode = ScaleMode::Saved; div = 1; return; }
     if (s == "screen") { mode = ScaleMode::Screen; div = 1; return; }
     if (s.rfind("screen/", 0) == 0) {
         mode = ScaleMode::ScreenDiv;
@@ -119,12 +127,16 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
         case ScaleMode::ScreenDiv: outW = std::max<uint32_t>(1, backW / std::max<uint32_t>(1, div));
                                    outH = std::max<uint32_t>(1, backH / std::max<uint32_t>(1, div)); break;
         case ScaleMode::Absolute:  outW = absW ? absW : backW; outH = absH ? absH : backH; break;
+        // Saved is resolved at fire time from the state snapshot (a live
+        // viewport does not exist here); fall back to the backbuffer size so
+        // a resource misconfigured with scale=saved still allocates sanely.
+        case ScaleMode::Saved:     outW = backW; outH = backH; break;
     }
 }
 
 bool ParseInputBinding(const std::string& token, InputBinding& out) {
     // Format: "<slot>:<source>" where source is depth | currentRTV |
-    // currentPSRV:N | customResource:NAME | gbufferRT:N
+    // currentPSRV:N | customResource:NAME | gbufferRT:N | depthStencil:N
     auto colon = token.find(':');
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
@@ -138,6 +150,14 @@ bool ParseInputBinding(const std::string& token, InputBinding& out) {
     if (lowerSource == "gbuffermaterial")  { out.kind = InputKind::GBufferMaterial; return true; }
     if (lowerSource == "motionvectors")    { out.kind = InputKind::MotionVectors; return true; }
     if (lowerSource == "scenehdr")         { out.kind = InputKind::SceneHDR; return true; }
+    if (lowerSource == "waterreflectioncubemap") {
+        out.kind = InputKind::WaterReflectionCubemap;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemapmeta") {
+        out.kind = InputKind::WaterReflectionCubemapMeta;
+        return true;
+    }
     if (lowerSource.rfind("currentpsrv:", 0) == 0) {
         out.kind = InputKind::CurrentPSRV;
         try { out.sourceSlot = std::stoi(source.substr(strlen("currentPSRV:"))); } catch (...) { return false; }
@@ -153,6 +173,27 @@ bool ParseInputBinding(const std::string& token, InputBinding& out) {
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
         return true;
     }
+    // Depth-stencil targets are a separate array from renderTargets[]. The
+    // shadow map array lives here (RT::Depth::kShadowMap = 6), which is what
+    // world-space occlusion probes sample. Bound as srViewDepth, so the
+    // consuming shader declares a Texture2DArray<float> and samples it with a
+    // SamplerComparisonState.
+    if (lowerSource.rfind("depthstencil:", 0) == 0) {
+        out.kind = InputKind::DepthStencil;
+        try { out.depthStencilIndex = std::stoi(source.substr(strlen("depthStencil:"))); } catch (...) { return false; }
+        return true;
+    }
+    // File-backed texture: "N:file:relative/or/absolute.png". Relative paths
+    // resolve against the pass's shader folder in the `input=` parse branch
+    // (folderPath is not visible from here).
+    if (lowerSource.rfind("file:", 0) == 0) {
+        std::string path = source.substr(strlen("file:"));
+        if (path.empty()) return false;
+        out.kind = InputKind::File;
+        out.fileTexture.file = path;
+        out.fileTexture.slot = out.slot;
+        return true;
+    }
     return false;
 }
 
@@ -161,14 +202,35 @@ bool ParseOutputBinding(const std::string& token, OutputBinding& out) {
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
     std::string source = token.substr(colon + 1);
-    if (source.rfind("customResource:", 0) == 0) {
+    const std::string lowerSource = ToLower(source);
+    if (lowerSource.rfind("customresource:", 0) == 0) {
         out.kind = OutputKind::Resource;
         out.resourceName = source.substr(strlen("customResource:"));
+        const std::string lowerName = ToLower(out.resourceName);
+        const auto mipMarker = lowerName.rfind("@mip");
+        if (mipMarker != std::string::npos) {
+            const std::string mipText = out.resourceName.substr(mipMarker + 4);
+            if (mipText.empty()) return false;
+            try {
+                size_t consumed = 0;
+                const auto mip = std::stoul(mipText, &consumed);
+                if (consumed != mipText.size()) return false;
+                out.mipLevel = static_cast<uint32_t>(mip);
+            } catch (...) {
+                return false;
+            }
+            out.resourceName.resize(mipMarker);
+            if (out.resourceName.empty()) return false;
+        }
         return true;
     }
-    if (source.rfind("gbufferRT:", 0) == 0) {
+    if (lowerSource.rfind("gbufferrt:", 0) == 0) {
         out.kind = OutputKind::GBufferRT;
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
+        return true;
+    }
+    if (lowerSource == "currentrtv") {
+        out.kind = OutputKind::CurrentRTV;
         return true;
     }
     return false;
@@ -182,7 +244,11 @@ void ParseList(const std::string& value, std::vector<std::string>& out) {
 
 ThreadGroupDim ParseThreadGroupDim(const std::string& s) {
     ThreadGroupDim d{};
-    if (s.rfind("screen/", 0) == 0) {
+    if (s.rfind("screenceil/", 0) == 0) {
+        d.mode = ScaleMode::ScreenDiv;
+        d.roundUp = true;
+        try { d.value = static_cast<uint32_t>(std::stoul(s.substr(11))); } catch (...) { d.value = 1; }
+    } else if (s.rfind("screen/", 0) == 0) {
         d.mode = ScaleMode::ScreenDiv;
         try { d.value = static_cast<uint32_t>(std::stoul(s.substr(7))); } catch (...) { d.value = 1; }
     } else if (s == "screen") {
@@ -224,42 +290,82 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
     uint32_t targetW = 0, targetH = 0;
     ResolveScale(spec.scaleMode, spec.scaleDiv, spec.absWidth, spec.absHeight,
                  backbufferW, backbufferH, targetW, targetH);
-    if (texture && targetW == width && targetH == height) return true;
+    const bool isVolume = spec.depth > 1;
+    auto targetFormat = spec.format;
+    if (isVolume && spec.needUav && !SupportsVoxelTypedUavLoads()) {
+        if (targetFormat == REX::W32::DXGI_FORMAT_R16_FLOAT) {
+            targetFormat = REX::W32::DXGI_FORMAT_R32_FLOAT;
+        } else if (targetFormat == REX::W32::DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            targetFormat = REX::W32::DXGI_FORMAT_R32_UINT;
+        }
+    }
+    const bool hasTexture = isVolume ? texture3D != nullptr : texture != nullptr;
+    if (hasTexture && targetW == width && targetH == height &&
+        spec.depth == depth && targetFormat == allocatedFormat) return true;
 
     Release();
-    width = targetW; height = targetH;
+    width = targetW; height = targetH; depth = spec.depth;
+    allocatedFormat = targetFormat;
 
-    REX::W32::D3D11_TEXTURE2D_DESC desc{};
-    desc.width            = width;
-    desc.height           = height;
-    desc.mipLevels        = spec.mipLevels;
-    desc.arraySize        = 1;
-    desc.format           = spec.format;
-    desc.sampleDesc.count = 1;
-    desc.usage            = REX::W32::D3D11_USAGE_DEFAULT;
-    desc.bindFlags        = REX::W32::D3D11_BIND_SHADER_RESOURCE;
-    if (spec.needRtv) desc.bindFlags |= REX::W32::D3D11_BIND_RENDER_TARGET;
-    if (spec.needUav) desc.bindFlags |= REX::W32::D3D11_BIND_UNORDERED_ACCESS;
+    std::uint32_t bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+    if (spec.needRtv && !isVolume) bindFlags |= REX::W32::D3D11_BIND_RENDER_TARGET;
+    if (spec.needUav) bindFlags |= REX::W32::D3D11_BIND_UNORDERED_ACCESS;
 
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &texture);
-    if (!REX::W32::SUCCESS(hr) || !texture) {
-        REX::WARN("CustomPass::Resource[{}]: CreateTexture2D failed 0x{:08X}", spec.name, hr);
-        return false;
+    HRESULT hr = 0;
+    if (isVolume) {
+        REX::W32::D3D11_TEXTURE3D_DESC desc{};
+        desc.width = width;
+        desc.height = height;
+        desc.depth = depth;
+        desc.mipLevels = spec.mipLevels;
+        desc.format = allocatedFormat;
+        desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+        desc.bindFlags = bindFlags;
+        hr = device->CreateTexture3D(&desc, nullptr, &texture3D);
+        if (!REX::W32::SUCCESS(hr) || !texture3D) {
+            REX::WARN("CustomPass::Resource[{}]: CreateTexture3D failed 0x{:08X}", spec.name, hr);
+            Release(); return false;
+        }
+    } else {
+        REX::W32::D3D11_TEXTURE2D_DESC desc{};
+        desc.width = width;
+        desc.height = height;
+        desc.mipLevels = spec.mipLevels;
+        desc.arraySize = 1;
+        desc.format = allocatedFormat;
+        desc.sampleDesc.count = 1;
+        desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+        desc.bindFlags = bindFlags;
+        hr = device->CreateTexture2D(&desc, nullptr, &texture);
+        if (!REX::W32::SUCCESS(hr) || !texture) {
+            REX::WARN("CustomPass::Resource[{}]: CreateTexture2D failed 0x{:08X}", spec.name, hr);
+            Release(); return false;
+        }
     }
     {
         REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.format        = spec.format;
-        sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.texture2D.mipLevels = spec.mipLevels;
-        hr = device->CreateShaderResourceView(texture, &sd, &srv);
+        sd.format = allocatedFormat;
+        if (isVolume) {
+            sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE3D;
+            sd.texture3D.mostDetailedMip = 0;
+            sd.texture3D.mipLevels = spec.mipLevels;
+        } else {
+            sd.viewDimension = REX::W32::D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.texture2D.mostDetailedMip = 0;
+            sd.texture2D.mipLevels = spec.mipLevels;
+        }
+        auto* resource = isVolume
+            ? static_cast<REX::W32::ID3D11Resource*>(texture3D)
+            : static_cast<REX::W32::ID3D11Resource*>(texture);
+        hr = device->CreateShaderResourceView(resource, &sd, &srv);
         if (!REX::W32::SUCCESS(hr)) {
             REX::WARN("CustomPass::Resource[{}]: CreateShaderResourceView failed 0x{:08X}", spec.name, hr);
             Release(); return false;
         }
     }
-    if (spec.needRtv) {
+    if (spec.needRtv && !isVolume) {
         REX::W32::D3D11_RENDER_TARGET_VIEW_DESC rd{};
-        rd.format        = spec.format;
+        rd.format        = allocatedFormat;
         rd.viewDimension = REX::W32::D3D11_RTV_DIMENSION_TEXTURE2D;
         hr = device->CreateRenderTargetView(texture, &rd, &rtv);
         if (!REX::W32::SUCCESS(hr)) {
@@ -268,49 +374,236 @@ bool Resource::EnsureAllocated(REX::W32::ID3D11Device* device,
         }
     }
     if (spec.needUav) {
-        REX::W32::D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.format        = spec.format;
-        ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE2D;
-        hr = device->CreateUnorderedAccessView(texture, &ud, &uav);
-        if (!REX::W32::SUCCESS(hr)) {
-            REX::WARN("CustomPass::Resource[{}]: CreateUnorderedAccessView failed 0x{:08X}", spec.name, hr);
-            Release(); return false;
+        mipUavs.reserve(spec.mipLevels);
+        for (uint32_t mip = 0; mip < spec.mipLevels; ++mip) {
+            REX::W32::D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.format = allocatedFormat;
+            if (isVolume) {
+                ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE3D;
+                ud.texture3D.mipSlice = mip;
+                ud.texture3D.firstWSlice = 0;
+                ud.texture3D.wSize = std::max<uint32_t>(1, depth >> mip);
+            } else {
+                ud.viewDimension = REX::W32::D3D11_UAV_DIMENSION_TEXTURE2D;
+                ud.texture2D.mipSlice = mip;
+            }
+            REX::W32::ID3D11UnorderedAccessView* mipUav = nullptr;
+            auto* resource = isVolume
+                ? static_cast<REX::W32::ID3D11Resource*>(texture3D)
+                : static_cast<REX::W32::ID3D11Resource*>(texture);
+            hr = device->CreateUnorderedAccessView(resource, &ud, &mipUav);
+            if (!REX::W32::SUCCESS(hr) || !mipUav) {
+                REX::WARN("CustomPass::Resource[{}]: CreateUnorderedAccessView mip {} failed 0x{:08X}", spec.name, mip, hr);
+                Release(); return false;
+            }
+            mipUavs.push_back(mipUav);
         }
+        uav = mipUavs.front();
     }
     REX::INFO(
-        "CustomPass::Resource[{}]: allocated {}x{} (domain={})",
+        "CustomPass::Resource[{}]: allocated {}x{}x{} mips={} format={} (domain={})",
         spec.name,
         width,
         height,
+        depth,
+        spec.mipLevels,
+        static_cast<uint32_t>(allocatedFormat),
         spec.renderDomain ? "render" : "allocation");
     return true;
 }
 
 void Resource::Release() {
-    if (uav) { uav->Release(); uav = nullptr; }
+    for (auto* view : mipUavs) if (view) view->Release();
+    mipUavs.clear();
+    uav = nullptr;
     if (rtv) { rtv->Release(); rtv = nullptr; }
     if (srv) { srv->Release(); srv = nullptr; }
     if (texture) { texture->Release(); texture = nullptr; }
-    width = height = 0;
+    if (texture3D) { texture3D->Release(); texture3D = nullptr; }
+    width = height = depth = 0;
+    allocatedFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
 }
 
 void Resource::SwapContents(Resource& other) {
     std::swap(texture, other.texture);
+    std::swap(texture3D, other.texture3D);
     std::swap(rtv, other.rtv);
     std::swap(srv, other.srv);
     std::swap(uav, other.uav);
+    std::swap(mipUavs, other.mipUavs);
     std::swap(width, other.width);
     std::swap(height, other.height);
+    std::swap(depth, other.depth);
+    std::swap(allocatedFormat, other.allocatedFormat);
 }
 
 // --- Pass ---------------------------------------------------------------
 
 void Pass::Release() {
     if (hlslWatcher) { hlslWatcher->Stop(); hlslWatcher.reset(); }
+    for (auto& in : spec.inputs) {
+        if (in.kind == InputKind::File) in.fileTexture.Release();
+    }
     if (psShader) { psShader->Release(); psShader = nullptr; }
     if (csShader) { csShader->Release(); csShader = nullptr; }
     if (compiledBlob) { compiledBlob->Release(); compiledBlob = nullptr; }
+    for (auto& timing : gpuTiming) {
+        if (timing.disjoint) { timing.disjoint->Release(); timing.disjoint = nullptr; }
+        if (timing.begin) { timing.begin->Release(); timing.begin = nullptr; }
+        if (timing.end) { timing.end->Release(); timing.end = nullptr; }
+        timing.submittedFrame = 0;
+        timing.pending = false;
+    }
+    gpuLastMs.store(0.0f, std::memory_order_relaxed);
+    gpuAverageMs.store(0.0f, std::memory_order_relaxed);
+    gpuTimingSamples.store(0, std::memory_order_relaxed);
+    gpuTimingUnavailable = false;
+    gpuTimingFailureLogged = false;
     compileTried = false; compileFailed = false;
+}
+
+namespace {
+bool EnsureGpuTimingQueries(Pass& pass, REX::W32::ID3D11Device* device)
+{
+    if (!pass.spec.profileGpu || pass.gpuTimingUnavailable || !device) {
+        return false;
+    }
+    if (pass.gpuTiming.front().disjoint) {
+        return true;
+    }
+
+    const REX::W32::D3D11_QUERY_DESC disjointDesc{
+        REX::W32::D3D11_QUERY_TIMESTAMP_DISJOINT,
+        0
+    };
+    const REX::W32::D3D11_QUERY_DESC timestampDesc{
+        REX::W32::D3D11_QUERY_TIMESTAMP,
+        0
+    };
+    bool ready = true;
+    for (auto& timing : pass.gpuTiming) {
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&disjointDesc, &timing.disjoint));
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&timestampDesc, &timing.begin));
+        ready = ready && REX::W32::SUCCESS(
+            device->CreateQuery(&timestampDesc, &timing.end));
+        if (!ready) {
+            break;
+        }
+    }
+    if (ready) {
+        return true;
+    }
+
+    for (auto& timing : pass.gpuTiming) {
+        if (timing.disjoint) { timing.disjoint->Release(); timing.disjoint = nullptr; }
+        if (timing.begin) { timing.begin->Release(); timing.begin = nullptr; }
+        if (timing.end) { timing.end->Release(); timing.end = nullptr; }
+        timing.pending = false;
+    }
+    pass.gpuTimingUnavailable = true;
+    if (!pass.gpuTimingFailureLogged) {
+        REX::WARN(
+            "CustomPass[{}]: asynchronous GPU timestamp queries unavailable; profiling disabled",
+            pass.spec.name);
+        pass.gpuTimingFailureLogged = true;
+    }
+    return false;
+}
+
+Pass::GpuTimingSlot* BeginGpuTiming(
+    Pass& pass,
+    REX::W32::ID3D11Device* device,
+    REX::W32::ID3D11DeviceContext* context,
+    uint32_t frame)
+{
+    if (!context || !EnsureGpuTimingQueries(pass, device)) {
+        return nullptr;
+    }
+
+    auto& timing = pass.gpuTiming[frame % pass.gpuTiming.size()];
+    if (timing.pending) {
+        // Never overwrite an unresolved query. Skipping a diagnostic sample
+        // is preferable to forcing the driver to flush or wait.
+        return nullptr;
+    }
+    context->Begin(timing.disjoint);
+    context->End(timing.begin);
+    timing.submittedFrame = frame;
+    return &timing;
+}
+
+void EndGpuTiming(
+    REX::W32::ID3D11DeviceContext* context,
+    Pass::GpuTimingSlot* timing)
+{
+    if (!context || !timing) {
+        return;
+    }
+    context->End(timing->end);
+    context->End(timing->disjoint);
+    timing->pending = true;
+}
+
+void PollGpuTiming(
+    Pass& pass,
+    REX::W32::ID3D11DeviceContext* context,
+    uint32_t frame)
+{
+    if (!pass.spec.profileGpu || !context || pass.gpuTimingUnavailable) {
+        return;
+    }
+
+    constexpr std::uint32_t kNoFlush =
+        REX::W32::D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    for (auto& timing : pass.gpuTiming) {
+        if (!timing.pending || frame - timing.submittedFrame < 2) {
+            continue;
+        }
+
+        REX::W32::D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+        const HRESULT disjointResult = context->GetData(
+            timing.disjoint,
+            &disjoint,
+            sizeof(disjoint),
+            kNoFlush);
+        if (disjointResult == S_FALSE) {
+            continue;
+        }
+        if (FAILED(disjointResult)) {
+            timing.pending = false;
+            continue;
+        }
+
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        const HRESULT beginResult = context->GetData(
+            timing.begin, &begin, sizeof(begin), kNoFlush);
+        const HRESULT endResult = context->GetData(
+            timing.end, &end, sizeof(end), kNoFlush);
+        if (beginResult == S_FALSE || endResult == S_FALSE) {
+            continue;
+        }
+        timing.pending = false;
+        if (FAILED(beginResult) || FAILED(endResult) || disjoint.disjoint ||
+            disjoint.frequency == 0 || end < begin) {
+            continue;
+        }
+
+        const float milliseconds = static_cast<float>(
+            static_cast<double>(end - begin) * 1000.0 /
+            static_cast<double>(disjoint.frequency));
+        const std::uint64_t samples =
+            pass.gpuTimingSamples.fetch_add(1, std::memory_order_relaxed) + 1;
+        const float previous =
+            pass.gpuAverageMs.load(std::memory_order_relaxed);
+        const float average = samples == 1 ? milliseconds :
+            previous + 0.15f * (milliseconds - previous);
+        pass.gpuLastMs.store(milliseconds, std::memory_order_relaxed);
+        pass.gpuAverageMs.store(average, std::memory_order_relaxed);
+    }
+}
 }
 
 // --- Snapshot SRV cache --------------------------------------------------
@@ -454,6 +747,7 @@ bool Registry::ParseResourceSection(const std::string& name,
 
         if      (lk == "format")          res->spec.format = ParseFormat(value);
         else if (lk == "scale")           ParseScale(value, res->spec.scaleMode, res->spec.scaleDiv, res->spec.absWidth, res->spec.absHeight);
+        else if (lk == "depth")           { try { res->spec.depth = std::max<uint32_t>(1, static_cast<uint32_t>(std::stoul(value))); } catch (...) {} }
         else if (lk == "domain")          res->spec.renderDomain = (ToLower(value) == "render");
         else if (lk == "miplevels")       { try { res->spec.mipLevels = static_cast<uint32_t>(std::stoul(value)); } catch (...) {} }
         else if (lk == "srvslot")         { try { res->spec.srvSlot = std::stoi(value); } catch (...) {} }
@@ -534,6 +828,8 @@ bool Registry::ParsePassSection(const std::string& name,
                 pass->spec.trigger = TriggerKind::BeforeHookId;
                 pass->spec.triggerHookId = value.substr(strlen("beforeDrawForHook:"));
                 pass->spec.atDrawTime = true;
+            } else if (value == "afterDeferredLights") {
+                pass->spec.trigger = TriggerKind::AfterDeferredLights;
             } else if (value == "atPresent") {
                 pass->spec.trigger = TriggerKind::AtPresent;
             }
@@ -545,7 +841,14 @@ bool Registry::ParsePassSection(const std::string& name,
         else if (lk == "onceperframe")  pass->spec.oncePerFrame = (ToLower(value) == "true" || value == "1");
         else if (lk == "input") {
             std::vector<std::string> parts; ParseList(value, parts);
-            for (auto& tok : parts) { InputBinding b; if (ParseInputBinding(tok, b)) pass->spec.inputs.push_back(b); }
+            for (auto& tok : parts) {
+                InputBinding b;
+                if (!ParseInputBinding(tok, b)) continue;
+                if (b.kind == InputKind::File && b.fileTexture.file.is_relative()) {
+                    b.fileTexture.file = folderPath / b.fileTexture.file;
+                }
+                pass->spec.inputs.push_back(b);
+            }
         }
         else if (lk == "output" || lk == "uav") {
             std::vector<std::string> parts; ParseList(value, parts);
@@ -565,6 +868,8 @@ bool Registry::ParsePassSection(const std::string& name,
                              :                        BlendMode::Opaque;
         }
         else if (lk == "log")          pass->spec.log = (ToLower(value) == "true" || value == "1");
+        else if (lk == "profilegpu" || lk == "profile")
+            pass->spec.profileGpu = (ToLower(value) == "true" || value == "1");
         else if (lk == "threadgroups") {
             std::vector<std::string> parts; ParseList(value, parts);
             const size_t n = parts.size() < 3u ? parts.size() : 3u;
@@ -677,6 +982,7 @@ bool Registry::EnsureCompiled(Pass& pass) {
         .profile         = profile,
         .entry           = pass.spec.entry,
         .flags           = kCompileFlags,
+        .shaderFolder    = pass.spec.shaderFile.parent_path(),
     });
     if (ShaderCache::TryLoad(cacheKey, &pass.compiledBlob)) {
         REX::INFO("CustomPass[{}]: cache HIT ({} bytes)", pass.spec.name, pass.compiledBlob->GetBufferSize());
@@ -793,15 +1099,44 @@ std::string IdentifyRenderTarget(REX::W32::ID3D11Resource* resource) {
     return result;
 }
 
-// Log the engine's bound state at trigger time. Once-per-session per pass
-// (rate-limited via fire count) so the F4SE log doesn't drown.
+// Log the engine's bound state at trigger time. Fires on the pass's first
+// fire, and again whenever the engine's RTV0 RESOURCE changes (rate-limited
+// to 1 per 2s) - the engine composites the scene into different textures on
+// different frames, and the binding set that accompanies the alternate
+// target is exactly the information a first-fire-only dump misses.
 void LogEngineBindings(const Pass& pass, REX::W32::ID3D11DeviceContext* ctx, uint64_t fireCount) {
-    if (fireCount != 1) return;  // only on first fire
     if (!ctx) return;
 
     REX::W32::ID3D11RenderTargetView* rtvs[8] = {};
     REX::W32::ID3D11DepthStencilView* dsv = nullptr;
     ctx->OMGetRenderTargets(8, rtvs, &dsv);
+
+    // Pointer identity only, never dereferenced later.
+    static const void* s_lastRtv0Resource = nullptr;
+    static std::uint64_t s_lastForcedDumpMs = 0;
+    const void* rtv0Resource = nullptr;
+    if (rtvs[0]) {
+        REX::W32::ID3D11Resource* res = nullptr;
+        rtvs[0]->GetResource(&res);
+        rtv0Resource = res;
+        if (res) res->Release();
+    }
+    bool due = fireCount == 1;
+    if (!due && rtv0Resource != s_lastRtv0Resource) {
+        const auto nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (nowMs - s_lastForcedDumpMs > 2000) {
+            s_lastForcedDumpMs = nowMs;
+            due = true;
+        }
+    }
+    s_lastRtv0Resource = rtv0Resource;
+    if (!due) {
+        for (int i = 0; i < 8; ++i) if (rtvs[i]) rtvs[i]->Release();
+        if (dsv) dsv->Release();
+        return;
+    }
 
     REX::INFO("CustomPass[{}]: engine bindings at trigger time:", pass.spec.name);
     for (int i = 0; i < 8; ++i) {
@@ -820,14 +1155,29 @@ void LogEngineBindings(const Pass& pass, REX::W32::ID3D11DeviceContext* ctx, uin
         dsv->Release();
     }
 
-    REX::W32::ID3D11ShaderResourceView* srvs[16] = {};
-    ctx->PSGetShaderResources(0, 16, srvs);
-    for (int i = 0; i < 16; ++i) {
+    REX::W32::ID3D11ShaderResourceView* srvs[32] = {};
+    ctx->PSGetShaderResources(0, 32, srvs);
+    for (int i = 0; i < 32; ++i) {
         if (!srvs[i]) continue;
         REX::W32::ID3D11Resource* res = nullptr;
         srvs[i]->GetResource(&res);
-        REX::INFO("  PS SRV t{}: {}", i, IdentifyRenderTarget(res));
-        if (res) res->Release();
+        // Include dimensions: two same-purpose textures at different
+        // resolutions (native scene vs upscaler proxy) both identify as
+        // "(unknown)", and the size is what tells them apart.
+        std::string name = IdentifyRenderTarget(res);
+        if (res) {
+            REX::W32::ID3D11Texture2D* tex = nullptr;
+            res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                reinterpret_cast<void**>(&tex));
+            if (tex) {
+                REX::W32::D3D11_TEXTURE2D_DESC d{};
+                tex->GetDesc(&d);
+                name += std::format(" {}x{}", d.width, d.height);
+                tex->Release();
+            }
+            res->Release();
+        }
+        REX::INFO("  PS SRV t{}: {}", i, name);
         srvs[i]->Release();
     }
 }
@@ -1016,6 +1366,7 @@ struct PassStateCache {
 // Default sampler (linear/clamp) bound on s0 for pass shaders.
 REX::W32::ID3D11SamplerState* g_passSamplerLinear = nullptr;
 REX::W32::ID3D11SamplerState* g_passSamplerPoint = nullptr;
+REX::W32::ID3D11SamplerState* g_passSamplerLinearWrap = nullptr;
 void EnsureSamplers(REX::W32::ID3D11Device* dev) {
     if (!g_passSamplerLinear) {
         REX::W32::D3D11_SAMPLER_DESC d{};
@@ -1030,6 +1381,14 @@ void EnsureSamplers(REX::W32::ID3D11Device* dev) {
         d.addressU = d.addressV = d.addressW = REX::W32::D3D11_TEXTURE_ADDRESS_CLAMP;
         d.maxLOD = (std::numeric_limits<float>::max)();
         dev->CreateSamplerState(&d, &g_passSamplerPoint);
+    }
+    if (!g_passSamplerLinearWrap) {
+        REX::W32::D3D11_SAMPLER_DESC d{};
+        d.filter = REX::W32::D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        d.addressU = d.addressV = d.addressW =
+            REX::W32::D3D11_TEXTURE_ADDRESS_WRAP;
+        d.maxLOD = (std::numeric_limits<float>::max)();
+        dev->CreateSamplerState(&d, &g_passSamplerLinearWrap);
     }
 }
 }  // anonymous
@@ -1060,47 +1419,115 @@ bool Registry::FireSortedBatch(REX::W32::ID3D11DeviceContext* context, const std
     // up to N (chain-length) save/restore cycles into one, which dominates
     // CPU overhead when many passes share a trigger (e.g. SSAO + SSRTGI +
     // fake skin bloom firing at beforeDrawForHook:visualTonemap).
+    const bool needsLateReconstructionConstants = std::any_of(
+        matches.begin(), matches.end(), [](const Pass* pass) {
+            return pass && pass->spec.active &&
+                pass->spec.type == PassType::Pixel &&
+                pass->spec.trigger == TriggerKind::BeforeDrawForMatchedDef &&
+                pass->spec.atDrawTime &&
+                pass->spec.triggerHookId == "visualTonemap";
+        });
     const bool wasCustomPassRendering = ::g_customPassRendering;
     ::g_customPassRendering = true;
     SavedState saved; saved.Capture(context);
+    ShadowUpgrade::DeferredReconstructionBinding lateReconstruction{};
+    const bool lateReconstructionBound =
+        needsLateReconstructionConstants &&
+        ShadowUpgrade::BindDeferredReconstructionConstants(
+            context, lateReconstruction);
     bool firedAny = false;
     for (auto* p : matches) {
         if (!p) continue;
         if (!p->spec.active) continue;
         firedAny = FirePassWithSaved(context, *p, saved) || firedAny;
     }
+    if (lateReconstructionBound) {
+        ShadowUpgrade::RestoreDeferredReconstructionConstants(
+            context, lateReconstruction);
+    }
     saved.Restore(context);
     ::g_customPassRendering = wasCustomPassRendering;
     return firedAny;
 }
 
-// Evaluate the optional `activeWhen` runtime gate. Returns true (fire)
-// when the spec is empty, the bool is true, or the spec is "!id" and the
-// bool is false. The resolved ShaderValue* is cached in the pass on first
-// call so subsequent fires skip the linear scan.
+// Evaluate the optional `activeWhen` runtime gate. Commas and `&&` form an
+// AND-list; a `|` anywhere makes the whole spec an OR-list instead (any one
+// true term satisfies it). Each term may start with `!`. The special token
+// `weatherRain` is evaluated per-frame against the current/outgoing weather
+// class rather than a Values.ini bool, so rain passes can be skipped entirely
+// in clear weather. Resolved pointers/kinds are cached on first use.
 static bool EvaluateActiveWhen(Pass& pass) {
     const std::string& spec = pass.spec.activeWhen;
     if (spec.empty()) return true;
 
     if (!pass.activeWhenChecked) {
-        bool negate = !spec.empty() && spec[0] == '!';
-        const std::string id = negate ? spec.substr(1) : spec;
-        ShaderValue* resolved = nullptr;
-        for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
-            if (sv && sv->id == id) { resolved = sv; break; }
+        pass.activeWhenIsOr = spec.find('|') != std::string::npos;
+        std::string normalized = spec;
+        // Normalize every AND/OR separator (&&, |, ||) to a single comma; the
+        // AND-vs-OR decision is already captured in activeWhenIsOr above.
+        for (size_t pos = 0; (pos = normalized.find("&&", pos)) != std::string::npos;) {
+            normalized.replace(pos, 2, ",");
         }
-        if (!resolved) {
-            REX::WARN("CustomPass[{}]: activeWhen='{}' did not resolve to a Values.ini bool — pass will fire as if no gate were set",
-                pass.spec.name, spec);
+        std::replace(normalized.begin(), normalized.end(), '|', ',');
+        std::stringstream terms(normalized);
+        std::string token;
+        while (std::getline(terms, token, ',')) {
+            if (token.empty()) continue;
+            const bool negate = token[0] == '!';
+            const std::string id = negate ? token.substr(1) : token;
+            if (id.empty()) continue;
+            if (id == "weatherRain") {
+                pass.activeWhenTerms.push_back(
+                    { nullptr, negate, Pass::ActiveWhenTerm::Kind::WeatherRain });
+                continue;
+            }
+            ShaderValue* resolved = nullptr;
+            for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
+                if (sv && sv->id == id) { resolved = sv; break; }
+            }
+            if (!resolved) {
+                REX::WARN("CustomPass[{}]: activeWhen term '{}' did not resolve to a Values.ini bool; that term will fire-open",
+                    pass.spec.name, token);
+            }
+            pass.activeWhenTerms.push_back(
+                { resolved, negate, Pass::ActiveWhenTerm::Kind::Bool });
         }
-        pass.activeWhenResolved = resolved;
-        pass.activeWhenNegated  = negate;
         pass.activeWhenChecked  = true;
     }
 
-    auto* sv = static_cast<ShaderValue*>(pass.activeWhenResolved);
-    if (!sv) return true;  // fire-open on unknown id
-    return pass.activeWhenNegated ? !sv->current.b : sv->current.b;
+    // Resolve one term's boolean value (fire-open when a Bool term's pointer
+    // never resolved, so a typo cannot silently disable a pass).
+    auto termValue = [](const Pass::ActiveWhenTerm& term, bool& usable) -> bool {
+        usable = true;
+        if (term.kind == Pass::ActiveWhenTerm::Kind::WeatherRain) {
+            const bool raining = g_customBufferData.currentWeatherClass == 2 ||
+                                 g_customBufferData.outgoingWeatherClass == 2;
+            return term.negate ? !raining : raining;
+        }
+        auto* sv = static_cast<ShaderValue*>(term.shaderValue);
+        if (!sv) { usable = false; return true; }
+        return term.negate ? !sv->current.b : sv->current.b;
+    };
+
+    if (pass.activeWhenIsOr) {
+        bool anyUsable = false;
+        for (const auto& term : pass.activeWhenTerms) {
+            bool usable = false;
+            const bool value = termValue(term, usable);
+            if (!usable) continue;
+            anyUsable = true;
+            if (value) return true;
+        }
+        // No term was true. An all-unresolved OR gate fires open.
+        return !anyUsable;
+    }
+
+    for (const auto& term : pass.activeWhenTerms) {
+        bool usable = false;
+        const bool value = termValue(term, usable);
+        if (usable && !value) return false;
+    }
+    return true;
 }
 
 bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& pass, SavedState& saved) {
@@ -1148,10 +1575,49 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     for (auto& in : pass.spec.inputs) {
         REX::W32::ID3D11ShaderResourceView* s = nullptr;
         switch (in.kind) {
-            case InputKind::Depth:
+            case InputKind::Depth: {
                 g_depthSRV = ShaderResources::GetDepthBufferSRV_Internal();
                 s = g_depthSRV;
+                // Transition log: which texture "depth" actually resolves to.
+                // The scene can render into an upscaler proxy while the depth
+                // TABLE entry keeps pointing at the native-size buffer, in
+                // which case every consumer of this input samples depth the
+                // current frame never wrote - the contact raymarch then sees
+                // no occluders anywhere and its whole output silently
+                // disappears. Pointer identity only, never dereferenced.
+                {
+                    static const void* s_lastDepthRes =
+                        reinterpret_cast<const void*>(~uintptr_t{0});
+                    const void* depthRes = nullptr;
+                    uint32_t dw = 0, dh = 0;
+                    if (s) {
+                        REX::W32::ID3D11Resource* res = nullptr;
+                        s->GetResource(&res);
+                        if (res) {
+                            depthRes = res;
+                            REX::W32::ID3D11Texture2D* tex = nullptr;
+                            res->QueryInterface(
+                                REX::W32::IID_ID3D11Texture2D,
+                                reinterpret_cast<void**>(&tex));
+                            if (tex) {
+                                REX::W32::D3D11_TEXTURE2D_DESC d{};
+                                tex->GetDesc(&d);
+                                dw = d.width;
+                                dh = d.height;
+                                tex->Release();
+                            }
+                            res->Release();
+                        }
+                    }
+                    if (depthRes != s_lastDepthRes) {
+                        s_lastDepthRes = depthRes;
+                        REX::INFO(
+                            "CustomPass[{}]: depth input resolved to {} ({}x{})",
+                            pass.spec.name, depthRes, dw, dh);
+                    }
+                }
                 break;
+            }
             case InputKind::CurrentRTV: {
                 // Use the snapshot we captured BEFORE Restore (saved.rtvs[0]).
                 // The render target's underlying resource is the engine's HDR
@@ -1207,6 +1673,62 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             case InputKind::SceneHDR:
                 s = g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].srView;
                 break;
+            case InputKind::WaterReflectionCubemap:
+                s = ShaderResources::GetWaterReflectionCubemapSRVForCustomPass(
+                    context);
+                break;
+            case InputKind::WaterReflectionCubemapMeta:
+                s = ShaderResources::GetWaterReflectionCubemapMetaSRVForCustomPass(
+                    context);
+                break;
+            case InputKind::DepthStencil: {
+                // Stays nullptr when the engine has not allocated the target
+                // this frame (the shadow array is absent in some interiors and
+                // during loading). Consuming shaders must treat a null bind as
+                // "fully visible" rather than "fully occluded".
+                if (in.depthStencilIndex >= 0 &&
+                    in.depthStencilIndex < (int)RT::idx(RT::Depth::kCount)) {
+                    s = g_rendererData->depthStencilTargets[in.depthStencilIndex].srViewDepth;
+                }
+                // One-shot report per index. A null SRV here is silent on the
+                // GPU: samples return 0, every depth comparison resolves the
+                // same way, and the consuming field looks uniformly wrong
+                // rather than absent - which is indistinguishable from a
+                // working field with nothing to show.
+                {
+                    static std::array<bool, 16> s_reported{};
+                    const int idx = in.depthStencilIndex;
+                    if (idx >= 0 && idx < 16 && !s_reported[idx]) {
+                        s_reported[idx] = true;
+                        if (!s) {
+                            REX::WARN(
+                                "CustomPass: depthStencil:{} has no srViewDepth; "
+                                "shader samples will read 0",
+                                idx);
+                        } else {
+                            REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+                            s->GetDesc(&d);
+                            REX::INFO(
+                                "CustomPass: depthStencil:{} bound, srv dimension={} "
+                                "format={} arraySize={}",
+                                idx,
+                                static_cast<int>(d.viewDimension),
+                                static_cast<int>(d.format),
+                                d.texture2DArray.arraySize);
+                        }
+                    }
+                }
+                break;
+            }
+            case InputKind::File: {
+                // Lazy-loaded on first fire, exactly like a replacement
+                // shader's bindTexture. Load failure logs once (inside the
+                // loader) and the slot stays null; the consuming shader must
+                // treat a null bind (samples return 0) as "feature off".
+                ShaderResources::EnsureFileTextureSRV(device, in.fileTexture);
+                s = in.fileTexture.srv;
+                break;
+            }
             default: break;
         }
         if (in.slot >= 0 && in.slot < (int)srvBindings.size()) srvBindings[in.slot] = s;
@@ -1224,6 +1746,67 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     if (maxUavSlot >= 0) uavBindings.resize(maxUavSlot + 1, nullptr);
     Resource* primaryOut = nullptr;
     for (auto& out : pass.spec.outputs) {
+        if (out.kind == OutputKind::CurrentRTV) {
+            // Bind whatever the engine had on OM slot 0 when the trigger
+            // fired. Capture AddRef'd saved.rtvs[0] and Restore releases it
+            // after the batch, so the reference is alive for the whole fire.
+            // The target's identity is unknown by design (at
+            // afterDeferredLights it is not in renderTargets[] at all), so
+            // guard on the one thing the pass requires: a real 2D texture of
+            // plausible size. On any mismatch the slot stays null and the
+            // anyRTV check below skips the pass instead of corrupting state.
+            if (pass.spec.type != PassType::Pixel) continue;
+            auto* rt = saved.rtvs[0];
+            bool usable = false;
+            REX::W32::ID3D11Resource* identity = nullptr;
+            uint32_t descW = 0, descH = 0;
+            int descFormat = -1;
+            if (rt) {
+                REX::W32::ID3D11Resource* res = nullptr;
+                rt->GetResource(&res);
+                if (res) {
+                    identity = res;
+                    REX::W32::ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                        reinterpret_cast<void**>(&tex));
+                    if (tex) {
+                        REX::W32::D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        usable = d.width >= 16 && d.height >= 16;
+                        descW = d.width;
+                        descH = d.height;
+                        descFormat = static_cast<int>(d.format);
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+            }
+            // Transition log: the target's identity is unknown by design, so
+            // the one thing worth recording is when it CHANGES - a full-frame
+            // effect dropout at a specific camera angle would show here as the
+            // engine swapping (or unbinding) its composite destination.
+            // `s_lastIdentity` stores the pointer VALUE for comparison only
+            // and is never dereferenced; a destroyed-and-reallocated texture
+            // at the same address logs nothing, which is acceptable for a
+            // diagnostic. Static is fine: render-thread only, and shared
+            // across the (currently one) pass using currentRTV.
+            {
+                static REX::W32::ID3D11Resource* s_lastIdentity =
+                    reinterpret_cast<REX::W32::ID3D11Resource*>(~uintptr_t{0});
+                if (identity != s_lastIdentity) {
+                    s_lastIdentity = identity;
+                    REX::INFO(
+                        "CustomPass[{}]: currentRTV target changed: res={} "
+                        "{}x{} fmt={} usable={}",
+                        pass.spec.name, static_cast<void*>(identity),
+                        descW, descH, descFormat, usable);
+                }
+            }
+            if (usable && out.slot >= 0 && out.slot < (int)rtvBindings.size()) {
+                rtvBindings[out.slot] = rt;
+            }
+            continue;
+        }
         if (out.kind == OutputKind::GBufferRT) {
             // Direct bind to engine renderTargets[N].rtView. Used by composite
             // passes that need to write into an existing engine surface (e.g.
@@ -1240,7 +1823,14 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (pass.spec.type == PassType::Pixel) {
             if (out.slot >= 0 && out.slot < (int)rtvBindings.size()) rtvBindings[out.slot] = r->rtv;
         } else {
-            if (out.slot >= 0 && out.slot < (int)uavBindings.size()) uavBindings[out.slot] = r->uav;
+            if (out.mipLevel >= r->mipUavs.size()) {
+                REX::WARN("CustomPass[{}]: output '{}' requests mip {} but resource has {} UAV mip(s)",
+                    pass.spec.name, r->spec.name, out.mipLevel, r->mipUavs.size());
+                return false;
+            }
+            if (out.slot >= 0 && out.slot < (int)uavBindings.size()) {
+                uavBindings[out.slot] = r->mipUavs[out.mipLevel];
+            }
         }
     }
 
@@ -1261,12 +1851,43 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     uint32_t outW = 0, outH = 0;
     for (auto& out : pass.spec.outputs) {
         REX::W32::ID3D11Texture2D* targetTex = nullptr;
+        if (out.kind == OutputKind::CurrentRTV) {
+            // Size from the live target itself. Released immediately after
+            // GetDesc below via the shared targetTex handling being skipped -
+            // so query the desc here and continue the loop directly.
+            if (saved.rtvs[0]) {
+                REX::W32::ID3D11Resource* res = nullptr;
+                saved.rtvs[0]->GetResource(&res);
+                if (res) {
+                    REX::W32::ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(REX::W32::IID_ID3D11Texture2D,
+                                        reinterpret_cast<void**>(&tex));
+                    if (tex) {
+                        REX::W32::D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        outW = d.width;
+                        outH = d.height;
+                        tex->Release();
+                    }
+                    res->Release();
+                }
+            }
+            if (outW > 0) break;
+            continue;
+        }
         if (out.kind == OutputKind::GBufferRT) {
             if (out.gbufferIndex >= 0 && out.gbufferIndex < 101) {
                 targetTex = g_rendererData->renderTargets[out.gbufferIndex].texture;
             }
         } else {
-            if (auto* r = FindResource(out.resourceName)) targetTex = r->texture;
+            if (auto* r = FindResource(out.resourceName)) {
+                if (r->texture3D) {
+                    outW = std::max<uint32_t>(1, r->width >> out.mipLevel);
+                    outH = std::max<uint32_t>(1, r->height >> out.mipLevel);
+                    break;
+                }
+                targetTex = r->texture;
+            }
         }
         if (targetTex) {
             REX::W32::D3D11_TEXTURE2D_DESC d{};
@@ -1276,8 +1897,33 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             break;
         }
     }
+    // viewport=saved: rasterize over the engine's own viewport as captured
+    // when the trigger fired. At a beforeDrawForHook trigger that is the
+    // hooked draw's viewport - during the imagespace HDR phase (tonemap and
+    // earlier) the dynamic-resolution SUBRECT of the allocation, so the
+    // pass's fullscreen UV becomes the engine's scene-logical UV and its
+    // writes land only on texels the scene actually occupies. Falls back to
+    // the output texture's size when the snapshot has no usable viewport.
+    if (pass.spec.viewportMode == ScaleMode::Saved) {
+        if (saved.viewports[0].width >= 1.0f && saved.viewports[0].height >= 1.0f) {
+            outW = (uint32_t)saved.viewports[0].width;
+            outH = (uint32_t)saved.viewports[0].height;
+        }
+        // Transition log: the saved viewport IS the diagnosis surface for
+        // DRS-space bugs (full allocation here means the engine was not in a
+        // subrect and the mapping is identity). Render-thread only.
+        {
+            static uint64_t s_lastDims = ~0ull;
+            const uint64_t dims = (uint64_t(outW) << 32) | outH;
+            if (dims != s_lastDims) {
+                s_lastDims = dims;
+                REX::INFO("CustomPass[{}]: saved viewport {}x{}",
+                    pass.spec.name, outW, outH);
+            }
+        }
+    }
     // Override if explicit viewport scale set (resolves against kMain's size).
-    if (pass.spec.viewportMode != ScaleMode::Screen || pass.spec.viewportDiv > 1) {
+    else if (pass.spec.viewportMode != ScaleMode::Screen || pass.spec.viewportDiv > 1) {
         REX::W32::D3D11_TEXTURE2D_DESC bd{};
         if (g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture)
             g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture->GetDesc(&bd);
@@ -1327,9 +1973,23 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularIntsSRV)   context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/true);
-        REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
-        context->PSSetSamplers(0, 2, samplers);
+        SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/true);
+        ContactShadowBridge::BindCustomPassResource(
+            context,
+            /*pixelStage=*/true,
+            saved.psSrvs[30],
+            saved.rtvs[0],
+            pass.spec.name.c_str());
+        REX::W32::ID3D11SamplerState* samplers[3] = {
+            g_passSamplerLinear,
+            g_passSamplerPoint,
+            g_passSamplerLinearWrap
+        };
+        context->PSSetSamplers(0, 3, samplers);
+        auto* gpuTiming = BeginGpuTiming(
+            pass, device, context, currentFrame);
         context->Draw(3, 0);
+        EndGpuTiming(context, gpuTiming);
 
         // Unbind RTVs to allow restore.
         REX::W32::ID3D11RenderTargetView* nullRTV[8] = {};
@@ -1351,12 +2011,23 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         if (g_modularIntsSRV)   context->CSSetShaderResources(MODULAR_INTS_SLOT,   1, &g_modularIntsSRV);
         if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
         LocalLightBridge::BindCustomPassResource(context, /*pixelStage=*/false);
+        SunCascadeBridge::BindCustomPassResource(context, /*pixelStage=*/false);
+        ContactShadowBridge::BindCustomPassResource(
+            context,
+            /*pixelStage=*/false,
+            saved.psSrvs[30],
+            saved.rtvs[0],
+            pass.spec.name.c_str());
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());
         }
-        REX::W32::ID3D11SamplerState* samplers[2] = { g_passSamplerLinear, g_passSamplerPoint };
-        context->CSSetSamplers(0, 2, samplers);
+        REX::W32::ID3D11SamplerState* samplers[3] = {
+            g_passSamplerLinear,
+            g_passSamplerPoint,
+            g_passSamplerLinearWrap
+        };
+        context->CSSetSamplers(0, 3, samplers);
 
         // Resolve dispatch geometry.
         UINT groups[3] = { 1, 1, 1 };
@@ -1370,10 +2041,20 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
             switch (tg.mode) {
                 case ScaleMode::Absolute:  groups[i] = std::max<uint32_t>(1, tg.value); break;
                 case ScaleMode::Screen:    groups[i] = (i == 0 ? bw : (i == 1 ? bh : 1)); break;
-                case ScaleMode::ScreenDiv: groups[i] = std::max<uint32_t>(1, (i == 0 ? bw : (i == 1 ? bh : 1)) / std::max<uint32_t>(1, tg.value)); break;
+                case ScaleMode::ScreenDiv: {
+                    const auto extent = i == 0 ? bw : (i == 1 ? bh : 1);
+                    const auto divisor = std::max<uint32_t>(1, tg.value);
+                    groups[i] = std::max<uint32_t>(1,
+                        tg.roundUp ? (extent + divisor - 1) / divisor
+                                   : extent / divisor);
+                    break;
+                }
             }
         }
+        auto* gpuTiming = BeginGpuTiming(
+            pass, device, context, currentFrame);
         context->Dispatch(groups[0], groups[1], groups[2]);
+        EndGpuTiming(context, gpuTiming);
         // Unbind UAVs to release for restore.
         if (!uavBindings.empty()) {
             std::vector<REX::W32::ID3D11UnorderedAccessView*> nulls(uavBindings.size(), nullptr);
@@ -1383,9 +2064,12 @@ bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     }
 
     const uint64_t fires = pass.totalFireCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (pass.spec.oncePerFrame) {
-        pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
-    }
+    // Unconditional: the oncePerFrame GATE above only reads this when that
+    // flag is set, but the afterDeferredLights batch diagnostic reads it as
+    // "did this pass fire this frame" - with the old conditional store, a
+    // oncePerFrame=false pass logged as SKIPPED forever while firing fine,
+    // which sent a live debugging session down the wrong path (2026-08-14).
+    pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
     if (pass.spec.log) {
         // Rate-limit: every fire for the first 5, then every 600th frame
         // (~10s at 60fps). Avoids dumping 180 lines/sec when log=true is on
@@ -1559,6 +2243,9 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
     if (bd.width == 0 || bd.height == 0) return;
     {
         std::lock_guard lk(mutex);
+        for (auto& pass : passes) {
+            PollGpuTiming(*pass, context, currentFrame);
+        }
         for (auto& res : resources) res->EnsureAllocated(g_rendererData->device, bd.width, bd.height);
         for (auto& res : resources) {
             if (res->pingpongPartner) continue;
@@ -1584,8 +2271,22 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
 
         // clearOnPresent
         for (auto& res : resources) {
-            if (!res->spec.clearOnPresent || !res->rtv) continue;
-            context->ClearRenderTargetView(res->rtv, res->spec.clearColor);
+            if (!res->spec.clearOnPresent) continue;
+            if (res->rtv) {
+                context->ClearRenderTargetView(res->rtv, res->spec.clearColor);
+            } else if (res->uav) {
+                if (res->allocatedFormat == REX::W32::DXGI_FORMAT_R32_UINT) {
+                    const std::uint32_t clear[4] = {
+                        static_cast<std::uint32_t>(res->spec.clearColor[0]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[1]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[2]),
+                        static_cast<std::uint32_t>(res->spec.clearColor[3])
+                    };
+                    context->ClearUnorderedAccessViewUint(res->uav, clear);
+                } else {
+                    context->ClearUnorderedAccessViewFloat(res->uav, res->spec.clearColor);
+                }
+            }
         }
 
         // AtPresent passes
@@ -1596,6 +2297,47 @@ void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
 
         ApplyPingpong();
     }
+}
+
+void Registry::FireAfterDeferredLights(REX::W32::ID3D11DeviceContext* context) {
+    if (!context) return;
+    std::vector<Pass*> matches;
+    {
+        std::lock_guard lk(mutex);
+        for (auto& p : passes) {
+            if (p->spec.trigger != TriggerKind::AfterDeferredLights) continue;
+            if (!p->spec.active) continue;
+            matches.push_back(p.get());
+        }
+    }
+    const bool fired = matches.empty() ? false : FireBatch(context, matches);
+
+    // Throttled. Separates the two ways this can look identical in game -
+    // "no pass matched the trigger" from "passes fired but wrote somewhere
+    // that gets discarded" - which is otherwise only distinguishable by
+    // reading the GPU profiler, and cost a full test cycle to guess at.
+    static std::atomic<std::uint64_t> lastLogMs{0};
+    const auto nowMs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const auto previous = lastLogMs.load(std::memory_order_relaxed);
+    if (nowMs - previous > 5000u) {
+        lastLogMs.store(nowMs, std::memory_order_relaxed);
+        std::string names;
+        for (auto* p : matches) {
+            if (!names.empty()) names += ", ";
+            names += p->spec.name;
+            names += p->lastFiredFrame.load(std::memory_order_relaxed) ==
+                     currentFrame ? "(fired)" : "(SKIPPED)";
+        }
+        REX::INFO(
+            "CustomPass: afterDeferredLights - {} matched, FireBatch={} | {}",
+            matches.size(), fired, names.empty() ? "<none>" : names);
+    }
+}
+
+void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context) {
+    g_registry.FireAfterDeferredLights(context);
 }
 
 void Registry::ApplyPingpong() {
@@ -1687,6 +2429,17 @@ void Registry::StartFileWatchers() {
         });
         p->hlslWatcher->Start();
     }
+}
+
+std::size_t Registry::RequestReloadAll() {
+    std::lock_guard lk(mutex);
+    std::size_t marked = 0;
+    for (auto& p : passes) {
+        if (!p || p->spec.shaderFile.empty()) continue;
+        p->reloadRequested.store(true, std::memory_order_release);
+        ++marked;
+    }
+    return marked;
 }
 
 size_t Registry::ResourceCount() const { std::lock_guard lk(mutex); return resources.size(); }

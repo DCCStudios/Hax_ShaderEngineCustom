@@ -2795,6 +2795,10 @@ namespace
         }
     }
 
+    // The SEH guard that used to wrap the call below now lives in the separate
+    // RemovePartCrashFix plugin, which hooks the same function independently.
+    // Keeping it out of here means the crash mitigation is not tied to
+    // ShaderEngine being installed, and this hook stays purely about draw tags.
     void HookedBipedAnimRemovePart(RE::BipedAnim* biped, RE::BIPOBJECT* bipObject, bool queueDetach)
     {
         if (bipObject) {
@@ -3694,7 +3698,11 @@ void HookedBSDFTiledLightingAddLight(std::uint32_t lightType,
     if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
         adjusted = radius * scale;
     }
-    LocalLightBridge::OnTiledLight(viewPosition, adjusted, color, attenuation);
+    // Preserve both contracts. The GPU record needs the adjusted radius used
+    // by tiled lighting, while CPU correlation against the engine shadow
+    // array must use the unmodified radius still stored by BSLight.
+    LocalLightBridge::OnTiledLight(
+        viewPosition, adjusted, radius, color, attenuation);
     OriginalBSDFTiledLightingAddLight(lightType, viewPosition, adjusted, color, attenuation,
                                       flagA, flagB, flagC, flagD);
 }
@@ -3756,6 +3764,7 @@ bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask
             light,
             worldPosition,
             *radiusPtr,
+            std::isfinite(saved) ? saved : *radiusPtr,
             &linearColor,
             attenuation);
     }

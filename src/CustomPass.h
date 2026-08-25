@@ -47,7 +47,13 @@ private:
 
 // --- Resource -------------------------------------------------------------
 
-enum class ScaleMode : uint8_t { Screen, ScreenDiv, Absolute };
+// Saved = the viewport captured from the engine at fire time. Only
+// meaningful for a pass's `viewport=` (resources have no live viewport):
+// at a beforeDrawForHook trigger the snapshot holds the hooked draw's own
+// viewport, which during the imagespace HDR phase is the dynamic-resolution
+// SUBRECT of the target allocation - rasterizing there makes the pass's
+// fullscreen-triangle UV equal the engine's scene-logical UV.
+enum class ScaleMode : uint8_t { Screen, ScreenDiv, Absolute, Saved };
 
 struct ResourceSpec {
     std::string                             name;
@@ -56,6 +62,7 @@ struct ResourceSpec {
     uint32_t                                scaleDiv = 1;       // Screen/N
     uint32_t                                absWidth = 0;       // Absolute
     uint32_t                                absHeight = 0;      // Absolute
+    uint32_t                                depth = 1;          // depth > 1 selects Texture3D
     bool                                    renderDomain = false; // scale relative to logical render extent
     uint32_t                                mipLevels = 1;
     int                                     srvSlot = -1;       // Preferred/requested SRV slot for INI consumers.
@@ -74,11 +81,16 @@ class Resource {
 public:
     ResourceSpec                                spec{};
     REX::W32::ID3D11Texture2D*                  texture = nullptr;
+    REX::W32::ID3D11Texture3D*                  texture3D = nullptr;
     REX::W32::ID3D11RenderTargetView*           rtv = nullptr;
     REX::W32::ID3D11ShaderResourceView*         srv = nullptr;
+    // Non-owning alias of mipUavs[0], retained for existing callers.
     REX::W32::ID3D11UnorderedAccessView*        uav = nullptr;
+    std::vector<REX::W32::ID3D11UnorderedAccessView*> mipUavs;
     uint32_t                                    width = 0;
     uint32_t                                    height = 0;
+    uint32_t                                    depth = 0;
+    REX::W32::DXGI_FORMAT                       allocatedFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
     Resource*                                   pingpongPartner = nullptr;
 
     // Allocate / release. Idempotent: EnsureAllocated returns true if usable.
@@ -110,7 +122,13 @@ enum class TriggerKind : uint8_t {
                               // PREFER THIS for tonemap-piggyback patterns like SSRTGI
                               // composite that need to read/write surfaces the matched
                               // shader is about to consume.
-    AtPresent
+    AtPresent,
+    // Fires immediately after DrawWorld::DeferredLightsImpl returns, i.e. once
+    // all deferred lighting has resolved but before anything transparent is
+    // drawn. A pass that multiplies into the scene here darkens only lit
+    // opaque surfaces; particles, smoke and glass then blend over the result
+    // instead of being darkened by it.
+    AfterDeferredLights
 };
 enum class BlendMode : uint8_t {
     Opaque,        // dst = src                               (writeMask = 0x0F)
@@ -131,6 +149,10 @@ enum class InputKind : uint8_t {
     GBufferMaterial,      // renderTargets[kGbufferMaterial=24].srView
     MotionVectors,        // renderTargets[kMotionVectors=29].srView
     SceneHDR,             // renderTargets[kMain=3].srView (engine HDR scene)
+    WaterReflectionCubemap,      // validated completed engine reflection cube
+    WaterReflectionCubemapMeta,  // native generation/freshness metadata
+    DepthStencil,         // depthStencilTargets[N].srViewDepth (explicit index)
+    File,                 // WIC-loaded texture file (path relative to the pass's folder)
 };
 
 struct InputBinding {
@@ -138,12 +160,23 @@ struct InputBinding {
     InputKind                               kind = InputKind::None;
     std::string                             resourceName;        // for Resource
     int                                     gbufferIndex = -1;   // for GBufferRT
+    int                                     depthStencilIndex = -1;  // for DepthStencil
     int                                     sourceSlot = -1;     // for CurrentPSRV
+    // For File: lazy-loaded on first fire via the same WIC path replacement
+    // shaders use for bindTexture. Released in Pass::Release.
+    ReplacementTextureBinding               fileTexture;
 };
 
 enum class OutputKind : uint8_t {
     Resource,                  // a customResource RTV (PS) or UAV (CS)
-    GBufferRT                  // g_rendererData->renderTargets[N].rtView (PS only)
+    GBufferRT,                 // g_rendererData->renderTargets[N].rtView (PS only)
+    // OMGetRenderTargets()[0] as captured at fire time (PS only). Exists for
+    // triggers where the engine's destination surface is not present in
+    // renderTargets[] at all — at afterDeferredLights the composite writes an
+    // RTV that no table index reaches, so the only way to address it is "the
+    // one bound right now". Identity is deliberately unknown; the bind path
+    // guards on it being a 2D texture before using it.
+    CurrentRTV
 };
 
 struct OutputBinding {
@@ -151,11 +184,13 @@ struct OutputBinding {
     OutputKind                              kind = OutputKind::Resource;
     std::string                             resourceName;        // for Resource
     int                                     gbufferIndex = -1;   // for GBufferRT
+    uint32_t                                mipLevel = 0;        // customResource:NAME@mipN
 };
 
 struct ThreadGroupDim {
     ScaleMode                               mode = ScaleMode::Absolute;
     uint32_t                                value = 1;           // Absolute: literal; ScreenDiv: divisor
+    bool                                    roundUp = false;     // screenceil/N covers partial edge groups
 };
 
 struct PassSpec {
@@ -188,11 +223,22 @@ struct PassSpec {
     bool                                    clearOnFire = false;
     bool                                    depthTest = false;
     bool                                    log = false;
+    // Opt-in asynchronous timestamp queries. Results are polled several
+    // frames later with DONOTFLUSH, so diagnostics never stall the renderer.
+    bool                                    profileGpu = false;
     std::array<ThreadGroupDim, 3>           threadGroups{};      // CS only
 };
 
 class Pass {
 public:
+    struct GpuTimingSlot {
+        REX::W32::ID3D11Query* disjoint = nullptr;
+        REX::W32::ID3D11Query* begin = nullptr;
+        REX::W32::ID3D11Query* end = nullptr;
+        uint32_t submittedFrame = 0;
+        bool pending = false;
+    };
+
     PassSpec                                    spec{};
     REX::W32::ID3D11PixelShader*                psShader = nullptr;
     REX::W32::ID3D11ComputeShader*              csShader = nullptr;
@@ -209,6 +255,12 @@ public:
     // Total fires across the lifetime of this pass — used by the debug
     // overlay and the rate-limited fire log.
     std::atomic<uint64_t>                       totalFireCount{ 0 };
+    std::array<GpuTimingSlot, 4>                gpuTiming{};
+    std::atomic<float>                          gpuLastMs{ 0.0f };
+    std::atomic<float>                          gpuAverageMs{ 0.0f };
+    std::atomic<uint64_t>                       gpuTimingSamples{ 0 };
+    bool                                        gpuTimingUnavailable = false;
+    bool                                        gpuTimingFailureLogged = false;
     // Set by FileWatcher when the .hlsl file changes on disk. FirePass
     // observes the flag on the main render thread, drops the compiled
     // shader, and recompiles before dispatching. This avoids the watcher
@@ -220,15 +272,23 @@ public:
     // compile this pass at once. unique_ptr because std::mutex is non-movable.
     std::unique_ptr<std::mutex>                 compileMutex = std::make_unique<std::mutex>();
 
-    // Cache for activeWhen resolution. Set on first fire after lookup
-    // against g_shaderSettings.GetBoolShaderValues(). Subsequent fires
-    // read sv->current.b directly without rescanning the list.
-    //   activeWhenResolved == nullptr && !activeWhenChecked → unresolved
-    //   activeWhenResolved == nullptr &&  activeWhenChecked → unknown id (fire-open)
-    //   activeWhenResolved != nullptr                       → cached pointer
-    void*                                       activeWhenResolved = nullptr;
+    struct ActiveWhenTerm {
+        // Bool: a Values.ini bool ShaderValue*. WeatherRain: runtime-evaluated
+        // against g_customBufferData weather class (no shaderValue), so rain
+        // passes can be skipped entirely in clear weather.
+        enum class Kind : std::uint8_t { Bool, WeatherRain };
+        void* shaderValue = nullptr;
+        bool  negate = false;
+        Kind  kind = Kind::Bool;
+    };
+    // Terms are AND-combined by default; a `|`-separated activeWhen sets
+    // activeWhenIsOr so any single true term satisfies the gate (used to fold
+    // several feature-gated copies of one pass into a single OR-gated pass).
+    // Unknown ids retain fire-open behavior so legacy configs never turn a pass
+    // off unexpectedly.
+    std::vector<ActiveWhenTerm>                 activeWhenTerms;
     bool                                        activeWhenChecked = false;
-    bool                                        activeWhenNegated = false;
+    bool                                        activeWhenIsOr = false;
 
     void Release();
 };
@@ -279,6 +339,13 @@ public:
     // Called once after Shader.ini parsing completes when DEVELOPMENT=true.
     void StartFileWatchers();
 
+    // Mark every pass that has an HLSL file for recompile from disk, exactly
+    // as the watcher callback does but without requiring a watcher to exist
+    // (they are DEVELOPMENT-only). Sets flags only — the compiled objects are
+    // released on the render thread inside FirePassWithSaved. Returns the
+    // number of passes marked.
+    std::size_t RequestReloadAll();
+
     // Submit one compile job per registered pass to the background
     // precompile worker. The worker is owned externally (g_precompileWorker)
     // — we just hand it std::function<void()>s. Each job locks the per-pass
@@ -320,6 +387,10 @@ public:
     //   - ping-pong swap
     //   - global SRV bind refresh
     void OnFramePresent(REX::W32::ID3D11DeviceContext* context);
+
+    // Called from ShadowUpgrade's DeferredLightsImpl hook, after the original.
+    // Fires every AfterDeferredLights pass as one priority-sorted batch.
+    void FireAfterDeferredLights(REX::W32::ID3D11DeviceContext* context);
 
     // Called from BindInjectedPixelShaderResources to keep customResource
     // SRVs bound on their declared slots after engine state changes.
@@ -386,6 +457,11 @@ private:
 
 // Single shared registry. Lifetime: process; reset on Shader.ini hot reload.
 extern Registry g_registry;
+
+// Free-function wrapper so hook translation units can fire this trigger without
+// including CustomPass.h, which is not standalone (it needs Plugin.h's types
+// first). Declared again in ShadowUpgrade.cpp; defined in CustomPass.cpp.
+void FireAfterDeferredLightsPasses(REX::W32::ID3D11DeviceContext* context);
 
 // --- Built-in fullscreen VS used by every PS-typed pass -------------------
 // Compiled once on first PS pass fire and cached.

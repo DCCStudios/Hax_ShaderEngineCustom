@@ -28,6 +28,8 @@ namespace {
 REL::Relocation<void**> ptr_ShadowSceneNode{ REL::ID{ 879298, 0 } };
 constexpr std::size_t    kSSN_PointPtrsOffset  = 0x158;
 constexpr std::size_t    kSSN_PointCountOffset = 0x168;
+constexpr std::size_t    kSSN_ShadowPtrsOffset = 0x170;
+constexpr std::size_t    kSSN_ShadowCountOffset = 0x180;
 constexpr std::size_t    kLight_StencilFlagOff = 0x17d;
 
 // Maximum number of point lights we can save/restore. Boston gameplay shows
@@ -120,6 +122,82 @@ void OnExit()
     std::memcpy(tl_savedArrayBase, tl_saved, tl_savedCount * sizeof(void*));
     tl_savedCount     = 0;
     tl_savedArrayBase = nullptr;
+}
+
+bool IsShadowMappedLight(const void* light) noexcept
+{
+    if (!light || !REX::FModule::IsRuntimeOG()) return true;
+
+    void* ssn = ReadShadowSceneNode();
+    if (!ssn) return true;
+
+    void** shadowLights = nullptr;
+    std::uint32_t shadowCount = 0;
+    std::memcpy(
+        &shadowLights,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowPtrsOffset,
+        sizeof(shadowLights));
+    std::memcpy(
+        &shadowCount,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowCountOffset,
+        sizeof(shadowCount));
+    if (shadowCount == 0) return false;
+    // The engine's tiled light contract tops out at 625 records. Treat a
+    // malformed pointer or count conservatively so we never double darken an
+    // unknown light as a side effect of bad classification data.
+    if (!shadowLights || shadowCount > 625) return true;
+    return std::find(shadowLights, shadowLights + shadowCount, light) !=
+        shadowLights + shadowCount;
+}
+
+std::uint32_t GetShadowLightCount() noexcept
+{
+    if (!REX::FModule::IsRuntimeOG()) return 0;
+
+    void* ssn = ReadShadowSceneNode();
+    if (!ssn) return 0;
+
+    void** shadowLights = nullptr;
+    std::uint32_t shadowCount = 0;
+    std::memcpy(
+        &shadowLights,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowPtrsOffset,
+        sizeof(shadowLights));
+    std::memcpy(
+        &shadowCount,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowCountOffset,
+        sizeof(shadowCount));
+    return shadowLights && shadowCount <= 625 ? shadowCount : 0;
+}
+
+std::size_t CopyShadowLightPointers(
+    void** destination,
+    std::size_t capacity) noexcept
+{
+    if (!destination || capacity == 0 || !REX::FModule::IsRuntimeOG()) {
+        return 0;
+    }
+
+    void* ssn = ReadShadowSceneNode();
+    if (!ssn) return 0;
+
+    void** shadowLights = nullptr;
+    std::uint32_t shadowCount = 0;
+    std::memcpy(
+        &shadowLights,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowPtrsOffset,
+        sizeof(shadowLights));
+    std::memcpy(
+        &shadowCount,
+        static_cast<std::uint8_t*>(ssn) + kSSN_ShadowCountOffset,
+        sizeof(shadowCount));
+    if (!shadowLights || shadowCount == 0 || shadowCount > 625) return 0;
+
+    const std::size_t copied = (std::min)(
+        capacity,
+        static_cast<std::size_t>(shadowCount));
+    std::memcpy(destination, shadowLights, copied * sizeof(void*));
+    return copied;
 }
 
 void Initialize()

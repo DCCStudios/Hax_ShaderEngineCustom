@@ -30,6 +30,7 @@ namespace ShaderResources
         std::atomic<UINT> g_currentDepthTargetIndex{ DEPTHSTENCIL_TARGET_COUNT };
         std::atomic<UINT> g_currentRenderTargetCount{ 0 };
         std::atomic<bool> g_currentHasRenderTarget{ false };
+        std::atomic<bool> g_waterReflectionCubeCaptureActive{ false };
         REX::W32::ID3D11ShaderResourceView* g_lastSceneDepthSRV = nullptr;
 
         bool g_activeReplacementPixelShader = false;
@@ -70,6 +71,206 @@ namespace ShaderResources
         UINT g_modularFloatElementCount = 0;
         UINT g_modularIntElementCount = 0;
         UINT g_modularBoolElementCount = 0;
+        REX::W32::ID3D11Buffer* g_waterReflectionCubeMetaBuffer = nullptr;
+        REX::W32::ID3D11ShaderResourceView* g_waterReflectionCubeMetaSRV = nullptr;
+        std::vector<ModularFloat4> g_waterReflectionCubeMetaData(2);
+        UINT g_waterReflectionCubeMetaElementCount = 0;
+        bool g_waterReflectionCubeMetaReady = false;
+        REX::W32::ID3D11Texture2D* g_waterReflectionCubeTrackedTexture = nullptr;
+        std::atomic<std::uint32_t> g_waterReflectionCubePendingFaces{ 0u };
+        std::atomic<std::uint32_t> g_waterReflectionCubeGeneration{ 0u };
+        std::atomic<std::uint32_t> g_waterReflectionCubeResourceEpoch{ 0u };
+        std::atomic<std::uint32_t> g_waterReflectionCubeLastCompletionFrame{ 0u };
+        std::atomic<float> g_waterReflectionCubeLastCompletionTime{ 0.0f };
+        std::atomic<int> g_waterReflectionCubeActiveFace{ -1 };
+        std::atomic<bool> g_waterReflectionCubeHasCompleteGeneration{ false };
+        std::array<std::atomic<std::uint32_t>, 6>
+            g_waterReflectionCubeLastFaceCompletionFrame{};
+        bool g_waterReflectionCubeSceneIdentityReady = false;
+        std::uint32_t g_waterReflectionCubeWorldspace = 0u;
+        bool g_waterReflectionCubeInterior = false;
+        float g_waterReflectionCubeCameraX = 0.0f;
+        float g_waterReflectionCubeCameraY = 0.0f;
+        float g_waterReflectionCubeCameraZ = 0.0f;
+
+        std::uint32_t WaterReflectionCubeFrame() noexcept
+        {
+            const float frame = g_customBufferData.frame;
+            return std::isfinite(frame) && frame > 0.0f
+                ? static_cast<std::uint32_t>(frame)
+                : 0u;
+        }
+
+        float WaterReflectionCubeTime() noexcept
+        {
+            const float time = g_customBufferData.time;
+            return std::isfinite(time) && time >= 0.0f ? time : 0.0f;
+        }
+
+        void InvalidateWaterReflectionCubeGeneration(const char* reason)
+        {
+            g_waterReflectionCubePendingFaces.store(0u, std::memory_order_relaxed);
+            g_waterReflectionCubeGeneration.store(0u, std::memory_order_relaxed);
+            g_waterReflectionCubeLastCompletionFrame.store(0u, std::memory_order_relaxed);
+            g_waterReflectionCubeLastCompletionTime.store(0.0f, std::memory_order_relaxed);
+            g_waterReflectionCubeActiveFace.store(-1, std::memory_order_relaxed);
+            g_waterReflectionCubeHasCompleteGeneration.store(false, std::memory_order_relaxed);
+            for (auto& frame : g_waterReflectionCubeLastFaceCompletionFrame) {
+                frame.store(0u, std::memory_order_relaxed);
+            }
+            const auto epoch = g_waterReflectionCubeResourceEpoch.fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+            REX::INFO(
+                "WaterReflectionCube: invalidated generation tracking reason={} epoch={}",
+                reason ? reason : "unknown", epoch);
+        }
+
+        void TrackWaterReflectionCubeTexture(
+            REX::W32::ID3D11Texture2D* texture)
+        {
+            if (texture == g_waterReflectionCubeTrackedTexture) {
+                return;
+            }
+            g_waterReflectionCubeTrackedTexture = texture;
+            InvalidateWaterReflectionCubeGeneration("resource-change");
+        }
+
+        void TrackWaterReflectionCubeSceneIdentity()
+        {
+            const std::uint32_t worldspace = g_customBufferData.worldSpaceID;
+            const bool interior = g_customBufferData.inInterior > 0.5f;
+            const float cameraX = g_customBufferData.camX;
+            const float cameraY = g_customBufferData.camY;
+            const float cameraZ = g_customBufferData.camZ;
+            const bool cameraFinite = std::isfinite(cameraX) &&
+                std::isfinite(cameraY) && std::isfinite(cameraZ);
+
+            if (!g_waterReflectionCubeSceneIdentityReady) {
+                g_waterReflectionCubeSceneIdentityReady = true;
+                g_waterReflectionCubeWorldspace = worldspace;
+                g_waterReflectionCubeInterior = interior;
+                if (cameraFinite) {
+                    g_waterReflectionCubeCameraX = cameraX;
+                    g_waterReflectionCubeCameraY = cameraY;
+                    g_waterReflectionCubeCameraZ = cameraZ;
+                }
+                return;
+            }
+
+            const float dx = cameraX - g_waterReflectionCubeCameraX;
+            const float dy = cameraY - g_waterReflectionCubeCameraY;
+            const float dz = cameraZ - g_waterReflectionCubeCameraZ;
+            constexpr float kTeleportDistance = 8192.0f;
+            const bool teleported = cameraFinite &&
+                dx * dx + dy * dy + dz * dz >
+                    kTeleportDistance * kTeleportDistance;
+            if (worldspace != g_waterReflectionCubeWorldspace ||
+                interior != g_waterReflectionCubeInterior || teleported) {
+                InvalidateWaterReflectionCubeGeneration(
+                    teleported ? "camera-teleport" : "scene-transition");
+            }
+
+            g_waterReflectionCubeWorldspace = worldspace;
+            g_waterReflectionCubeInterior = interior;
+            if (cameraFinite) {
+                g_waterReflectionCubeCameraX = cameraX;
+                g_waterReflectionCubeCameraY = cameraY;
+                g_waterReflectionCubeCameraZ = cameraZ;
+            }
+        }
+
+        void CompleteWaterReflectionCubeFace(int face, const char* source)
+        {
+            if (face < 0 || face >= 6) {
+                return;
+            }
+
+            // Direct RTV completion followed by a resolve/copy can report the
+            // same physical face twice. Deduplicate within the render frame so
+            // the second report cannot seed a false next generation after the
+            // sixth face completes.
+            const std::uint32_t frame = WaterReflectionCubeFrame();
+            if (frame != 0u) {
+                const auto previousFrame =
+                    g_waterReflectionCubeLastFaceCompletionFrame[face].exchange(
+                        frame, std::memory_order_relaxed);
+                if (previousFrame == frame) {
+                    return;
+                }
+            }
+
+            const std::uint32_t faceBit = 1u << face;
+            const std::uint32_t previousFaces =
+                g_waterReflectionCubePendingFaces.fetch_or(
+                    faceBit, std::memory_order_relaxed);
+            const std::uint32_t completedFaces =
+                (previousFaces | faceBit) & 0x3Fu;
+            if ((previousFaces & faceBit) == 0u) {
+                REX::INFO(
+                    "WaterReflectionCube: completed face={} source={} pendingMask=0x{:02X}",
+                    face, source ? source : "unknown", completedFaces);
+            }
+            if (completedFaces != 0x3Fu) {
+                return;
+            }
+
+            g_waterReflectionCubePendingFaces.store(0u, std::memory_order_relaxed);
+            g_waterReflectionCubeHasCompleteGeneration.store(
+                true, std::memory_order_relaxed);
+            const std::uint32_t generation =
+                g_waterReflectionCubeGeneration.fetch_add(
+                    1u, std::memory_order_relaxed) + 1u;
+            const float completionTime = WaterReflectionCubeTime();
+            g_waterReflectionCubeLastCompletionFrame.store(
+                frame, std::memory_order_relaxed);
+            g_waterReflectionCubeLastCompletionTime.store(
+                completionTime, std::memory_order_relaxed);
+            REX::INFO(
+                "WaterReflectionCube: completed generation={} epoch={} frame={} time={:.3f}",
+                generation,
+                g_waterReflectionCubeResourceEpoch.load(
+                    std::memory_order_relaxed),
+                frame, completionTime);
+        }
+
+        void CompleteWaterReflectionCubeActiveFace()
+        {
+            const int face = g_waterReflectionCubeActiveFace.exchange(
+                -1, std::memory_order_relaxed);
+            CompleteWaterReflectionCubeFace(face, "rtv-leave");
+        }
+
+        bool IsWaterReflectionCubeResource(
+            REX::W32::ID3D11Resource* resource)
+        {
+            if (!resource || !g_rendererData) {
+                return false;
+            }
+
+            auto& cube = g_rendererData->cubeMapRenderTargets[0];
+            TrackWaterReflectionCubeSceneIdentity();
+            TrackWaterReflectionCubeTexture(cube.texture);
+            return cube.texture && resource == cube.texture;
+        }
+
+        void ClearPublishedWaterReflectionCubeBindings(
+            REX::W32::ID3D11DeviceContext* context)
+        {
+            if (!context) {
+                return;
+            }
+
+            // D3D11 otherwise auto-nulls conflicting SRVs when the engine
+            // writes the cube. Clearing explicitly avoids a debug-layer hazard
+            // and prevents a replacement bind hook from reasserting t49/t51.
+            REX::W32::ID3D11ShaderResourceView* nullSRV = nullptr;
+            g_bindingInjectedPixelResources = true;
+            context->PSSetShaderResources(49u, 1u, &nullSRV);
+            context->PSSetShaderResources(51u, 1u, &nullSRV);
+            g_bindingInjectedPixelResources = false;
+            context->CSSetShaderResources(49u, 1u, &nullSRV);
+            context->CSSetShaderResources(51u, 1u, &nullSRV);
+        }
 
         UINT PackedElementCount(std::size_t valueCount)
         {
@@ -126,17 +327,19 @@ namespace ShaderResources
         }
 
         template <class T>
-        void UpdateStructuredSRV(REX::W32::ID3D11DeviceContext* context, REX::W32::ID3D11Buffer* buffer, const std::vector<T>& data)
+        bool UpdateStructuredSRV(REX::W32::ID3D11DeviceContext* context, REX::W32::ID3D11Buffer* buffer, const std::vector<T>& data)
         {
             if (!context || !buffer || data.empty()) {
-                return;
+                return false;
             }
 
             REX::W32::D3D11_MAPPED_SUBRESOURCE mapped{};
             if (SUCCEEDED(context->Map(buffer, 0, REX::W32::D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
                 memcpy(mapped.data, data.data(), sizeof(T) * data.size());
                 context->Unmap(buffer, 0);
+                return true;
             }
+            return false;
         }
 
         REX::W32::ID3D11ShaderResourceView* GetMainDepthSRV()
@@ -345,6 +548,10 @@ namespace ShaderResources
                 return "gbufferMaterial";
             case ReplacementSRVSourceKind::MotionVectors:
                 return "motionVectors";
+            case ReplacementSRVSourceKind::WaterReflectionCubemap:
+                return "waterReflectionCubemap";
+            case ReplacementSRVSourceKind::WaterReflectionCubemapMeta:
+                return "waterReflectionCubemapMeta";
             case ReplacementSRVSourceKind::CustomResource:
                 return std::format("customResource:{}", binding.resourceName);
             default:
@@ -352,7 +559,238 @@ namespace ShaderResources
             }
         }
 
-        REX::W32::ID3D11ShaderResourceView* ResolveReplacementSRV(ReplacementSRVBinding& binding)
+        REX::W32::ID3D11ShaderResourceView* ResolveWaterReflectionCubemap(
+            REX::W32::ID3D11DeviceContext* context)
+        {
+            if (!context) {
+                return nullptr;
+            }
+
+            auto publishMeta = [context](
+                float valid, float mipCount, float cubeSize) {
+                REX::W32::ID3D11Device* device = nullptr;
+                context->GetDevice(&device);
+                if (!device) {
+                    return;
+                }
+                auto* previousMetaBuffer = g_waterReflectionCubeMetaBuffer;
+                if (EnsureStructuredSRV<ModularFloat4>(
+                        device,
+                        g_waterReflectionCubeMetaBuffer,
+                        g_waterReflectionCubeMetaSRV,
+                        g_waterReflectionCubeMetaElementCount,
+                        2u,
+                        "water reflection cube metadata")) {
+                    if (previousMetaBuffer != g_waterReflectionCubeMetaBuffer) {
+                        g_waterReflectionCubeMetaReady = false;
+                    }
+                    static float previousValid = -1.0f;
+                    static float previousMips = -1.0f;
+                    static float previousSize = -1.0f;
+                    static float previousGeneration = -1.0f;
+                    static float previousEpoch = -1.0f;
+                    static float previousCompletionTime = -1.0f;
+                    static float previousPendingFaces = -1.0f;
+                    static REX::W32::ID3D11Buffer* previousBuffer = nullptr;
+                    const std::uint32_t observedGeneration =
+                        g_waterReflectionCubeGeneration.load(
+                            std::memory_order_relaxed);
+                    // The engine may populate the persistent reflection cube
+                    // before our D3D hooks are installed. Reserve generation
+                    // one for that descriptor-validated bootstrap image, then
+                    // offset every generation whose six face writes we observe.
+                    // Capture hazards still publish valid=0 and clear t49/t51.
+                    const float generation = observedGeneration > 0u
+                        ? static_cast<float>(observedGeneration + 1u)
+                        : (valid > 0.5f ? 1.0f : 0.0f);
+                    const float epoch = static_cast<float>(
+                        g_waterReflectionCubeResourceEpoch.load(
+                            std::memory_order_relaxed));
+                    const float completionTime = observedGeneration > 0u
+                        ? g_waterReflectionCubeLastCompletionTime.load(
+                              std::memory_order_relaxed)
+                        : 0.0f;
+                    const float pendingFaces = static_cast<float>(
+                        g_waterReflectionCubePendingFaces.load(
+                            std::memory_order_relaxed) & 0x3Fu);
+                    if (valid != previousValid || mipCount != previousMips ||
+                        cubeSize != previousSize || generation != previousGeneration ||
+                        epoch != previousEpoch ||
+                        completionTime != previousCompletionTime ||
+                        pendingFaces != previousPendingFaces ||
+                        g_waterReflectionCubeMetaBuffer != previousBuffer) {
+                        g_waterReflectionCubeMetaData[0] = {
+                            valid, mipCount, cubeSize, 9137.25f };
+                        // Element one is a recurring-generation contract for
+                        // GPU consumers. The original element-zero ABI remains
+                        // unchanged for water replacement shaders.
+                        g_waterReflectionCubeMetaData[1] = {
+                            generation, epoch, completionTime, pendingFaces };
+                        if (UpdateStructuredSRV(
+                            context,
+                            g_waterReflectionCubeMetaBuffer,
+                            g_waterReflectionCubeMetaData)) {
+                            g_waterReflectionCubeMetaReady = true;
+                            previousValid = valid;
+                            previousMips = mipCount;
+                            previousSize = cubeSize;
+                            previousGeneration = generation;
+                            previousEpoch = epoch;
+                            previousCompletionTime = completionTime;
+                            previousPendingFaces = pendingFaces;
+                            previousBuffer =
+                                g_waterReflectionCubeMetaBuffer;
+                        } else {
+                            // A stale valid metadata buffer is worse than a
+                            // missing one during capture or a generation flip.
+                            g_waterReflectionCubeMetaReady = false;
+                        }
+                    }
+                }
+                device->Release();
+            };
+
+            if (!g_rendererData) {
+                publishMeta(0.0f, 0.0f, 0.0f);
+                return nullptr;
+            }
+
+            TrackWaterReflectionCubeSceneIdentity();
+
+            auto& cube = g_rendererData->cubeMapRenderTargets[0];
+            if (!cube.texture || !cube.srView) {
+                publishMeta(0.0f, 0.0f, 0.0f);
+                return nullptr;
+            }
+            TrackWaterReflectionCubeTexture(cube.texture);
+
+            // Directly publishing the engine cube is safe only while none of
+            // its six faces is the active render target. OMGetRenderTargets
+            // AddRefs every returned view, so release them before returning.
+            REX::W32::ID3D11RenderTargetView* activeRTVs[8]{};
+            context->OMGetRenderTargets(8, activeRTVs, nullptr);
+            bool cubeFaceActive = g_waterReflectionCubeCaptureActive.load(
+                std::memory_order_relaxed);
+            for (auto* activeRTV : activeRTVs) {
+                if (activeRTV) {
+                    for (auto* cubeRTV : cube.rtView) {
+                        cubeFaceActive = cubeFaceActive ||
+                            (cubeRTV && activeRTV == cubeRTV);
+                    }
+                    if (!cubeFaceActive) {
+                        REX::W32::ID3D11Resource* activeResource = nullptr;
+                        activeRTV->GetResource(&activeResource);
+                        cubeFaceActive = activeResource == cube.texture;
+                        if (activeResource) {
+                            activeResource->Release();
+                        }
+                    }
+                    activeRTV->Release();
+                }
+            }
+
+            static bool lastCubeFaceActive = false;
+            if (cubeFaceActive != lastCubeFaceActive) {
+                REX::INFO(
+                    "WaterReflectionCube: capture {} - t49 {}",
+                    cubeFaceActive ? "active" : "inactive",
+                    cubeFaceActive ? "cleared" : "eligible");
+                lastCubeFaceActive = cubeFaceActive;
+            }
+            if (cubeFaceActive) {
+                publishMeta(0.0f, 0.0f, 0.0f);
+                return nullptr;
+            }
+
+            REX::W32::D3D11_TEXTURE2D_DESC textureDesc{};
+            REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            cube.texture->GetDesc(&textureDesc);
+            cube.srView->GetDesc(&srvDesc);
+            REX::W32::ID3D11Resource* srvResource = nullptr;
+            cube.srView->GetResource(&srvResource);
+            const bool srvMatchesTexture = srvResource == cube.texture;
+            if (srvResource) {
+                srvResource->Release();
+            }
+            const bool textureCube =
+                (textureDesc.miscFlags &
+                 REX::W32::D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
+            const UINT mostDetailedMip = srvDesc.textureCube.mostDetailedMip;
+            const UINT declaredVisibleMips = srvDesc.textureCube.mipLevels;
+            const UINT availableMips = mostDetailedMip < textureDesc.mipLevels
+                ? textureDesc.mipLevels - mostDetailedMip
+                : 0u;
+            const UINT visibleMips = declaredVisibleMips == UINT_MAX
+                ? availableMips
+                : (std::min)(declaredVisibleMips, availableMips);
+            const UINT visibleBaseSize = availableMips > 0u
+                ? (std::max)(textureDesc.width >> mostDetailedMip, 1u)
+                : 0u;
+            const bool descriptorValid = srvMatchesTexture &&
+                textureDesc.arraySize == 6u && textureCube &&
+                srvDesc.viewDimension ==
+                    REX::W32::D3D11_SRV_DIMENSION_TEXTURECUBE &&
+                visibleMips > 0u && visibleBaseSize > 0u;
+            const std::uint32_t pendingFaces =
+                g_waterReflectionCubePendingFaces.load(
+                    std::memory_order_relaxed) & 0x3Fu;
+            const std::uint32_t generation =
+                g_waterReflectionCubeGeneration.load(
+                    std::memory_order_relaxed);
+            const std::uint32_t epoch =
+                g_waterReflectionCubeResourceEpoch.load(
+                    std::memory_order_relaxed);
+            const bool completeGenerationAvailable =
+                g_waterReflectionCubeHasCompleteGeneration.load(
+                    std::memory_order_relaxed);
+            // A valid persistent engine cube can predate hook installation.
+            // Publish that image as a bootstrap generation while continuing to
+            // track recurring six-face completions whenever the engine updates
+            // it after startup. Active cube rendering is rejected above.
+            const bool bootstrapGeneration = descriptorValid &&
+                !completeGenerationAvailable;
+            const bool valid = descriptorValid;
+
+            static REX::W32::ID3D11Texture2D* loggedTexture = nullptr;
+            static std::uint32_t loggedPendingFaces = UINT_MAX;
+            static std::uint32_t loggedGeneration = UINT_MAX;
+            static std::uint32_t loggedEpoch = UINT_MAX;
+            static bool loggedValid = false;
+            if (cube.texture != loggedTexture ||
+                pendingFaces != loggedPendingFaces ||
+                generation != loggedGeneration || epoch != loggedEpoch ||
+                valid != loggedValid) {
+                REX::INFO(
+                    "WaterReflectionCube: texture=0x{:016X} srv=0x{:016X} {}x{} array={} resourceMips={} srvMostDetailed={} srvMips={} usableMips={} format={} srvDim={} descriptorValid={} epoch={} generation={} pendingFaces=0x{:02X} bootstrap={} valid={}",
+                    reinterpret_cast<std::uintptr_t>(cube.texture),
+                    reinterpret_cast<std::uintptr_t>(cube.srView),
+                    textureDesc.width, textureDesc.height,
+                    textureDesc.arraySize, textureDesc.mipLevels,
+                    mostDetailedMip, visibleMips,
+                    valid ? 1u : 0u,
+                    static_cast<unsigned>(textureDesc.format),
+                    static_cast<unsigned>(srvDesc.viewDimension),
+                    descriptorValid, epoch, generation, pendingFaces,
+                    bootstrapGeneration, valid);
+                loggedTexture = cube.texture;
+                loggedPendingFaces = pendingFaces;
+                loggedGeneration = generation;
+                loggedEpoch = epoch;
+                loggedValid = valid;
+            }
+            publishMeta(
+                valid ? 1.0f : 0.0f,
+                // Descriptor allocation does not prove that FO4 populated or
+                // generated lower mips. Publish LOD0 only until runtime
+                // telemetry establishes a complete roughness mip chain.
+                valid ? 1.0f : 0.0f,
+                valid ? static_cast<float>(visibleBaseSize) : 0.0f);
+            return valid ? cube.srView : nullptr;
+        }
+
+        REX::W32::ID3D11ShaderResourceView* ResolveReplacementSRV(
+            REX::W32::ID3D11DeviceContext* context,
+            ReplacementSRVBinding& binding)
         {
             if (!g_rendererData) {
                 return nullptr;
@@ -380,6 +818,13 @@ namespace ShaderResources
                 return g_rendererData->renderTargets[RT::idx(RT::Color::kGbufferMaterial)].srView;
             case ReplacementSRVSourceKind::MotionVectors:
                 return g_rendererData->renderTargets[RT::idx(RT::Color::kMotionVectors)].srView;
+            case ReplacementSRVSourceKind::WaterReflectionCubemap:
+                return ResolveWaterReflectionCubemap(context);
+            case ReplacementSRVSourceKind::WaterReflectionCubemapMeta:
+                ResolveWaterReflectionCubemap(context);
+                return g_waterReflectionCubeMetaReady
+                    ? g_waterReflectionCubeMetaSRV
+                    : nullptr;
             case ReplacementSRVSourceKind::CustomResource:
                 return CustomPass::g_registry.GetResourceSRV(binding.resourceName);
             default:
@@ -670,8 +1115,25 @@ namespace ShaderResources
                 continue;
             }
 
-            REX::W32::ID3D11ShaderResourceView* srv = ResolveReplacementSRV(binding);
+            REX::W32::ID3D11ShaderResourceView* srv =
+                ResolveReplacementSRV(context, binding);
             if (!srv) {
+                // This source is intentionally rebound even when unavailable:
+                // clearing t49 prevents inherited/stale SRVs and is also the
+                // required RTV/SRV hazard break during cube-face capture.
+                if (binding.kind ==
+                        ReplacementSRVSourceKind::WaterReflectionCubemap ||
+                    binding.kind ==
+                        ReplacementSRVSourceKind::WaterReflectionCubemapMeta) {
+                    if (pixelStage) {
+                        context->PSSetShaderResources(
+                            static_cast<UINT>(binding.slot), 1, &srv);
+                    } else {
+                        context->VSSetShaderResources(
+                            static_cast<UINT>(binding.slot), 1, &srv);
+                    }
+                    continue;
+                }
                 if (!binding.warnedMissing) {
                     REX::WARN("ReplacementSRV[{}]: source '{}' unavailable for t{}",
                         def->id, ReplacementSRVSourceName(binding), binding.slot);
@@ -686,6 +1148,14 @@ namespace ShaderResources
                 context->VSSetShaderResources(static_cast<UINT>(binding.slot), 1, &srv);
             }
         }
+    }
+
+    // Public face of the lazy WIC texture loader so custom passes can bind
+    // file-backed textures (`input=N:file:foo.png`) through the exact same
+    // load/cache/fail-once path replacement shaders use for bindTexture.
+    bool EnsureFileTextureSRV(REX::W32::ID3D11Device* device, ReplacementTextureBinding& binding)
+    {
+        return EnsureReplacementTextureSRV(device, binding);
     }
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal()
@@ -720,6 +1190,21 @@ namespace ShaderResources
         return nullptr;
     }
 
+    REX::W32::ID3D11ShaderResourceView* GetWaterReflectionCubemapSRVForCustomPass(
+        REX::W32::ID3D11DeviceContext* context)
+    {
+        return ResolveWaterReflectionCubemap(context);
+    }
+
+    REX::W32::ID3D11ShaderResourceView* GetWaterReflectionCubemapMetaSRVForCustomPass(
+        REX::W32::ID3D11DeviceContext* context)
+    {
+        ResolveWaterReflectionCubemap(context);
+        return g_waterReflectionCubeMetaReady
+            ? g_waterReflectionCubeMetaSRV
+            : nullptr;
+    }
+
     UINT FindDepthTargetIndexForDSV(REX::W32::ID3D11DepthStencilView* dsv)
     {
         if (!g_rendererData || !dsv) {
@@ -739,6 +1224,196 @@ namespace ShaderResources
         }
 
         return DEPTHSTENCIL_TARGET_COUNT;
+    }
+
+    void PrepareWaterReflectionCubeOM(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT numViews,
+        REX::W32::ID3D11RenderTargetView* const* renderTargetViews)
+    {
+        bool cubeFaceBound = false;
+        bool mainViewBound = false;
+        int activeFace = -1;
+        if (g_rendererData && renderTargetViews) {
+            auto& cube = g_rendererData->cubeMapRenderTargets[0];
+            TrackWaterReflectionCubeSceneIdentity();
+            TrackWaterReflectionCubeTexture(cube.texture);
+            auto& mainTarget = g_rendererData->renderTargets[
+                RT::idx(RT::Color::kMain)];
+            for (UINT i = 0; i < numViews; ++i) {
+                auto* incomingRTV = renderTargetViews[i];
+                if (!incomingRTV) {
+                    continue;
+                }
+                for (int face = 0; face < 6; ++face) {
+                    if (cube.rtView[face] && incomingRTV == cube.rtView[face]) {
+                        cubeFaceBound = true;
+                        activeFace = face;
+                        break;
+                    }
+                }
+                REX::W32::ID3D11Resource* incomingResource = nullptr;
+                incomingRTV->GetResource(&incomingResource);
+                const bool incomingCubeResource =
+                    cube.texture && incomingResource == cube.texture;
+                cubeFaceBound = cubeFaceBound || incomingCubeResource;
+                if (incomingCubeResource && activeFace < 0) {
+                    // Some engine paths construct an equivalent face RTV
+                    // instead of reusing RendererData::rtView[face]. Recover
+                    // the face from the view descriptor rather than relying on
+                    // COM view pointer identity.
+                    REX::W32::D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+                    incomingRTV->GetDesc(&viewDesc);
+                    if (viewDesc.viewDimension ==
+                            REX::W32::D3D11_RTV_DIMENSION_TEXTURE2DARRAY &&
+                        viewDesc.texture2DArray.arraySize == 1u &&
+                        viewDesc.texture2DArray.firstArraySlice < 6u) {
+                        activeFace = static_cast<int>(
+                            viewDesc.texture2DArray.firstArraySlice);
+                    } else if (viewDesc.viewDimension ==
+                                   REX::W32::D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY &&
+                               viewDesc.texture2DMSArray.arraySize == 1u &&
+                               viewDesc.texture2DMSArray.firstArraySlice < 6u) {
+                        activeFace = static_cast<int>(
+                            viewDesc.texture2DMSArray.firstArraySlice);
+                    }
+                }
+                mainViewBound = mainViewBound ||
+                    (mainTarget.texture &&
+                     incomingResource == mainTarget.texture);
+                if (incomingResource) {
+                    incomingResource->Release();
+                }
+            }
+        }
+
+        // A face is complete only after the engine leaves its RTV. Counting
+        // the incoming bind made an untouched face look ready and could expose
+        // a six-face mix from different update cycles to lighting consumers.
+        const int previousActiveFace =
+            g_waterReflectionCubeActiveFace.load(std::memory_order_relaxed);
+        if (previousActiveFace >= 0 && previousActiveFace != activeFace) {
+            CompleteWaterReflectionCubeActiveFace();
+        }
+        if (cubeFaceBound && activeFace >= 0) {
+            g_waterReflectionCubeActiveFace.store(
+                activeFace, std::memory_order_relaxed);
+        }
+
+        const bool wasActive = g_waterReflectionCubeCaptureActive.load(
+            std::memory_order_relaxed);
+        // Keep the scope latched through intermediate targets used by the cube
+        // camera. A main HDR bind (or Present) is the explicit exit boundary.
+        const bool captureActive = cubeFaceBound ||
+            (wasActive && !mainViewBound);
+        g_waterReflectionCubeCaptureActive.store(
+            captureActive, std::memory_order_relaxed);
+        if (captureActive && context) {
+            ClearPublishedWaterReflectionCubeBindings(context);
+        }
+        if (captureActive != wasActive) {
+            if (captureActive) {
+                REX::INFO(
+                    "WaterReflectionCube: entering face capture face={} - t49/t51 cleared before OM bind",
+                    activeFace);
+            } else {
+                REX::INFO(
+                    "WaterReflectionCube: leaving face capture - main-view publication eligible");
+            }
+        }
+    }
+
+    void PrepareWaterReflectionCubeWrite(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination)
+    {
+        if (!IsWaterReflectionCubeResource(destination)) {
+            return;
+        }
+        ClearPublishedWaterReflectionCubeBindings(context);
+    }
+
+    void CompleteWaterReflectionCubeSubresourceWrite(
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        const char* source)
+    {
+        if (!IsWaterReflectionCubeResource(destination) || !g_rendererData) {
+            return;
+        }
+
+        auto* texture = g_rendererData->cubeMapRenderTargets[0].texture;
+        if (!texture) {
+            return;
+        }
+        REX::W32::D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        if (desc.mipLevels == 0u || destinationSubresource >=
+                desc.mipLevels * desc.arraySize) {
+            REX::WARN(
+                "WaterReflectionCube: ignored {} destination subresource={} mips={} array={}",
+                source ? source : "subresource-write", destinationSubresource,
+                desc.mipLevels, desc.arraySize);
+            return;
+        }
+
+        const UINT mip = destinationSubresource % desc.mipLevels;
+        const UINT face = destinationSubresource / desc.mipLevels;
+        if (mip != 0u || face >= 6u) {
+            return;
+        }
+        CompleteWaterReflectionCubeFace(
+            static_cast<int>(face), source ? source : "subresource-write");
+    }
+
+    void CompleteWaterReflectionCubeResourceWrite(
+        REX::W32::ID3D11Resource* destination,
+        const char* source)
+    {
+        if (!IsWaterReflectionCubeResource(destination)) {
+            return;
+        }
+        for (int face = 0; face < 6; ++face) {
+            CompleteWaterReflectionCubeFace(
+                face, source ? source : "resource-write");
+        }
+    }
+
+    bool WaterReflectionCubeCaptureActive() noexcept
+    {
+        return g_waterReflectionCubeCaptureActive.load(
+            std::memory_order_relaxed);
+    }
+
+    void EndWaterReflectionCubeFrame() noexcept
+    {
+        // Present is the final completion boundary when the engine leaves the
+        // last cube face without another OM bind first.
+        CompleteWaterReflectionCubeActiveFace();
+        g_waterReflectionCubeCaptureActive.store(
+            false, std::memory_order_relaxed);
+    }
+
+    void Shutdown()
+    {
+        ReleaseSRVBuffer(
+            g_waterReflectionCubeMetaBuffer,
+            g_waterReflectionCubeMetaSRV);
+        g_waterReflectionCubeMetaElementCount = 0;
+        g_waterReflectionCubeMetaReady = false;
+        g_waterReflectionCubeTrackedTexture = nullptr;
+        g_waterReflectionCubePendingFaces.store(0u, std::memory_order_relaxed);
+        g_waterReflectionCubeGeneration.store(0u, std::memory_order_relaxed);
+        g_waterReflectionCubeResourceEpoch.store(0u, std::memory_order_relaxed);
+        g_waterReflectionCubeLastCompletionFrame.store(0u, std::memory_order_relaxed);
+        g_waterReflectionCubeLastCompletionTime.store(0.0f, std::memory_order_relaxed);
+        g_waterReflectionCubeActiveFace.store(-1, std::memory_order_relaxed);
+        g_waterReflectionCubeHasCompleteGeneration.store(false, std::memory_order_relaxed);
+        for (auto& frame : g_waterReflectionCubeLastFaceCompletionFrame) {
+            frame.store(0u, std::memory_order_relaxed);
+        }
+        g_waterReflectionCubeSceneIdentityReady = false;
+        EndWaterReflectionCubeFrame();
     }
 
     void TrackOMRenderTargets(

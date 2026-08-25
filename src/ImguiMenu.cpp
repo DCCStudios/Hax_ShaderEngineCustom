@@ -115,6 +115,82 @@ static void SaveShaderSettingsWithFeedback()
     g_shaderSettingsSaveModalRequested = true;
 }
 
+// Manual HLSL hot reload. The file watchers that normally drive recompiles
+// only exist when DEVELOPMENT=true, so this is the shipped-build path for
+// picking up shader edits without a restart: flush the include memo (so the
+// on-disk shader cache re-keys against the current include contents), then
+// flag every replacement definition and custom pass. Nothing is released
+// here - the render thread drops the compiled objects on the next bind/fire,
+// since it is the only thread that may touch objects the immediate context
+// might currently have bound.
+static void ReloadShadersWithFeedback()
+{
+    // Full definition reload on the same task-queued path the DEVELOPMENT
+    // Shader.ini watcher uses: re-parses Shader.ini AND Values.ini for
+    // every shader folder, so newly added sliders, passes and definitions
+    // appear WITHOUT a game restart. Existing sliders keep their live
+    // values - AddShaderValue dedups by id, so a re-parse only adds.
+    if (g_taskInterface) {
+        if (g_reloadQueued.exchange(true)) {
+            g_shaderSettingsSaveSucceeded = false;
+            g_shaderSettingsSaveMessage = "A shader reload is already queued.";
+            g_shaderSettingsSaveModalRequested = true;
+            return;
+        }
+        g_taskInterface->AddTask([]() {
+            try {
+                UIUnlockShaderList_Internal();
+                ReloadAllShaderDefinitions_Internal();
+            } catch (const std::exception& e) {
+                REX::WARN("ReloadShadersWithFeedback: reload task threw: {}", e.what());
+            } catch (...) {
+                REX::WARN("ReloadShadersWithFeedback: reload task threw an unknown exception");
+            }
+            g_reloadQueued = false;
+        });
+        REX::INFO("ReloadShadersWithFeedback: full definition reload queued");
+        g_shaderSettingsSaveSucceeded = true;
+        g_shaderSettingsSaveMessage =
+            "Full shader reload queued: Shader.ini, Values.ini and all HLSL "
+            "reload from disk over the next frames.\n"
+            "New sliders and passes appear without a restart; existing "
+            "sliders keep their current values.";
+        g_shaderSettingsSaveModalRequested = true;
+        return;
+    }
+
+    // Fallback without a task interface: the old mark-for-recompile path
+    // (HLSL edits only; Values.ini additions need a restart here).
+    ShaderCache::InvalidateIncludeMemo();
+    std::size_t definitionCount = 0;
+    {
+        std::shared_lock lock(g_shaderDefinitions.mutex);
+        for (auto* def : g_shaderDefinitions.definitions) {
+            if (def && def->active && !def->shaderFile.empty()) {
+                ++definitionCount;
+            }
+        }
+    }
+    g_manualShaderReloadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    const std::size_t passCount = CustomPass::g_registry.RequestReloadAll();
+
+    REX::INFO(
+        "ReloadShadersWithFeedback: manual reload requested, generation {} - {} replacement shader(s), {} custom pass(es)",
+        g_manualShaderReloadGeneration.load(std::memory_order_relaxed),
+        definitionCount,
+        passCount);
+
+    g_shaderSettingsSaveSucceeded = true;
+    g_shaderSettingsSaveMessage = std::format(
+        "Marked {} replacement shader(s) and {} custom pass(es) for reload.\n"
+        "Each one recompiles from disk the next time it is used, so edits "
+        "appear over the next frame or two.\n"
+        "Adding or removing Values.ini settings still needs a game restart.",
+        definitionCount,
+        passCount);
+    g_shaderSettingsSaveModalRequested = true;
+}
+
 // UI: Compiler neon flash shader pointer
 REX::W32::ID3D11PixelShader* g_flashPixelShader = nullptr;
 // UI: Imgui WndProc hook variables
@@ -294,6 +370,136 @@ const RECT* UIGetWindowRect()
     return &g_windowRect;
 }
 
+namespace {
+
+// Names mirror the branches in GI_DebugColor / SL_DebugView in
+// HachiToon/visualTonemap.hlsl. Keep them in sync: a debug view that is
+// mislabelled is worse than one that is unlabelled, because it sends you
+// looking at the wrong subsystem.
+const char* GIDebugModeName(int mode)
+{
+    switch (mode) {
+    case 1:  return "GI pass reached (flat green)";
+    case 2:  return "World normal";
+    case 3:  return "Albedo";
+    case 4:  return "Scene colour";
+    case 5:  return "World position (wrapped every 256 units)";
+    case 6:  return "Linear depth";
+    case 7:  return "Tonemap hook reached (flat red)";
+    case 8:  return "SSRTGI L0 irradiance (x16)";
+    case 9:  return "SSRTGI receiver albedo";
+    case 10: return "SSRTGI diffuse indirect";
+    case 11: return "SSRTGI principal direction";
+    case 12: return "SSRTGI directional focus";
+    // 13, 15 and 16 were produced by the old quarter-resolution contact trace
+    // pass and died with it: 13 rendered the local-light record field into that
+    // pass's target, and 15/16 were its trace confidence and cached edge age.
+    // The wavefront march is deterministic and keeps no history, so neither
+    // quantity exists to show. Returning nullptr makes the caption read
+    // "retired" rather than labelling a blank screen with a stale name.
+    case 14: return "Contact shadow blocked ratio (full res)";
+    case 17: return "Skylighting ambient visibility";
+    case 18: return "Skylighting sun visibility (shadow map)";
+    case 19: return "Sun bounce (analytic proxies)";
+    case 20: return "Bounce volume (local lights + sun radiosity)";
+    default: return nullptr;
+    }
+}
+
+// Small always-on caption naming the active diagnostic view. These views
+// replace the whole frame, so without a label it is easy to misread one field
+// as another - several rounds of this project were spent doing exactly that.
+void UIDrawDebugViewCaption()
+{
+    int mode = 0;
+    for (auto* value : g_shaderSettings.GetIntShaderValues()) {
+        if (value && value->id == "ps_GIDebugMode") {
+            mode = value->current.i;
+            break;
+        }
+    }
+    if (mode <= 0) {
+        return;
+    }
+
+    const char* name = GIDebugModeName(mode);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // Bottom-left, clear of the health/AP bars.
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + 24.0f,
+               viewport->WorkPos.y + viewport->WorkSize.y - 150.0f),
+        ImGuiCond_Always,
+        ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    if (ImGui::Begin(
+            "##gi_debug_caption", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "GI Debug View %d", mode);
+        ImGui::TextUnformatted(
+            name ? name : "(retired or unassigned - nothing produces this)");
+    }
+    ImGui::End();
+}
+
+ShaderValue* FindGlobalShaderValue(const char* id)
+{
+    for (auto* value : g_shaderSettings.GetGlobalShaderValues()) {
+        if (value && value->id == id) return value;
+    }
+    return nullptr;
+}
+
+void SetGlobalBool(const char* id, bool value)
+{
+    if (auto* setting = FindGlobalShaderValue(id);
+        setting && setting->type == ShaderValue::Type::Bool) {
+        setting->current.b = value;
+    }
+}
+
+void SetGlobalFloat(const char* id, float value)
+{
+    if (auto* setting = FindGlobalShaderValue(id);
+        setting && setting->type == ShaderValue::Type::Float) {
+        setting->current.f = std::clamp(value, setting->min.f, setting->max.f);
+    }
+}
+
+void ApplyWaterBodyPreset(int preset)
+{
+    preset = std::clamp(preset, 0, 2);
+
+    // Presets intentionally own only geometric displacement. Physical optics,
+    // reflection, refraction, absorption, normal detail, and foam must not jump
+    // when the user changes the water-body wave profile.
+    if (preset == 0) { // Lake: calm, broad, low-energy surface.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 2.0f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 420.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 0.35f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.0f);
+    } else if (preset == 1) { // River: aligned and faster.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 3.5f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 180.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 1.25f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.10f);
+    } else { // Ocean: long gravity waves with true Gerstner horizontal chop.
+        SetGlobalBool("vu_WaterDisplacementEnabled", true);
+        SetGlobalFloat("vu_WaterDisplacementAmplitude", 12.0f);
+        SetGlobalFloat("vu_WaterDisplacementWavelength", 820.0f);
+        SetGlobalFloat("vu_WaterDisplacementSpeed", 0.80f);
+        SetGlobalFloat("vu_WaterDisplacementChoppiness", 0.42f);
+    }
+
+    REX::INFO("ShaderEngine Settings: applied water displacement preset {}", preset);
+}
+
+}  // namespace
+
 void UIRenderFrame()
 {
     if (g_imguiInitialized) {
@@ -303,6 +509,12 @@ void UIRenderFrame()
     }
     if (g_imguiInitialized && SHADERSETTINGS_ON && g_showSettings) {
         UIDrawShaderSettingsOverlay();
+    }
+    // Drawn independently of DEVGUI_ON and g_showSettings: the caption must be
+    // visible whenever a debug view is active, including with the dev GUI
+    // closed, since that is how these views are normally looked at.
+    if (g_imguiInitialized) {
+        UIDrawDebugViewCaption();
     }
     if (g_imguiInitialized && DEVGUI_ON && g_showSettings) {
         UIDrawShaderDebugOverlay();
@@ -351,6 +563,16 @@ void UIDrawShaderSettingsOverlay() {
     if (ImGui::Button("Save settings")) {
         SaveShaderSettingsWithFeedback();
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload shaders")) {
+        ReloadShadersWithFeedback();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Recompile every replacement shader and custom pass from disk.\n"
+            "Picks up .hlsl and include edits without restarting the game.\n"
+            "Values.ini settings added or removed still need a restart.");
+    }
     ImGui::Separator();
 
     bool shaderEngineEffectsOn = SHADERENGINE_EFFECTS_ON;
@@ -383,14 +605,59 @@ void UIDrawShaderSettingsOverlay() {
     }
     ImGui::Separator();
 
+    // Search bar: filters every setting below by label, id, or group name
+    // (case-insensitive; comma-separates multiple terms, "-term" excludes).
+    // While a filter is active the group headers are forced open and groups
+    // with no matches are hidden, so matches are always visible.
+    static ImGuiTextFilter settingsFilter;
+    settingsFilter.Draw("Search", ImGui::GetContentRegionAvail().x * 0.55f);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Filter all settings by label, id, or group name.\n"
+            "Comma separates multiple terms; -term excludes.");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear##settingsFilter")) {
+        settingsFilter.Clear();
+    }
+    ImGui::Separator();
+    // Everything below scrolls inside this child so the header buttons and the
+    // search bar above stay pinned to the top of the window as the settings
+    // list is scrolled. ImVec2(0, 0) fills the remaining window height.
+    ImGui::BeginChild("##settingsBody", ImVec2(0.0f, 0.0f), false);
+    const bool settingsFilterActive = settingsFilter.IsActive();
+    auto valueMatchesFilter = [&](const ShaderValue& v) {
+        return settingsFilter.PassFilter(v.label.c_str()) ||
+               settingsFilter.PassFilter(v.id.c_str());
+    };
+    ImGui::Separator();
+
     static std::string editingValueId;
     static bool focusEditInput = false;
+
+    auto valueIsDisabled = [&](const ShaderValue& value) {
+        if (value.disabledWhen.empty()) return false;
+        bool negate = value.disabledWhen[0] == '!';
+        const std::string id = negate
+            ? value.disabledWhen.substr(1) : value.disabledWhen;
+        for (auto* candidate : g_shaderSettings.GetBoolShaderValues()) {
+            if (candidate && candidate->id == id) {
+                return negate ? !candidate->current.b : candidate->current.b;
+            }
+        }
+        return false;
+    };
 
     // Render a row for each shader value with appropriate control based on type
     auto renderRow = [&](ShaderValue &sValue) {
         ImGui::PushID(sValue.id.c_str());
-        const bool canEditValue = sValue.type == ShaderValue::Type::Int || sValue.type == ShaderValue::Type::Float;
+        const bool rowDisabled = valueIsDisabled(sValue);
+        if (rowDisabled) ImGui::BeginDisabled();
+        const bool canEditValue =
+            (sValue.type == ShaderValue::Type::Int && sValue.options.empty()) ||
+            sValue.type == ShaderValue::Type::Float;
         const bool isEditingValue = canEditValue && editingValueId == sValue.id;
+        bool valueChanged = false;
 
         if (isEditingValue && focusEditInput) {
             ImGui::SetKeyboardFocusHere();
@@ -400,35 +667,64 @@ void UIDrawShaderSettingsOverlay() {
         switch (sValue.type) {
             case ShaderValue::Type::Bool:
                 if (ImGui::Checkbox(sValue.label.c_str(), &sValue.current.b)) {
-                    /* value changed if you need to react */
+                    valueChanged = true;
                 }
                 break;
             case ShaderValue::Type::Int:
-                if (isEditingValue) {
+                if (!sValue.options.empty()) {
+                    const int optionIndex = std::clamp(
+                        sValue.current.i, 0,
+                        static_cast<int>(sValue.options.size()) - 1);
+                    const char* preview = sValue.options[optionIndex].c_str();
+                    if (ImGui::BeginCombo(sValue.label.c_str(), preview)) {
+                        for (int i = 0; i < static_cast<int>(sValue.options.size()); ++i) {
+                            const bool selected = sValue.current.i == i;
+                            if (ImGui::Selectable(sValue.options[i].c_str(), selected)) {
+                                sValue.current.i = i;
+                                valueChanged = true;
+                            }
+                            if (selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                } else if (isEditingValue) {
                     if (ImGui::InputInt(sValue.label.c_str(), &sValue.current.i, 0, 0, ImGuiInputTextFlags_EnterReturnsTrue)) {
                         sValue.current.i = std::clamp(sValue.current.i, sValue.min.i, sValue.max.i);
+                        valueChanged = true;
                         editingValueId.clear();
                     } else if (ImGui::IsItemDeactivated()) {
                         sValue.current.i = std::clamp(sValue.current.i, sValue.min.i, sValue.max.i);
                         editingValueId.clear();
                     }
                 } else if (ImGui::SliderInt(sValue.label.c_str(), &sValue.current.i, sValue.min.i, sValue.max.i, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-                    /* value changed */
+                    valueChanged = true;
                 }
                 break;
             case ShaderValue::Type::Float:
                 if (isEditingValue) {
                     if (ImGui::InputFloat(sValue.label.c_str(), &sValue.current.f, 0.0f, 0.0f, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) {
                         sValue.current.f = std::clamp(sValue.current.f, sValue.min.f, sValue.max.f);
+                        valueChanged = true;
                         editingValueId.clear();
                     } else if (ImGui::IsItemDeactivated()) {
                         sValue.current.f = std::clamp(sValue.current.f, sValue.min.f, sValue.max.f);
                         editingValueId.clear();
                     }
                 } else if (ImGui::SliderFloat(sValue.label.c_str(), &sValue.current.f, sValue.min.f, sValue.max.f, "%.3f", ImGuiSliderFlags_AlwaysClamp)) {
-                    /* value changed */
+                    valueChanged = true;
                 }
                 break;
+        }
+        if (valueChanged && sValue.id == "vu_WaterBodyPreset") {
+            ApplyWaterBodyPreset(sValue.current.i);
+        }
+        if (!sValue.tooltip.empty() &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+            ImGui::TextUnformatted(sValue.tooltip.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
         }
         if (canEditValue) {
             ImGui::SameLine();
@@ -443,12 +739,150 @@ void UIDrawShaderSettingsOverlay() {
         ImGui::SameLine();
         if (ImGui::SmallButton("R")) {
             sValue.ResetToDefault();
+            if (sValue.id == "vu_WaterBodyPreset") {
+                ApplyWaterBodyPreset(sValue.current.i);
+            }
             if (editingValueId == sValue.id) {
                 editingValueId.clear();
             }
         }
+        if (rowDisabled) ImGui::EndDisabled();
         ImGui::PopID();
     };
+    // Right-click "Collapse group" / "Collapse all" support. A right-click on a
+    // parent header writes a request into the persistent flags; the next frame
+    // snapshots them (clearing the persistent copy so the force-close lasts
+    // exactly one frame and the header can be reopened afterwards) and passes
+    // SetNextItemOpen(false) to the matching headers. Suppressed while a search
+    // filter is active, which force-opens everything instead.
+    static std::string s_collapseGroupPersist;
+    static std::string s_collapseChildPersist;
+    static bool s_collapseAllPersist = false;
+    const std::string collapseGroupThisFrame = s_collapseGroupPersist;
+    const std::string collapseChildThisFrame = s_collapseChildPersist;
+    const bool collapseAllThisFrame = s_collapseAllPersist;
+    s_collapseGroupPersist.clear();
+    s_collapseChildPersist.clear();
+    s_collapseAllPersist = false;
+
+    // Nested group renderer: a group named "Parent:Child" renders as a child
+    // header INSIDE the "Parent" header (e.g. every "Water:..." group becomes a
+    // subgroup of one Water section). Groups without a colon render flat as
+    // before. Children order alphabetically within the parent (the "1 ", "2 "
+    // prefixes in Values.ini control the sequence). Filtering: a matching
+    // parent shows everything under it, a matching child shows that child, and
+    // otherwise only matching controls survive; empty parents/children are
+    // hidden and surviving headers are forced open so matches stay visible.
+    auto renderGroupedTree = [&](std::vector<std::pair<std::string, ShaderValue*>> const& entries) {
+        std::map<std::string, std::map<std::string, std::vector<ShaderValue*>>> tree;
+        for (auto& e : entries) {
+            if (!e.second) continue;
+            std::string parent = e.first, child;
+            const size_t colon = e.first.find(':');
+            if (colon != std::string::npos) {
+                parent = e.first.substr(0, colon);
+                child = e.first.substr(colon + 1);
+            }
+            if (parent.empty()) parent = "Ungrouped";
+            tree[parent][child].push_back(e.second);
+        }
+        for (auto& pkv : tree) {
+            const std::string& parent = pkv.first;
+            const bool parentMatches =
+                settingsFilterActive && settingsFilter.PassFilter(parent.c_str());
+            // Decide what survives the filter, child by child.
+            std::map<std::string, std::vector<ShaderValue*>> shownTree;
+            size_t shownCount = 0;
+            for (auto& ckv : pkv.second) {
+                const bool childMatches = settingsFilterActive && !ckv.first.empty() &&
+                    settingsFilter.PassFilter(ckv.first.c_str());
+                std::vector<ShaderValue*> shown;
+                if (settingsFilterActive && !parentMatches && !childMatches) {
+                    for (auto* sValue : ckv.second) {
+                        if (sValue && valueMatchesFilter(*sValue)) shown.push_back(sValue);
+                    }
+                } else {
+                    shown = ckv.second;
+                }
+                if (!shown.empty()) {
+                    shownCount += shown.size();
+                    shownTree[ckv.first] = std::move(shown);
+                }
+            }
+            if (settingsFilterActive && shownCount == 0) continue;
+            // A search filter hides non-matching groups but does NOT force
+            // matching groups open - the user expands them by hand.
+            if (collapseAllThisFrame ||
+                (!collapseGroupThisFrame.empty() &&
+                 collapseGroupThisFrame == parent)) {
+                ImGui::SetNextItemOpen(false);
+            }
+            const bool parentOpen = ImGui::CollapsingHeader(parent.c_str());
+            // Right-click a group header for collapse actions.
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem("Collapse group")) {
+                    s_collapseGroupPersist = parent;
+                }
+                if (ImGui::MenuItem("Collapse all")) {
+                    s_collapseAllPersist = true;
+                }
+                ImGui::EndPopup();
+            }
+            if (!parentOpen) continue;
+            ImGui::PushID(parent.c_str());
+            if (ImGui::SmallButton("Reset group")) {
+                for (auto& ckv : pkv.second) {
+                    for (auto* sValue : ckv.second) {
+                        if (sValue) sValue->ResetToDefault();
+                    }
+                }
+            }
+            // Ungrouped-within-parent controls first, then the child sections.
+            auto direct = shownTree.find(std::string());
+            if (direct != shownTree.end()) {
+                for (auto* sValue : direct->second) {
+                    if (sValue) renderRow(*sValue);
+                }
+            }
+            for (auto& ckv : shownTree) {
+                if (ckv.first.empty()) continue;
+                // Unique key so "Collapse group" on a child closes only that
+                // child (children share the parent's ImGui ID scope).
+                const std::string childKey = parent + '\x1f' + ckv.first;
+                // Filter does not auto-expand a matching child either.
+                if (collapseAllThisFrame ||
+                    collapseChildThisFrame == childKey) {
+                    ImGui::SetNextItemOpen(false);
+                }
+                ImGui::Indent();
+                const bool childOpen = ImGui::CollapsingHeader(ckv.first.c_str());
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Collapse group")) {
+                        s_collapseChildPersist = childKey;
+                    }
+                    if (ImGui::MenuItem("Collapse all")) {
+                        s_collapseAllPersist = true;
+                    }
+                    ImGui::EndPopup();
+                }
+                if (childOpen) {
+                    ImGui::PushID(ckv.first.c_str());
+                    if (ImGui::SmallButton("Reset group")) {
+                        for (auto* sValue : pkv.second[ckv.first]) {
+                            if (sValue) sValue->ResetToDefault();
+                        }
+                    }
+                    for (auto* sValue : ckv.second) {
+                        if (sValue) renderRow(*sValue);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Unindent();
+            }
+            ImGui::PopID();
+        }
+    };
+
     // Collapsing header for global shader settings
     if (ImGui::CollapsingHeader("Global Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SmallButton("Reset global")) {
@@ -456,57 +890,26 @@ void UIDrawShaderSettingsOverlay() {
                 if (sValue) sValue->ResetToDefault();
             }
         }
-        std::map<std::string, std::vector<ShaderValue*>> globalGroups;
+        std::vector<std::pair<std::string, ShaderValue*>> globalEntries;
         for (auto* sValue : g_shaderSettings.GetGlobalShaderValues()) {
             if (!sValue) continue;
-            const std::string groupName = sValue->group.empty() ? "Ungrouped" : sValue->group;
-            globalGroups[groupName].push_back(sValue);
+            globalEntries.emplace_back(
+                sValue->group.empty() ? "Ungrouped" : sValue->group, sValue);
         }
-        for (auto& kv : globalGroups) {
-            const std::string& groupName = kv.first;
-            auto& vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str())) {
-                ImGui::PushID(groupName.c_str());
-                if (ImGui::SmallButton("Reset group")) {
-                    for (auto* sValue : vals) {
-                        if (sValue) sValue->ResetToDefault();
-                    }
-                }
-                for (auto* sValue : vals) {
-                    if (sValue) renderRow(*sValue);
-                }
-                ImGui::PopID();
-            }
-        }
+        renderGroupedTree(globalEntries);
     }
     // Collapsing header for active shader definitions and their settings
     if (ImGui::CollapsingHeader("Shader Settings", ImGuiTreeNodeFlags_DefaultOpen))
     {
         // Group local values by explicit Values.ini group, then folder/module.
-        std::map<std::string, std::vector<ShaderValue*>> settingsGroups;
+        std::vector<std::pair<std::string, ShaderValue*>> localEntries;
         for (auto* sValue : g_shaderSettings.GetLocalShaderValues()) {
             if (!sValue) continue;
             std::string groupName = !sValue->group.empty() ? sValue->group :
                 (sValue->folderName.empty() ? sValue->shaderDefinitionId : sValue->folderName);
-            settingsGroups[groupName].push_back(sValue);
+            localEntries.emplace_back(std::move(groupName), sValue);
         }
-        // Draw one collapsing header per definition and render children only if open
-        for (auto &kv : settingsGroups) {
-            const std::string &groupName = kv.first;
-            auto &vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str())) {
-                ImGui::PushID(groupName.c_str());
-                if (ImGui::SmallButton("Reset group")) {
-                    for (auto* sValue : vals) {
-                        if (sValue) sValue->ResetToDefault();
-                    }
-                }
-                for (auto* sValue : vals) {
-                    if (sValue) renderRow(*sValue);
-                }
-                ImGui::PopID();
-            }
-        }
+        renderGroupedTree(localEntries);
     }
 
     if (g_shaderSettingsSaveModalRequested) {
@@ -529,6 +932,7 @@ void UIDrawShaderSettingsOverlay() {
         }
         ImGui::EndPopup();
     }
+    ImGui::EndChild();  // ##settingsBody (pinned header above)
     ImGui::End();
 }
 
@@ -928,6 +1332,9 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderInt("outgoingWeatherClass", data.outgoingWeatherClass, previousData.outgoingWeatherClass);
             renderFloat("inInterior", data.inInterior, previousData.inInterior, 0.5f);
             renderFloat("inCombat", data.inCombat, previousData.inCombat, 0.5f);
+            renderFloat("waterHeight", data.waterHeight, previousData.waterHeight, 1.0f);
+            renderFloat("viewWaterHeight", data.g_WaterPlanes.x, previousData.g_WaterPlanes.x, 1.0f);
+            renderFloat("cameraUnderwater", data.cameraUnderwater, previousData.cameraUnderwater, 0.5f);
             endColumns();
         }
     }
@@ -953,7 +1360,7 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderFloat4("g_FogDistances0", data.g_FogDistances0, previousData.g_FogDistances0, 50.0f);
             renderFloat4("g_FogDistances1", data.g_FogDistances1, previousData.g_FogDistances1, 50.0f);
             renderFloat4("g_FogParams", data.g_FogParams, previousData.g_FogParams, 0.25f);
-            renderFloat4("g_FogColor", data.g_FogColor, previousData.g_FogColor, 0.05f);
+            renderFloat4("g_WaterState0", data.g_WaterState0, previousData.g_WaterState0, 0.05f);
             renderFloat("g_SunR", data.g_SunR, previousData.g_SunR, 0.05f);
             renderFloat("g_SunG", data.g_SunG, previousData.g_SunG, 0.05f);
             renderFloat("g_SunB", data.g_SunB, previousData.g_SunB, 0.05f);
@@ -1065,10 +1472,11 @@ void Registry::DrawDebugOverlay() {
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::CollapsingHeader("Passes", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::BeginTable("passes_tbl", 6, kTableFlags)) {
+        if (ImGui::BeginTable("passes_tbl", 7, kTableFlags)) {
             ImGui::TableSetupColumn("Name",      ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableSetupColumn("Kind",      ImGuiTableColumnFlags_WidthFixed,  40.0f);
             ImGui::TableSetupColumn("Status",    ImGuiTableColumnFlags_WidthFixed,  60.0f);
+            ImGui::TableSetupColumn("GPU ms",    ImGuiTableColumnFlags_WidthFixed,  65.0f);
             ImGui::TableSetupColumn("LastFired", ImGuiTableColumnFlags_WidthFixed,  90.0f);
             ImGui::TableSetupColumn("Trigger",   ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableSetupColumn("Detail",    ImGuiTableColumnFlags_WidthStretch, 2.5f);
@@ -1105,6 +1513,28 @@ void Registry::DrawDebugOverlay() {
                 ImGui::TextColored(col, "%s", status);
 
                 ImGui::TableSetColumnIndex(3);
+                const uint64_t timingSamples =
+                    p->gpuTimingSamples.load(std::memory_order_relaxed);
+                if (!s.profileGpu) {
+                    ImGui::TextUnformatted("-");
+                } else if (timingSamples == 0) {
+                    ImGui::TextUnformatted("...");
+                } else {
+                    const float averageMs =
+                        p->gpuAverageMs.load(std::memory_order_relaxed);
+                    const float lastMs =
+                        p->gpuLastMs.load(std::memory_order_relaxed);
+                    ImGui::Text("%.3f", averageMs);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Asynchronous GPU time\nEMA: %.3f ms\nLast: %.3f ms\nSamples: %llu\nNo flush or render-thread wait",
+                            averageMs,
+                            lastMs,
+                            static_cast<unsigned long long>(timingSamples));
+                    }
+                }
+
+                ImGui::TableSetColumnIndex(4);
                 // The pass fires DURING frame F's draws; OnFramePresent then
                 // increments currentFrame to F+1; this overlay renders AFTER
                 // the increment. So a pass with lastFired == currentFrame-1
@@ -1123,10 +1553,10 @@ void Registry::DrawDebugOverlay() {
                     }
                 }
 
-                ImGui::TableSetColumnIndex(4);
+                ImGui::TableSetColumnIndex(5);
                 ImGui::TextUnformatted(TriggerName(s.trigger));
 
-                ImGui::TableSetColumnIndex(5);
+                ImGui::TableSetColumnIndex(6);
                 switch (s.trigger) {
                     case TriggerKind::BeforeShaderUID:
                         ImGui::TextUnformatted(s.triggerUID.c_str());

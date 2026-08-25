@@ -1,6 +1,77 @@
 #include <PCH.h>
 #include <Global.h>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
+// ---- Shared HLSL file-watch poller ---------------------------------------
+// One background thread stats every registered shader file once a second, in
+// place of one thread per shader definition. See HlslFileWatchPoller in
+// Global.h for the rationale (thread count + instant reload teardown).
+HlslFileWatchPoller& HlslFileWatchPoller::Instance() {
+    // Leaked on purpose: a process-lifetime singleton whose detached thread
+    // must not race the watchers during static destruction at process exit.
+    static HlslFileWatchPoller* instance = new HlslFileWatchPoller();
+    return *instance;
+}
+
+void HlslFileWatchPoller::EnsureThreadStarted() {
+    if (threadStarted_.exchange(true)) {
+        return;
+    }
+    std::thread([this]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& e : entries_) {
+                try {
+                    if (!e.path || !std::filesystem::exists(*e.path)) {
+                        continue;
+                    }
+                    auto currentTime = std::filesystem::last_write_time(*e.path);
+                    if (currentTime != e.lastWrite) {
+                        e.lastWrite = currentTime;
+                        if (e.flag) {
+                            e.flag->store(true, std::memory_order_release);
+                        }
+                        REX::INFO("HlslFileWatcher: Shader file '{}' changed, marked for reload",
+                                  e.path->string());
+                    }
+                } catch (...) {
+                    // Ignore transient filesystem errors for this entry.
+                }
+            }
+        }
+    }).detach();
+}
+
+void HlslFileWatchPoller::Register(const std::filesystem::path* path,
+                                   std::atomic<bool>* reloadFlag) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry entry;
+        entry.path = path;
+        entry.flag = reloadFlag;
+        try {
+            if (path && std::filesystem::exists(*path)) {
+                entry.lastWrite = std::filesystem::last_write_time(*path);
+            }
+        } catch (...) {
+        }
+        entries_.push_back(entry);
+    }
+    EnsureThreadStarted();
+}
+
+void HlslFileWatchPoller::Deregister(std::atomic<bool>* reloadFlag) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.erase(
+        std::remove_if(entries_.begin(), entries_.end(),
+                       [&](const Entry& e) { return e.flag == reloadFlag; }),
+        entries_.end());
+}
+
 const char* defaultIni = R"(
 ; Enable/disable debugging of the plugin
 ; This is extensive debugging for the plugin
@@ -24,6 +95,11 @@ CUSTOMBUFFER_ON=true
 ; replays dynamic/unknown casters.
 ; Requires slot-safe DSV access; otherwise it falls back to vanilla rendering.
 SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
+; --- SUN CASCADE CAPTURE ---
+; Publishes the sun's per-cascade shadow transforms so world-space occlusion
+; passes can sample the shadow map array. Required by Skylighting's sun shadow
+; term. Installs a passthrough hook on BSShadowDirectionalLight.
+SUN_CASCADE_CAPTURE_ON=false
 ; --- COMMAND BUFFER REPLAY ---
 ; Experimental CPU optimization: during command-buffer replay, suppress redundant
 ; SRV and input-assembly binds by tracking state and forwarding only changes.
@@ -185,7 +261,7 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_FogDistances0; // x=near, y=far, z=waterNear, w=waterFar
 ;    float4   GFXInjected[0].g_FogDistances1; // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
 ;    float4   GFXInjected[0].g_FogParams; // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-;    float4   GFXInjected[0].g_FogColor; // xyz=reserved fog RGB, currently zero; w=reserved
+;    float4   GFXInjected[0].g_WaterState0; // source wave bank: amplitude, wavelength, chop, preset
 ;    float    GFXInjected[0].g_SunR; // dominant stylized light red
 ;    float    GFXInjected[0].g_SunG; // dominant stylized light green
 ;    float    GFXInjected[0].g_SunB; // dominant stylized light blue
@@ -199,6 +275,11 @@ LIGHT_SORTER_MODE=off
 ;    float4   GFXInjected[0].g_CurrentCameraPositionAdjust; // absolute BGS camera translation for the current frame
 ;    float4   GFXInjected[0].g_PreviousCameraPositionAdjust; // translation paired with g_PrevViewProjRow*
 ;    float4   GFXInjected[0].g_RenderInfo; // xy=logical render extent, zw=display extent
+;    float4   GFXInjected[0].g_WorldSH_R; // world-space L1 ambient cube for R; .xyz=directional bands, .w=DC
+;    float4   GFXInjected[0].g_WorldSH_G; // world-space L1 ambient cube for G
+;    float4   GFXInjected[0].g_WorldSH_B; // world-space L1 ambient cube for B
+;    float4   GFXInjected[0].g_ViewmodelDOF; // .x = viewmodel-DOF anim blend (1 full, 0 suppressed); yzw reserved
+;    float4   GFXInjected[0].g_WaterPlanes; // .x = height of the water IN VIEW (grid scan; -1e9 none); yzw reserved
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -212,6 +293,8 @@ LIGHT_SORTER_MODE=off
 ;id=g_SomeFloatValue      ; the name of the variable in the shader to set, e.g. g_SomeFloatValue
 ;label="Some Float Value" ; the label to show in the menu for this setting
 ;group=Example            ; optional group name to organize this setting in the menu
+;tooltip=Hover help text   ; optional wrapped help shown while hovering the control
+;disabledWhen=g_Master    ; optional bool ID; greys and locks this row while true
 ;type=float               ; the type of the variable (bool, int, float)
 ;value=0.5                ; the default value to set (true/false for bool, numeric value for int and float)
 ;min=0.0                  ; optional minimum value for float and int types
@@ -244,9 +327,51 @@ float4 main(PS_INPUT input) : SV_Target {
 }
 )";
 
+bool SupportsVoxelTypedUavLoads()
+{
+    auto* device = g_rendererData ? g_rendererData->device : nullptr;
+    if (!device) {
+        return false;
+    }
+
+    struct FormatSupport2Data {
+        REX::W32::DXGI_FORMAT inFormat;
+        std::uint32_t outFormatSupport2;
+    };
+
+    static std::mutex cacheMutex;
+    static REX::W32::ID3D11Device* cachedDevice = nullptr;
+    static bool cachedResult = false;
+    std::lock_guard lock(cacheMutex);
+    if (cachedDevice == device) {
+        return cachedResult;
+    }
+
+    const auto supportsTypedLoad = [device](REX::W32::DXGI_FORMAT format) {
+        FormatSupport2Data support{ format, 0 };
+        const auto hr = device->CheckFeatureSupport(
+            REX::W32::D3D11_FEATURE_FORMAT_SUPPORT2,
+            &support,
+            sizeof(support));
+        return REX::W32::SUCCESS(hr) &&
+               (support.outFormatSupport2 &
+                REX::W32::D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+    };
+
+    cachedResult = supportsTypedLoad(REX::W32::DXGI_FORMAT_R16_FLOAT) &&
+                   supportsTypedLoad(REX::W32::DXGI_FORMAT_R16G16B16A16_FLOAT);
+    cachedDevice = device;
+    REX::INFO("Voxel GI: R16/RGBA16 typed UAV loads {}",
+        cachedResult ? "supported" : "unsupported; using R32 volume formats");
+    return cachedResult;
+}
+
 std::string GetCommonShaderHeaderHLSLTop()
 {
-    return R"(
+    std::string header = SupportsVoxelTypedUavLoads()
+        ? "#define VX_TYPED_UAV_LOADS 1\n"
+        : "#define VX_TYPED_UAV_LOADS 0\n";
+    header += R"(
         // Data passed from the plugin as resource view
         struct GFXBoosterAccessData
         {
@@ -297,7 +422,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float    g_Random;
             float    g_Combat;
             float    g_Interior;
-            float    _padding;
+            float    g_WaterPhaseBlock;
 
             // Block 8 (Bytes 176-239)
             float4   g_ViewProjRow0;
@@ -323,9 +448,15 @@ std::string GetCommonShaderHeaderHLSLTop()
             int   g_CurrentWeatherClass;
 
             int   g_OutgoingWeatherClass;
-            float _enbPadding0;
-            float _enbPadding1;
-            float _enbPadding2;
+            // Former ENB padding, repurposed WITHOUT changing the stride
+            // (growing this struct once pushed FXC's unroll budget over in
+            // visualDOFAutoFocus and dropped that pass entirely).
+            // g_WaterHeight: absolute Z of the player cell's water plane, or
+            // -1e9 when the cell has none. g_CameraUnderwater: 1 when the
+            // camera sits below that plane. Consumers: underwater caustics.
+            float g_WaterHeight;
+            float g_CameraUnderwater;
+            float g_WaterPhaseRemainder;
 
             float4 g_CameraLocalRow0;
             float4 g_CameraLocalRow1;
@@ -346,7 +477,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_FogDistances0;  // x=near, y=far, z=waterNear, w=waterFar
             float4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
             float4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-            float4 g_FogColor;       // xyz=blended RGB (0 until per-weather blend lands), w=reserved
+            float4 g_WaterState0;    // source wave bank: amplitude, wavelength, chop, preset
 
             float  g_SunR;
             float  g_SunG;
@@ -356,7 +487,7 @@ std::string GetCommonShaderHeaderHLSLTop()
             float  g_SunDirY;
             float  g_SunDirZ;
             float  g_SunValid;
-            float  _sunPadding;
+            float  g_WaterTransition; // 2 + source-to-live-bank blend
 
             // L1 SH coefficients per color channel, computed plugin-side from
             // RE::Sky::directionalAmbientColorsA (6-axis directional ambient
@@ -379,6 +510,27 @@ std::string GetCommonShaderHeaderHLSLTop()
             // upscalers may keep some engine resources display-sized while
             // rendering the G-buffer through reduced proxy allocations.
             float4 g_RenderInfo; // xy=render, zw=display
+
+            // World-space L1 coefficients from the same blended ambient cube
+            // as g_SH. These fields are appended to preserve the offsets of
+            // the established structured-buffer ABI. World-space tracing
+            // passes evaluate them directly with float4(worldDirection, 1).
+            float4 g_WorldSH_R;
+            float4 g_WorldSH_G;
+            float4 g_WorldSH_B;
+
+            // Viewmodel DOF runtime state (appended to preserve ABI offsets).
+            // .x = weapon-animation DOF blend: 1 = full DOF, 0 = suppressed while
+            //      a discrete first-person animation (reload/inspect/equip/...) plays.
+            //      Smoothed on the CPU; consumed by visualViewmodelDOF.hlsl. yzw reserved.
+            float4 g_ViewmodelDOF;
+
+            // Water planes (appended). .x = height of the water IN VIEW (grid
+            // scan, highest at/below camera; -1e9 sentinel). Consumed by the
+            // underwater-bed mask pass only; g_WaterHeight keeps its original
+            // player-cell semantics for the water surface shaders. yzw reserved.
+            float4 g_WaterPlanes;
+
         };
 
         struct DrawTagData
@@ -422,7 +574,8 @@ std::string GetCommonShaderHeaderHLSLTop()
         #define GFX_RACE_GROUP_29      0x20000000u
         #define GFX_RACE_GROUP_30      0x40000000u
         #define GFX_RACE_GROUP_31      0x80000000u
-        )";
+    )";
+    return header;
 }
 
 // Here will be the dynamic Shader Settings values defined
@@ -649,21 +802,64 @@ std::filesystem::path GetCacheDir() {
 // done once per ComputeKey) and the include-file contents (read via ifstream
 // on every #include from D3DCompile) used to be recomputed on every shader
 // compile. With N matched shaders bound back-to-back at world load that's
-// N copies of the same disk traffic. Memoize both, drop the memo on Shader.ini
-// reload (where the include-dir contents may have changed).
+// N copies of the same disk traffic.
+//
+// STALENESS CONTRACT (2026-08-16): the memos are NOT trusted blindly for a
+// whole session. Shader development deploys land while the game is running,
+// and a session-lifetime memo then keys new compiles with an old include
+// hash or feeds D3DCompile old include bytes - compiled output silently
+// diverges from what is on disk. Every consumer now revalidates against a
+// cheap stat probe (name+size+mtime) and only reuses the memo when the
+// probe is unchanged: changed files ALWAYS recompile, unchanged files
+// still skip the disk traffic.
 
-std::mutex                                            g_includeMemoMutex;
-bool                                                  g_includeHashCached = false;
-uint64_t                                              g_includeHashValue  = 0;
-std::unordered_map<std::string, std::vector<char>>    g_includeContentCache;
+std::mutex g_includeMemoMutex;
+
+// Freshness probe over the include dir: order-independent accumulation of
+// (name, size, mtime) per file. Stat-only - no file contents are read.
+uint64_t ProbeCommonIncludeDir() {
+    if (g_commonShaderHeaderPath.empty()) return 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(g_commonShaderHeaderPath, ec)) return 0;
+    uint64_t probe = kFnvOffset;
+    for (auto& e : std::filesystem::directory_iterator(g_commonShaderHeaderPath, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const auto name = e.path().filename().string();
+        uint64_t fileHash = kFnvOffset;
+        fileHash = FnvUpdate(fileHash, name.data(), name.size());
+        const uint64_t size = static_cast<uint64_t>(e.file_size(ec));
+        fileHash = FnvUpdate(fileHash, &size, sizeof(size));
+        const int64_t mtime =
+            e.last_write_time(ec).time_since_epoch().count();
+        fileHash = FnvUpdate(fileHash, &mtime, sizeof(mtime));
+        // XOR-fold so directory iteration order cannot change the probe.
+        probe ^= fileHash;
+    }
+    return probe;
+}
+
+bool     g_includeHashCached = false;
+uint64_t g_includeHashProbe  = 0;
+uint64_t g_includeHashValue  = 0;
+
+struct CachedInclude {
+    std::vector<char> bytes;
+    uint64_t          size = 0;
+    int64_t           mtime = 0;
+};
+std::unordered_map<std::string, CachedInclude> g_includeContentCache;
 
 // Hash every regular file inside g_commonShaderHeaderPath (filename + body)
 // in sorted order so any change to a shared include invalidates dependent
-// caches without us needing to track per-shader include graphs.
+// caches without us needing to track per-shader include graphs. Memoized
+// against the stat probe: any file add/remove/edit reruns the content pass.
 uint64_t HashCommonIncludeDir() {
+    const uint64_t probe = ProbeCommonIncludeDir();
     {
         std::lock_guard lk(g_includeMemoMutex);
-        if (g_includeHashCached) return g_includeHashValue;
+        if (g_includeHashCached && g_includeHashProbe == probe) {
+            return g_includeHashValue;
+        }
     }
     if (g_commonShaderHeaderPath.empty()) return 0;
     std::error_code ec;
@@ -685,6 +881,7 @@ uint64_t HashCommonIncludeDir() {
     {
         std::lock_guard lk(g_includeMemoMutex);
         g_includeHashValue  = h;
+        g_includeHashProbe  = probe;
         g_includeHashCached = true;
     }
     return h;
@@ -694,6 +891,77 @@ uint64_t HashCommonIncludeDir() {
 
 namespace ShaderCache {
 
+namespace {
+
+// Per-folder equivalent of HashCommonIncludeDir for the shader's OWN folder:
+// closes the sibling-include hole (a HachiToon shader whose body is only a
+// `#include` of another HachiToon file never changes its assembled source
+// when the included file changes). Only shader-source extensions are
+// content-hashed - Values.ini already reaches the key via the generated
+// define header, and hashing textures/INIs here would force pointless
+// folder-wide recompiles. Memoized per folder against a stat probe.
+struct FolderHashMemo { uint64_t probe = 0; uint64_t hash = 0; };
+std::mutex g_folderHashMutex;
+std::unordered_map<std::string, FolderHashMemo> g_folderHashMemo;
+
+bool IsShaderSourceFile(const std::filesystem::path& p) {
+    auto ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".hlsl" || ext == ".hlsli" || ext == ".inc" || ext == ".h";
+}
+
+uint64_t HashShaderFolder(const std::filesystem::path& folder) {
+    if (folder.empty()) return 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(folder, ec)) return 0;
+
+    // Stat probe (order-independent) over shader-source files only.
+    uint64_t probe = kFnvOffset;
+    for (auto& e : std::filesystem::directory_iterator(folder, ec)) {
+        if (!e.is_regular_file(ec) || !IsShaderSourceFile(e.path())) continue;
+        const auto name = e.path().filename().string();
+        uint64_t fileHash = kFnvOffset;
+        fileHash = FnvUpdate(fileHash, name.data(), name.size());
+        const uint64_t size = static_cast<uint64_t>(e.file_size(ec));
+        fileHash = FnvUpdate(fileHash, &size, sizeof(size));
+        const int64_t mtime = e.last_write_time(ec).time_since_epoch().count();
+        fileHash = FnvUpdate(fileHash, &mtime, sizeof(mtime));
+        probe ^= fileHash;
+    }
+
+    const std::string memoKey = folder.string();
+    {
+        std::lock_guard lk(g_folderHashMutex);
+        auto it = g_folderHashMemo.find(memoKey);
+        if (it != g_folderHashMemo.end() && it->second.probe == probe) {
+            return it->second.hash;
+        }
+    }
+
+    std::vector<std::filesystem::path> files;
+    for (auto& e : std::filesystem::directory_iterator(folder, ec)) {
+        if (e.is_regular_file(ec) && IsShaderSourceFile(e.path())) files.push_back(e.path());
+    }
+    std::sort(files.begin(), files.end());
+    uint64_t h = kFnvOffset;
+    for (auto& f : files) {
+        auto name = f.filename().string();
+        h = FnvUpdate(h, name.data(), name.size());
+        std::ifstream ifs(f, std::ios::binary);
+        if (!ifs) continue;
+        std::string body((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        h = FnvUpdate(h, body.data(), body.size());
+    }
+    {
+        std::lock_guard lk(g_folderHashMutex);
+        g_folderHashMemo[memoKey] = { probe, h };
+    }
+    return h;
+}
+
+}  // namespace
+
 std::string ComputeKey(const CompileInputs& inputs) {
     uint64_t h = kFnvOffset;
     h = FnvUpdate(h, inputs.assembledSource.data(), inputs.assembledSource.size());
@@ -702,6 +970,8 @@ std::string ComputeKey(const CompileInputs& inputs) {
     h = FnvUpdate(h, &inputs.flags,                 sizeof(inputs.flags));
     const uint64_t inc = HashCommonIncludeDir();
     h = FnvUpdate(h, &inc, sizeof(inc));
+    const uint64_t folder = HashShaderFolder(inputs.shaderFolder);
+    h = FnvUpdate(h, &folder, sizeof(folder));
     return std::format("{:016x}", h);
 }
 
@@ -815,13 +1085,27 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
                                              UINT* pBytes) {
     if (!ppData || !pBytes || !pFileName) return E_FAIL;
     const std::string key = pFileName;
+    const std::filesystem::path includePath = g_commonShaderHeaderPath / pFileName;
 
-    // Hot path: serve a copy from the in-memory cache.
+    // Freshness stat: the memo is only served while size+mtime still match
+    // the file on disk, so an include edited mid-session (deploys land while
+    // the game runs) is re-read instead of feeding D3DCompile stale bytes.
+    std::error_code ec;
+    const uint64_t diskSize = static_cast<uint64_t>(
+        std::filesystem::file_size(includePath, ec));
+    const int64_t diskMtime = ec
+        ? 0
+        : std::filesystem::last_write_time(includePath, ec)
+              .time_since_epoch().count();
+
+    // Hot path: serve a copy from the in-memory cache when still current.
     {
         std::lock_guard lk(g_includeMemoMutex);
         auto it = g_includeContentCache.find(key);
-        if (it != g_includeContentCache.end()) {
-            const auto& src = it->second;
+        if (it != g_includeContentCache.end() &&
+            it->second.size == diskSize &&
+            it->second.mtime == diskMtime) {
+            const auto& src = it->second.bytes;
             char* out = new char[src.size()];
             std::memcpy(out, src.data(), src.size());
             *ppData = out;
@@ -830,8 +1114,7 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
         }
     }
 
-    // Cold path: read from disk and populate the cache.
-    const std::filesystem::path includePath = g_commonShaderHeaderPath / pFileName;
+    // Cold path: read from disk and (re)populate the cache.
     std::ifstream file(includePath, std::ios::binary);
     if (!file.good()) {
         REX::WARN("ShaderIncludeHandler: Failed to open include file: {}", includePath.string());
@@ -852,8 +1135,10 @@ HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
 
     {
         std::lock_guard lk(g_includeMemoMutex);
-        // Insert if still absent (another thread may have populated meanwhile).
-        g_includeContentCache.try_emplace(key, std::move(body));
+        auto& entry = g_includeContentCache[key];
+        entry.bytes = std::move(body);
+        entry.size  = diskSize;
+        entry.mtime = diskMtime;
     }
     return S_OK;
 }
@@ -866,6 +1151,10 @@ HRESULT __stdcall ShaderIncludeHandler::Close(LPCVOID pData) {
 // --- IncludeDirWatcher implementation -----------------------------------
 
 std::unique_ptr<IncludeDirWatcher> g_includeDirWatcher;
+
+// Starts at 0; every ShaderDefinition starts at 0 too, so no reload is
+// pending until the UI button bumps this.
+std::atomic<std::uint64_t> g_manualShaderReloadGeneration{ 0 };
 
 namespace {
 

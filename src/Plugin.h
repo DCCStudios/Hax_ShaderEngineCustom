@@ -60,7 +60,7 @@ struct alignas(16) GFXBoosterAccessData
     float random;    // 28
     float  inCombat;     // 29
     float  inInterior;   // 30
-    float _padding;   // 31
+    float waterPhaseBlock; // persistent wave phase, high part in 4096-second blocks
 
     // Forward view-projection rows (needed for SSR world ??clip reprojection)
     DirectX::XMFLOAT4 g_ViewProjRow0; // 32
@@ -87,9 +87,9 @@ struct alignas(16) GFXBoosterAccessData
     int32_t  currentWeatherClass;
 
     int32_t  outgoingWeatherClass;
-    float    enbPadding0;
-    float    enbPadding1;
-    float    enbPadding2;
+    float    waterHeight;       // absolute Z of the player cell's water plane, -1e9 = none
+    float    cameraUnderwater;  // 1 when the camera is below that plane
+    float    waterPhaseRemainder; // persistent wave phase, low part in seconds
 
     DirectX::XMFLOAT4 cameraLocalRow0;
     DirectX::XMFLOAT4 cameraLocalRow1;
@@ -113,7 +113,7 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_FogDistances0;  // x=near, y=far, z=waterNear, w=waterFar
     DirectX::XMFLOAT4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
     DirectX::XMFLOAT4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
-    DirectX::XMFLOAT4 g_FogColor;       // x,y,z=blended fog RGB (0 until per-weather blend lands), w=reserved
+    DirectX::XMFLOAT4 g_WaterState0;    // x=source amplitude, y=wavelength, z=chop, w=preset
 
     // Dominant stylized world light. Exterior color is Sky::GetSunLightColor
     // (skyColor[4], Sky+0x0D8); interior color resolves cell/template
@@ -127,7 +127,7 @@ struct alignas(16) GFXBoosterAccessData
     float g_SunDirY;
     float g_SunDirZ;
     float g_SunValid;
-    float g_SunPadding;
+    float g_WaterTransition; // 2 + source-to-live-bank blend; <2 means legacy fallback
 
     // L1 spherical-harmonics ambient, computed from RE::Sky's 6-axis
     // directional ambient cube (Sky+0x3B8, NiColor[3][2]). The engine's own
@@ -160,7 +160,36 @@ struct alignas(16) GFXBoosterAccessData
     // xy is the logical projection/render extent. zw is the display extent.
     // They differ under native dynamic resolution and external upscalers.
     DirectX::XMFLOAT4 g_RenderInfo;
+
+    // World-space copy of RE::Sky's directional ambient cube. Keep this at
+    // the end of the structured-buffer ABI so older compiled shaders retain
+    // the offsets of every pre-existing field. Voxel and screen-space ray
+    // passes operate in world space and can evaluate these coefficients
+    // directly, without the camera-dependent basis used by the legacy g_SH
+    // fields above.
+    DirectX::XMFLOAT4 g_WorldSH_R;
+    DirectX::XMFLOAT4 g_WorldSH_G;
+    DirectX::XMFLOAT4 g_WorldSH_B;
+
+    // Viewmodel DOF runtime state. Appended at the end to preserve every
+    // pre-existing structured-buffer offset. .x = weapon-animation DOF blend
+    // (1 = full DOF, 0 = suppressed while a discrete first-person animation
+    // plays), smoothed on the CPU and consumed by visualViewmodelDOF.hlsl.
+    // yzw reserved for future viewmodel-DOF runtime signals.
+    DirectX::XMFLOAT4 g_ViewmodelDOF;
+
+    // Water planes (appended; ABI append-only). .x = the height of the water
+    // IN VIEW: the highest loaded cell water plane at/below the camera from a
+    // grid scan (sentinel -1e9 when none). Consumed ONLY by the underwater-bed
+    // mask pass, so the tonemap-time composites stop shading the bed through
+    // water seen from a cell with no/wrong water record (cliff-over-lake).
+    // g_WaterHeight itself keeps its ORIGINAL player-cell semantics - the
+    // water surface shaders' shore feather math is calibrated to it and broke
+    // when its meaning changed. yzw reserved.
+    DirectX::XMFLOAT4 g_WaterPlanes;
 };
+static_assert(sizeof(GFXBoosterAccessData) == 880,
+    "GFXBoosterAccessData is a fixed CPU/HLSL structured-buffer ABI");
 
 struct alignas(16) DrawTagData
 {
@@ -192,6 +221,9 @@ struct ShaderValue {
     std::string id = ""; // Unique ID for this value
     std::string label = ""; // Label to show in UI
     std::string group = ""; // Optional group name to organize values in the UI
+    std::string tooltip = ""; // Optional hover help loaded from Values.ini
+    std::string disabledWhen = ""; // Optional bool value ID that disables this UI row when true
+    std::vector<std::string> options; // Optional labels that render an int value as a dropdown
     enum class Type { Float, Int, Bool } type = Type::Float; // Type of the value for UI and storage
     // Value Tracking
     struct Data {
@@ -218,9 +250,14 @@ class GlobalShaderSettings {
     std::vector<ShaderValue*> floatShaderValues;
     std::vector<ShaderValue*> intShaderValues;
 public:
-    // Add a new shader value to the appropriate vector based on its type
-    void AddShaderValue(ShaderValue* value) {
-        if (!value) return;
+    // Add a new shader value to the appropriate vector based on its type.
+    // Returns whether the value was inserted anywhere; on false (a value
+    // with this identity is already registered - the normal case when
+    // Values.ini is RE-parsed by the full reload path) the caller still
+    // owns the pointer and must delete it. Existing entries keep their
+    // live (user-tuned) current values.
+    bool AddShaderValue(ShaderValue* value) {
+        if (!value) return false;
         // Check if we have this id already
         auto dedupCheck = [&](const std::vector<ShaderValue*>& vec) {
             return std::any_of(vec.begin(), vec.end(), [&](ShaderValue* s) {
@@ -231,31 +268,38 @@ public:
                     s->global == value->global;
         });
         };
+        bool added = false;
         if (value->global) {
             if (!dedupCheck(globalShaderValues)) {
                 globalShaderValues.push_back(value);
+                added = true;
             }
         } else {
             if (!dedupCheck(localShaderValues)) {
                 localShaderValues.push_back(value);
+                added = true;
             }
         }
         if (value->type == ShaderValue::Type::Bool) {
             if (!dedupCheck(boolShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(boolShaderValues.size());
                 boolShaderValues.push_back(value);
+                added = true;
             }
         } else if (value->type == ShaderValue::Type::Float) {
             if (!dedupCheck(floatShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(floatShaderValues.size());
                 floatShaderValues.push_back(value);
+                added = true;
             }
         } else if (value->type == ShaderValue::Type::Int) {
             if (!dedupCheck(intShaderValues)) {
                 value->bufferIndex = static_cast<uint32_t>(intShaderValues.size());
                 intShaderValues.push_back(value);
+                added = true;
             }
         }
+        return added;
     }
     // Save the current shader settings values to a file (e.g. JSON or INI)
     bool SaveSettings(std::string* errorMessage = nullptr) {
@@ -462,6 +506,8 @@ enum class ReplacementSRVSourceKind : uint8_t {
     GBufferAlbedo,
     GBufferMaterial,
     MotionVectors,
+    WaterReflectionCubemap,
+    WaterReflectionCubemapMeta,
     CustomResource
 };
 
@@ -514,6 +560,7 @@ struct ShaderDefinition {
         , usesGFXModularBools(other.usesGFXModularBools)
         , compileMutex(std::move(other.compileMutex))
         , hlslFileWatcher(std::move(other.hlslFileWatcher))
+        , appliedReloadGeneration(other.appliedReloadGeneration)
         , log(other.log)
         , dump(other.dump)
         , lightCullRadiusScaleValue(std::move(other.lightCullRadiusScaleValue))
@@ -582,6 +629,12 @@ struct ShaderDefinition {
     std::unique_ptr<std::mutex> compileMutex = std::make_unique<std::mutex>();
     // File watcher for this shader definition Shader.ini
     std::unique_ptr<HlslFileWatcher> hlslFileWatcher;
+    // Last value of g_manualShaderReloadGeneration this definition has acted
+    // on. Only ever read/written by the render thread inside
+    // MaybeApplyHlslHotReload_Internal, so it needs no synchronization of its
+    // own. A definition created after a manual reload starts at 0 and takes
+    // one no-op drop on its next bind (it has nothing compiled yet).
+    std::uint64_t appliedReloadGeneration = 0;
     // Logging and dumping options
     bool log = false;
     bool dump = false;
@@ -890,6 +943,11 @@ struct ShaderDB {
         auto it = entries.find(shader);
         return (it != entries.end()) ? it->second.GetMatchedDefinition() : nullptr;
     }
+    std::string GetShaderUID(REX::W32::ID3D11VertexShader* shader) {
+        std::shared_lock lock(mutex);
+        auto it = entries.find(shader);
+        return (it != entries.end()) ? it->second.shaderUID : std::string{};
+    }
     REX::W32::ID3D11PixelShader* GetReplacementShader(REX::W32::ID3D11PixelShader* shader) {
         std::shared_lock lock(mutex);
         auto it = entries.find(shader);
@@ -1021,6 +1079,8 @@ void ShutdownShaderDumping_Internal();
 void UILockShaderList_Internal();
 void UIUnlockShaderList_Internal();
 std::uint64_t GetD3DDrawCallsLastFrame_Internal();
+REX::W32::ID3D11VertexShader* GetCurrentOriginalVertexShader_Internal();
+REX::W32::ID3D11VertexShader* GetCurrentSelectedVertexShader_Internal();
 void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS);
 bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source);
 bool IsPrecombineShadowGeometry_Internal(RE::BSGeometry* geometry);

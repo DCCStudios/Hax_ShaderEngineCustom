@@ -2,12 +2,18 @@
 #include <CustomPass.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
+#include "ContactShadowBridge.h"
+#include "RenderDocBridge.h"
+#include "WaterTessellation.h"
 #include <LocalLightBridge.h>
+#include <SunCascadeBridge.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <ShadowTelemetry.h>
 #include <ShadowUpgrade.h>
+#include <ShaderResources.h>
 #include <LightSorter.h>
+#include "ViewmodelDOFAnim.h"
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -90,6 +96,11 @@ float DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE = 1600.0f;
 bool CUSTOMBUFFER_ON = true;
 // Experimental directional shadow-map static-depth cache benchmark
 bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
+// Captures the sun's per-cascade shadow transforms so world-space passes can
+// sample the shadow map array. Installs a passthrough hook on
+// BSShadowDirectionalLight::AccumulateFromLists; off by default because it
+// adds a hook to the engine's shadow submission path.
+bool SUN_CASCADE_CAPTURE_ON = false;
 bool COMMAND_BUFFER_REPLAY_DEDUPE_SRV = false;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
@@ -140,7 +151,10 @@ GlobalShaderSettings g_shaderSettings = {};
 std::filesystem::path g_commonShaderHeaderPath;
 // Global INI watcher map for hot-reloading shader definitions when their files change
 std::unordered_map<std::filesystem::path, std::unique_ptr<ShaderIniFileWatcher>> g_iniWatchers;
-static std::atomic<bool> g_reloadQueued{false};
+// External linkage (declared extern in Global.h): the settings overlay's
+// Reload button queues the same full-reload task the DEVELOPMENT watcher
+// uses, and needs this flag for its double-queue guard.
+std::atomic<bool> g_reloadQueued{false};
 
 // Helper to check if a file exists
 bool FileExists(const std::filesystem::path& filepath) {
@@ -224,6 +238,14 @@ bool ParseReplacementSRVBinding(const std::string& token, ReplacementSRVBinding&
     }
     if (lowerSource == "motionvectors") {
         out.kind = ReplacementSRVSourceKind::MotionVectors;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemap") {
+        out.kind = ReplacementSRVSourceKind::WaterReflectionCubemap;
+        return true;
+    }
+    if (lowerSource == "waterreflectioncubemapmeta") {
+        out.kind = ReplacementSRVSourceKind::WaterReflectionCubemapMeta;
         return true;
     }
     if (lowerSource.rfind("customresource:", 0) == 0) {
@@ -320,6 +342,7 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
         bool foundShadowUpgrade = false;
         bool foundDirectionalShadowFirstCascadeDistance = false;
         bool foundShadowCache = false;
+        bool foundSunCascadeCapture = false;
         bool foundCommandBufferReplayDedupeSrv = false;
         for (auto& line : lines) {
             auto [key, value] = GetKeyValueFromLine(line);
@@ -354,6 +377,9 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
+            } else if (lowerKey == "sun_cascade_capture_on") {
+                line = std::string("SUN_CASCADE_CAPTURE_ON=") + (SUN_CASCADE_CAPTURE_ON ? "true" : "false");
+                foundSunCascadeCapture = true;
             } else if (lowerKey == "command_buffer_replay_dedupe_srv") {
                 line = std::string("COMMAND_BUFFER_REPLAY_DEDUPE_SRV=") + (COMMAND_BUFFER_REPLAY_DEDUPE_SRV ? "true" : "false");
                 foundCommandBufferReplayDedupeSrv = true;
@@ -414,6 +440,15 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             lines.emplace_back("; --- SHADOW STATIC CACHE ---");
             lines.emplace_back("; Directional sun split static-depth cache A/B toggle.");
             lines.emplace_back(std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false"));
+        }
+        if (!foundSunCascadeCapture) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back("");
+            }
+            lines.emplace_back("; --- SUN CASCADE CAPTURE ---");
+            lines.emplace_back("; Publishes the sun's per-cascade shadow transforms for world-space");
+            lines.emplace_back("; occlusion passes. Required by Skylighting's sun shadow term.");
+            lines.emplace_back(std::string("SUN_CASCADE_CAPTURE_ON=") + (SUN_CASCADE_CAPTURE_ON ? "true" : "false"));
         }
         if (!foundCommandBufferReplayDedupeSrv) {
             if (!lines.empty() && !lines.back().empty()) {
@@ -1027,7 +1062,8 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     // Skip empty lines and comments
                     if (valueLine.empty() || valueLine[0] == ';') continue;
                     // Remove inline comments and trim
-                    std::string valueClean = RemoveInlineComment(valueLine);
+                    std::string valueText = RemoveInlineComment(valueLine);
+                    std::string valueClean = valueText;
                     // Remove all whitespace for easier parsing
                     valueClean = RemoveAllWhitespace(valueClean);
                     if (valueClean.empty()) continue;
@@ -1054,6 +1090,36 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     }
                     else if (lowerKey == "group") {
                         shaderV.group = value;
+                    }
+                    else if (lowerKey == "tooltip") {
+                        const auto equals = valueText.find('=');
+                        if (equals != std::string::npos) {
+                            const auto first = valueText.find_first_not_of(" \t\r\n\"", equals + 1);
+                            const auto last = valueText.find_last_not_of(" \t\r\n\"");
+                            if (first != std::string::npos && last >= first) {
+                                shaderV.tooltip = valueText.substr(first, last - first + 1);
+                            }
+                        }
+                    }
+                    else if (lowerKey == "disabledwhen") {
+                        shaderV.disabledWhen = value;
+                    }
+                    else if (lowerKey == "options") {
+                        shaderV.options.clear();
+                        size_t optionStart = 0;
+                        while (optionStart <= value.size()) {
+                            const size_t optionEnd = value.find('|', optionStart);
+                            const std::string option = value.substr(
+                                optionStart,
+                                optionEnd == std::string::npos
+                                    ? std::string::npos
+                                    : optionEnd - optionStart);
+                            if (!option.empty()) {
+                                shaderV.options.push_back(option);
+                            }
+                            if (optionEnd == std::string::npos) break;
+                            optionStart = optionEnd + 1;
+                        }
                     }
                     else if (lowerKey == "type") {
                         std::string type = ToLower(value);
@@ -1123,7 +1189,12 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     }
                 }
                 ShaderValue finalShaderV = shaderV; // Make a copy for ownership handoff
-                g_shaderSettings.AddShaderValue(new ShaderValue(std::move(finalShaderV)));
+                auto* ownedValue = new ShaderValue(std::move(finalShaderV));
+                if (!g_shaderSettings.AddShaderValue(ownedValue)) {
+                    // Duplicate id (full-reload re-parse): the registry keeps
+                    // the live value - its user-tuned current value survives.
+                    delete ownedValue;
+                }
             }
         }
         REX::INFO("LoadShaderDefinitionsFromFile: Loaded values for shader '{}' from {}/Values.ini", cachedShaderID, folderName);
@@ -1208,6 +1279,12 @@ void LoadConfig(HMODULE hModule) {
                     value,
                     DIRECTIONAL_SHADOW_FIRST_CASCADE_DISTANCE);
             }
+            continue;
+        }
+        else if (lowerKey == "sun_cascade_capture_on") {
+            const std::string v = ToLower(value);
+            SUN_CASCADE_CAPTURE_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: SUN_CASCADE_CAPTURE_ON set to {}", SUN_CASCADE_CAPTURE_ON);
             continue;
         }
         else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
@@ -1518,6 +1595,9 @@ void ReloadAllShaderDefinitions_Internal() {
     // there's no chance of a worker-thread CompileShader_Internal touching
     // a deleted ShaderDefinition*.
     if (g_precompileWorker) g_precompileWorker->Stop();
+    // Values.ini packing and the private tessellation source can both change
+    // during a full reload. Defer COM teardown to the next render-thread draw.
+    WaterTessellation::RequestReload();
     // Drop the include-dir hash and include-file content memo so the next
     // ComputeKey / D3DCompile picks up any include edits the user made
     // alongside their Shader.ini change.
@@ -1623,6 +1703,8 @@ void F4SEMessageHandler(F4SE::MessagingInterface::Message *a_message) {
             } else {
                 REX::WARN("Failed to install GFX hooks on kMessage_GameDataReady.");
             }
+            // Viewmodel-DOF weapon-animation hooks (event sink + SetupSpecialIdle).
+            ViewmodelDOFAnim::Install();
             break;
         case F4SE::MessagingInterface::kPostLoadGame:
             REX::INFO("Received kMessage_PostLoadGame. A save game has been loaded.");
@@ -1666,6 +1748,11 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     g_pluginPath = std::filesystem::path{ "Data\\F4SE\\Plugins" };
     // Load config
     LoadConfig(hModule);
+    // In-process RenderDoc capture. MUST run before the D3D11 device is
+    // created: RenderDoc hooks the API at device creation, so loading its
+    // DLL any later captures nothing. No-op unless renderdoc.dll sits next
+    // to this plugin's DLL (file presence is the on/off switch).
+    RenderDocBridge::Initialize();
     // Sort the shader definitions by priority (highest first)
     // So we match the definitions with then highest priority
     g_shaderDefinitions.SortByPriority();
@@ -1709,6 +1796,14 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 #endif
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
     ShadowTelemetry::Initialize();
+#elif SHADERENGINE_ENABLE_SHADOW_CACHE
+    // Shadow telemetry is compiled out, but the shadow-cache half of
+    // ShadowTelemetry is still built and owns the AccumulateFromLists hook
+    // that sun cascade capture needs. Initialize it here when that capture is
+    // requested; Initialize() itself no-ops when nothing wants a hook.
+    if (SUN_CASCADE_CAPTURE_ON) {
+        ShadowTelemetry::Initialize();
+    }
 #endif
     // LightSorter stable-partitions the point-light array by stencil flag
     // inside ShadowUpgrade's validated DeferredLightsImpl wrapper.
@@ -1776,11 +1871,14 @@ extern "C"
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
         LocalLightBridge::Shutdown();
+        SunCascadeBridge::Shutdown();
+        ContactShadowBridge::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
         // during teardown bails out of the slow path cheaply.
         LightCullPolicy::Shutdown();
         // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
         GpuScalar::Shutdown();
+        ShaderResources::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }

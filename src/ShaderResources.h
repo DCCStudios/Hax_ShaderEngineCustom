@@ -41,11 +41,41 @@ namespace ShaderResources
         bool pixelStage);
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal();
+    REX::W32::ID3D11ShaderResourceView* GetWaterReflectionCubemapSRVForCustomPass(
+        REX::W32::ID3D11DeviceContext* context);
+    REX::W32::ID3D11ShaderResourceView* GetWaterReflectionCubemapMetaSRVForCustomPass(
+        REX::W32::ID3D11DeviceContext* context);
+
+    // Lazy-load a file-backed texture SRV (WIC: dds/png/jpg/bmp) into
+    // `binding`. Returns true when binding.srv is usable. Fails once and
+    // remembers (binding.loadFailed) — callers may invoke per frame.
+    bool EnsureFileTextureSRV(REX::W32::ID3D11Device* device, ReplacementTextureBinding& binding);
     UINT FindDepthTargetIndexForDSV(REX::W32::ID3D11DepthStencilView* dsv);
     void TrackOMRenderTargets(
         UINT numViews,
         REX::W32::ID3D11RenderTargetView* const* renderTargetViews,
         REX::W32::ID3D11DepthStencilView* depthStencilView);
+    void PrepareWaterReflectionCubeOM(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT numViews,
+        REX::W32::ID3D11RenderTargetView* const* renderTargetViews);
+    // The engine may render a reflection face into a temporary 2D target and
+    // copy or resolve it into the published TextureCube. These boundaries are
+    // tracked separately from OM binds so a complete generation is recognized
+    // regardless of which legal D3D11 update path the runtime selects.
+    void PrepareWaterReflectionCubeWrite(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* destination);
+    void CompleteWaterReflectionCubeSubresourceWrite(
+        REX::W32::ID3D11Resource* destination,
+        UINT destinationSubresource,
+        const char* source);
+    void CompleteWaterReflectionCubeResourceWrite(
+        REX::W32::ID3D11Resource* destination,
+        const char* source);
+    bool WaterReflectionCubeCaptureActive() noexcept;
+    void EndWaterReflectionCubeFrame() noexcept;
+    void Shutdown();
 
     UINT GetCurrentDepthTargetIndex() noexcept;
     bool HasCurrentRenderTarget() noexcept;

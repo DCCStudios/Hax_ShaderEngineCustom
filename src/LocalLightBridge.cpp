@@ -1,4 +1,5 @@
 #include <Global.h>
+#include <LightSorter.h>
 #include <LocalLightBridge.h>
 
 namespace LocalLightBridge
@@ -13,6 +14,9 @@ namespace
     constexpr std::size_t kExpectedTiledLightCount = MAX_LIGHTS;
     constexpr float kViewSpaceKind = 0.0f;
     constexpr float kAbsoluteWorldKind = 1.0f;
+    // attenuation.w is unused by Bethesda's three-component attenuation
+    // equation. Reuse it as bridge metadata for Voxel GI visibility.
+    constexpr float kVoxelShadowEligible = 1.0f;
 
     struct alignas(16) GpuLocalLight
     {
@@ -23,24 +27,45 @@ namespace
 
     static_assert(sizeof(GpuLocalLight) == 48);
 
-    struct RasterLight
+    // The radius written to the GPU record can be expanded by directLightMul
+    // so Bethesda's tiled and volume-light paths cover the same pixels. The
+    // engine shadow array retains the native BSLight radius. Keep both values
+    // on the CPU without changing the 48-byte shader ABI.
+    struct ObservedLight
     {
         GpuLocalLight light{};
+        float nativeRadius = 0.0f;
+    };
+
+    struct RasterLight
+    {
+        ObservedLight observation{};
         std::uint64_t lastSeenFrame = 0;
     };
 
     struct PublicationCandidate
     {
-        GpuLocalLight light{};
+        ObservedLight observation{};
+    };
+
+    struct CorrelationStats
+    {
+        std::size_t eligibleCandidates = 0;
+        std::size_t positionMatches = 0;
+        std::size_t radiusMatches = 0;
+        std::size_t uniqueMatches = 0;
+        std::size_t ambiguousMatches = 0;
     };
 
     std::mutex g_mutex;
     std::unordered_map<std::uintptr_t, RasterLight> g_rasterLights;
-    std::vector<GpuLocalLight> g_tiledLights;
+    std::vector<ObservedLight> g_tiledLights;
     std::vector<RasterLight> g_tiledFallbackLights;
     std::uint64_t g_frame = 0;
+    std::uint64_t g_lastStatsFrame = 0;
     bool g_uploadDirty = true;
     bool g_overflowLogged = false;
+    bool g_statsLogged = false;
 
     REX::W32::ID3D11Buffer* g_lightBuffer = nullptr;
     REX::W32::ID3D11ShaderResourceView* g_lightSRV = nullptr;
@@ -97,42 +122,52 @@ namespace
                Finite(absolutePosition.z);
     }
 
-    bool MatchesAbsoluteLight(
-        const GpuLocalLight& candidate,
+    float MatchRadius(const ObservedLight& observed) noexcept
+    {
+        if (Finite(observed.nativeRadius) && observed.nativeRadius > 1.0e-3f) {
+            return observed.nativeRadius;
+        }
+        return observed.light.positionAndRadius.w;
+    }
+
+    bool PositionMatches(
+        const ObservedLight& candidate,
         const DirectX::XMFLOAT3& candidateAbsolutePosition,
-        const GpuLocalLight& retained) noexcept
+        const ObservedLight& retained) noexcept
     {
         const float radiusScale = (std::max)(
             1.0f,
             (std::max)(
-                candidate.positionAndRadius.w,
-                retained.positionAndRadius.w));
-        const float positionTolerance = (std::max)(0.5f, radiusScale * 0.001f);
+                MatchRadius(candidate),
+                MatchRadius(retained)));
+        const float positionTolerance = (std::max)(1.0f, radiusScale * 0.0025f);
         const float deltaX =
-            candidateAbsolutePosition.x - retained.positionAndRadius.x;
+            candidateAbsolutePosition.x - retained.light.positionAndRadius.x;
         const float deltaY =
-            candidateAbsolutePosition.y - retained.positionAndRadius.y;
+            candidateAbsolutePosition.y - retained.light.positionAndRadius.y;
         const float deltaZ =
-            candidateAbsolutePosition.z - retained.positionAndRadius.z;
-        if (deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ >
-            positionTolerance * positionTolerance) {
-            return false;
-        }
-        if (!NearlyEqual(
-                candidate.positionAndRadius.w,
-                retained.positionAndRadius.w,
-                0.5f,
-                0.002f)) {
-            return false;
-        }
+            candidateAbsolutePosition.z - retained.light.positionAndRadius.z;
+        return deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ <=
+            positionTolerance * positionTolerance;
+    }
 
-        // Position, radius, attenuation, and chroma identify a tiled light.
-        // Bethesda can fade its intensity between submissions, so comparing
-        // absolute RGB here would retain multiple copies of the same light.
+    bool RadiusMatches(
+        const ObservedLight& candidate,
+        const ObservedLight& retained) noexcept
+    {
+        return NearlyEqual(
+            MatchRadius(candidate),
+            MatchRadius(retained),
+            1.0f,
+            0.005f);
+    }
+
+    float AppearanceDifference(
+        const GpuLocalLight& candidate,
+        const GpuLocalLight& retained) noexcept
+    {
         const auto& candidateColor = candidate.colorAndKind;
         const auto& retainedColor = retained.colorAndKind;
-        const auto& candidateAttenuation = candidate.attenuation;
-        const auto& retainedAttenuation = retained.attenuation;
         const float candidatePeak = (std::max)(
             candidateColor.x,
             (std::max)(candidateColor.y, candidateColor.z));
@@ -140,48 +175,145 @@ namespace
             retainedColor.x,
             (std::max)(retainedColor.y, retainedColor.z));
         if (candidatePeak <= 1.0e-6f || retainedPeak <= 1.0e-6f) {
-            return false;
+            return (std::numeric_limits<float>::max)();
         }
+
         const float candidateInversePeak = 1.0f / candidatePeak;
         const float retainedInversePeak = 1.0f / retainedPeak;
+        const float colorDeltaX =
+            candidateColor.x * candidateInversePeak -
+            retainedColor.x * retainedInversePeak;
+        const float colorDeltaY =
+            candidateColor.y * candidateInversePeak -
+            retainedColor.y * retainedInversePeak;
+        const float colorDeltaZ =
+            candidateColor.z * candidateInversePeak -
+            retainedColor.z * retainedInversePeak;
+
+        const auto& candidateAttenuation = candidate.attenuation;
+        const auto& retainedAttenuation = retained.attenuation;
+        const auto normalizedDelta = [](float left, float right) noexcept {
+            const float scale = (std::max)(
+                0.01f,
+                (std::max)(std::abs(left), std::abs(right)));
+            return (left - right) / scale;
+        };
+        const float attenuationDeltaX = normalizedDelta(
+            candidateAttenuation.x, retainedAttenuation.x);
+        const float attenuationDeltaY = normalizedDelta(
+            candidateAttenuation.y, retainedAttenuation.y);
+        const float attenuationDeltaZ = normalizedDelta(
+            candidateAttenuation.z, retainedAttenuation.z);
         return
-            NearlyEqual(
-                candidateColor.x * candidateInversePeak,
-                retainedColor.x * retainedInversePeak,
-                0.01f,
-                0.02f) &&
-            NearlyEqual(
-                candidateColor.y * candidateInversePeak,
-                retainedColor.y * retainedInversePeak,
-                0.01f,
-                0.02f) &&
-            NearlyEqual(
-                candidateColor.z * candidateInversePeak,
-                retainedColor.z * retainedInversePeak,
-                0.01f,
-                0.02f) &&
-            NearlyEqual(
-                candidateAttenuation.x, retainedAttenuation.x, 0.001f, 0.01f) &&
-            NearlyEqual(
-                candidateAttenuation.y, retainedAttenuation.y, 0.001f, 0.01f) &&
-            NearlyEqual(
-                candidateAttenuation.z, retainedAttenuation.z, 0.001f, 0.01f);
+            colorDeltaX * colorDeltaX +
+            colorDeltaY * colorDeltaY +
+            colorDeltaZ * colorDeltaZ +
+            0.25f * (
+                attenuationDeltaX * attenuationDeltaX +
+                attenuationDeltaY * attenuationDeltaY +
+                attenuationDeltaZ * attenuationDeltaZ);
+    }
+
+    bool MatchesAbsoluteLight(
+        const ObservedLight& candidate,
+        const DirectX::XMFLOAT3& candidateAbsolutePosition,
+        const ObservedLight& retained) noexcept
+    {
+        if (!PositionMatches(candidate, candidateAbsolutePosition, retained) ||
+            !RadiusMatches(candidate, retained)) {
+            return false;
+        }
+
+        // Position, radius, attenuation, and chroma identify a tiled light.
+        // Bethesda can fade its intensity between submissions, so comparing
+        // absolute RGB here would retain multiple copies of the same light.
+        return AppearanceDifference(candidate.light, retained.light) <= 0.02f;
+    }
+
+    bool CorrelateEngineShadow(
+        const ObservedLight& candidate,
+        const DirectX::XMFLOAT3& candidateAbsolutePosition,
+        const std::vector<ObservedLight>& engineShadowLights,
+        CorrelationStats& stats) noexcept
+    {
+        ++stats.eligibleCandidates;
+
+        std::array<std::size_t, MAX_LIGHTS> positionMatches{};
+        std::size_t positionMatchCount = 0;
+        for (std::size_t index = 0; index < engineShadowLights.size(); ++index) {
+            if (PositionMatches(
+                    candidate,
+                    candidateAbsolutePosition,
+                    engineShadowLights[index])) {
+                positionMatches[positionMatchCount++] = index;
+            }
+        }
+        if (positionMatchCount == 0) {
+            return false;
+        }
+        ++stats.positionMatches;
+
+        std::array<std::size_t, MAX_LIGHTS> radiusMatches{};
+        std::size_t radiusMatchCount = 0;
+        for (std::size_t match = 0; match < positionMatchCount; ++match) {
+            const std::size_t index = positionMatches[match];
+            if (RadiusMatches(candidate, engineShadowLights[index])) {
+                radiusMatches[radiusMatchCount++] = index;
+            }
+        }
+        if (radiusMatchCount == 0) {
+            return false;
+        }
+        ++stats.radiusMatches;
+        if (radiusMatchCount == 1) {
+            ++stats.uniqueMatches;
+            return true;
+        }
+
+        float bestDifference = (std::numeric_limits<float>::max)();
+        float secondDifference = (std::numeric_limits<float>::max)();
+        for (std::size_t match = 0; match < radiusMatchCount; ++match) {
+            const float difference = AppearanceDifference(
+                candidate.light,
+                engineShadowLights[radiusMatches[match]].light);
+            if (difference < bestDifference) {
+                secondDifference = bestDifference;
+                bestDifference = difference;
+            } else if (difference < secondDifference) {
+                secondDifference = difference;
+            }
+        }
+
+        const float requiredSeparation = (std::max)(
+            0.05f,
+            bestDifference * 0.2f);
+        if (Finite(bestDifference) &&
+            secondDifference - bestDifference > requiredSeparation) {
+            ++stats.uniqueMatches;
+            return true;
+        }
+
+        // Multiple engine lights can intentionally share a transform. Leave
+        // an ambiguous candidate eligible rather than suppressing a different
+        // unshadowed light and record the case for the diagnostics overlay/log.
+        ++stats.ambiguousMatches;
+        return false;
     }
 
     bool CanonicalizeTiledLight(
-        const GpuLocalLight& tiled,
-        GpuLocalLight& canonical) noexcept
+        const ObservedLight& tiled,
+        ObservedLight& canonical) noexcept
     {
         DirectX::XMFLOAT3 absolutePosition{};
-        if (!TiledAbsolutePosition(tiled, absolutePosition)) {
+        if (!TiledAbsolutePosition(tiled.light, absolutePosition)) {
             return false;
         }
 
         canonical = tiled;
-        canonical.positionAndRadius.x = absolutePosition.x;
-        canonical.positionAndRadius.y = absolutePosition.y;
-        canonical.positionAndRadius.z = absolutePosition.z;
-        canonical.colorAndKind.w = kAbsoluteWorldKind;
+        canonical.light.positionAndRadius.x = absolutePosition.x;
+        canonical.light.positionAndRadius.y = absolutePosition.y;
+        canonical.light.positionAndRadius.z = absolutePosition.z;
+        canonical.light.colorAndKind.w = kAbsoluteWorldKind;
         return true;
     }
 
@@ -213,6 +345,55 @@ namespace
         // Zero and unusually sharp profiles are valid; imposing a plugin-side
         // exponent range silently removes otherwise visible lights.
         return true;
+    }
+
+    bool SnapshotEngineLight(
+        const void* identity,
+        ObservedLight& observed) noexcept
+    {
+        if (!identity) return false;
+
+        const auto* lightBytes = static_cast<const std::byte*>(identity);
+        const void* geometry = nullptr;
+        std::memcpy(&geometry, lightBytes + 0xB8, sizeof(geometry));
+        if (!geometry) return false;
+
+        const auto* geometryBytes = static_cast<const std::byte*>(geometry);
+        RE::NiPoint3 worldPosition{};
+        RE::NiColor gammaColor{};
+        RE::NiPoint3 attenuation{};
+        float radius = 0.0f;
+        float intensity = 0.0f;
+        float colorScale = 0.0f;
+        std::memcpy(&worldPosition, geometryBytes + 0xA0, sizeof(worldPosition));
+        std::memcpy(&gammaColor, geometryBytes + 0x12C, sizeof(gammaColor));
+        std::memcpy(&radius, geometryBytes + 0x138, sizeof(radius));
+        std::memcpy(&colorScale, geometryBytes + 0x144, sizeof(colorScale));
+        std::memcpy(&attenuation, geometryBytes + 0x170, sizeof(attenuation));
+        std::memcpy(&intensity, lightBytes + 0x10, sizeof(intensity));
+
+        const float combinedScale = intensity * colorScale;
+        auto& light = observed.light;
+        light.positionAndRadius = {
+            worldPosition.x,
+            worldPosition.y,
+            worldPosition.z,
+            radius
+        };
+        light.colorAndKind = {
+            std::pow((std::max)(0.0f, gammaColor.r), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor.g), 2.2f) * combinedScale,
+            std::pow((std::max)(0.0f, gammaColor.b), 2.2f) * combinedScale,
+            kAbsoluteWorldKind
+        };
+        light.attenuation = {
+            attenuation.x,
+            attenuation.y,
+            attenuation.z,
+            0.0f
+        };
+        observed.nativeRadius = radius;
+        return IsValidLocalLight(light);
     }
 
     float PublicationScore(const GpuLocalLight& light) noexcept
@@ -270,12 +451,24 @@ namespace
         // subset whenever the camera crossed a frustum boundary. Distance to
         // the light's influence sphere is stable under camera rotation and is
         // the correct first-order relevance metric for a screen-space pass.
-        const auto leftDistance = DistanceFromCamera(left.light);
-        const auto rightDistance = DistanceFromCamera(right.light);
-        if (leftDistance.outsideInfluence !=
-            rightDistance.outsideInfluence) {
-            return leftDistance.outsideInfluence <
-                rightDistance.outsideInfluence;
+        const auto& leftLight = left.observation.light;
+        const auto& rightLight = right.observation.light;
+        const auto leftDistance = DistanceFromCamera(leftLight);
+        const auto rightDistance = DistanceFromCamera(rightLight);
+        const float leftRadius = (std::max)(1.0f, leftLight.positionAndRadius.w);
+        const float rightRadius = (std::max)(1.0f, rightLight.positionAndRadius.w);
+        const float leftNormalizedOutside =
+            leftDistance.outsideInfluence / leftRadius;
+        const float rightNormalizedOutside =
+            rightDistance.outsideInfluence / rightRadius;
+        const float leftFalloff = 1.0f + leftNormalizedOutside;
+        const float rightFalloff = 1.0f + rightNormalizedOutside;
+        const float leftRelevance =
+            PublicationScore(leftLight) / (leftFalloff * leftFalloff);
+        const float rightRelevance =
+            PublicationScore(rightLight) / (rightFalloff * rightFalloff);
+        if (leftRelevance != rightRelevance) {
+            return leftRelevance > rightRelevance;
         }
         if (leftDistance.center != rightDistance.center) {
             return leftDistance.center < rightDistance.center;
@@ -284,26 +477,26 @@ namespace
         // Intensity and reach are secondary only. They break ties between
         // spatially equivalent candidates without making camera-facing cull
         // order part of the publication contract.
-        const float leftScore = PublicationScore(left.light);
-        const float rightScore = PublicationScore(right.light);
+        const float leftScore = PublicationScore(leftLight);
+        const float rightScore = PublicationScore(rightLight);
         if (leftScore != rightScore) {
             return leftScore > rightScore;
         }
 
-        const auto& a = left.light.positionAndRadius;
-        const auto& b = right.light.positionAndRadius;
+        const auto& a = leftLight.positionAndRadius;
+        const auto& b = rightLight.positionAndRadius;
         if (a.x != b.x) return a.x < b.x;
         if (a.y != b.y) return a.y < b.y;
         if (a.z != b.z) return a.z < b.z;
         if (a.w != b.w) return a.w < b.w;
-        const auto& ac = left.light.colorAndKind;
-        const auto& bc = right.light.colorAndKind;
+        const auto& ac = leftLight.colorAndKind;
+        const auto& bc = rightLight.colorAndKind;
         if (ac.x != bc.x) return ac.x < bc.x;
         if (ac.y != bc.y) return ac.y < bc.y;
         if (ac.z != bc.z) return ac.z < bc.z;
         if (ac.w != bc.w) return ac.w < bc.w;
-        const auto& aa = left.light.attenuation;
-        const auto& ba = right.light.attenuation;
+        const auto& aa = leftLight.attenuation;
+        const auto& ba = rightLight.attenuation;
         if (aa.x != ba.x) return aa.x < ba.x;
         if (aa.y != ba.y) return aa.y < ba.y;
         return aa.z < ba.z;
@@ -364,8 +557,10 @@ void Initialize()
     g_tiledFallbackLights.clear();
     g_tiledFallbackLights.reserve(kExpectedTiledLightCount);
     g_frame = 0;
+    g_lastStatsFrame = 0;
     g_uploadDirty = true;
     g_overflowLogged = false;
+    g_statsLogged = false;
 }
 
 void Shutdown()
@@ -384,12 +579,14 @@ void Shutdown()
     }
     g_uploadDirty = true;
     g_overflowLogged = false;
+    g_statsLogged = false;
 }
 
 void OnRasterLight(
     const void* identity,
     const RE::NiPoint3* worldPosition,
-    float radius,
+    float adjustedRadius,
+    float nativeRadius,
     const RE::NiColor* linearColor,
     const RE::NiPoint3* attenuation)
 {
@@ -398,12 +595,13 @@ void OnRasterLight(
         return;
     }
 
-    GpuLocalLight light{};
+    ObservedLight observed{};
+    auto& light = observed.light;
     light.positionAndRadius = {
         worldPosition->x,
         worldPosition->y,
         worldPosition->z,
-        radius
+        adjustedRadius
     };
     light.colorAndKind = {
         linearColor->r,
@@ -415,15 +613,19 @@ void OnRasterLight(
         attenuation->x,
         attenuation->y,
         attenuation->z,
-        0.0f
+        LightSorter::IsShadowMappedLight(identity) ? 0.0f :
+            kVoxelShadowEligible
     };
     if (!IsValidLocalLight(light)) {
         return;
     }
+    observed.nativeRadius =
+        Finite(nativeRadius) && nativeRadius > 1.0e-3f ?
+            nativeRadius : adjustedRadius;
 
     std::lock_guard lock(g_mutex);
     g_rasterLights[reinterpret_cast<std::uintptr_t>(identity)] = {
-        light,
+        observed,
         g_frame
     };
     g_uploadDirty = true;
@@ -431,7 +633,8 @@ void OnRasterLight(
 
 void OnTiledLight(
     const RE::NiPoint3* viewPosition,
-    float radius,
+    float adjustedRadius,
+    float nativeRadius,
     const RE::NiColor* color,
     const RE::NiPoint3* attenuation)
 {
@@ -439,12 +642,13 @@ void OnTiledLight(
         return;
     }
 
-    GpuLocalLight light{};
+    ObservedLight observed{};
+    auto& light = observed.light;
     light.positionAndRadius = {
         viewPosition->x,
         viewPosition->y,
         viewPosition->z,
-        radius
+        adjustedRadius
     };
     light.colorAndKind = {
         color->r,
@@ -456,24 +660,32 @@ void OnTiledLight(
         attenuation->x,
         attenuation->y,
         attenuation->z,
-        0.0f
+        kVoxelShadowEligible
     };
     if (!IsValidLocalLight(light)) {
         return;
     }
+    observed.nativeRadius =
+        Finite(nativeRadius) && nativeRadius > 1.0e-3f ?
+            nativeRadius : adjustedRadius;
 
     std::lock_guard lock(g_mutex);
     const auto duplicate = std::find_if(
         g_tiledLights.begin(),
         g_tiledLights.end(),
-        [&light](const GpuLocalLight& candidate) {
-            return std::memcmp(&candidate, &light, sizeof(light)) == 0;
+        [&observed](const ObservedLight& candidate) {
+            return
+                std::memcmp(
+                    &candidate.light,
+                    &observed.light,
+                    sizeof(observed.light)) == 0 &&
+                candidate.nativeRadius == observed.nativeRadius;
         });
     // MAX_LIGHTS is the native GPU publication ceiling, not a collection
     // limit. Collect everything first so native submission order cannot
     // decide which records survive publication.
     if (duplicate == g_tiledLights.end()) {
-        g_tiledLights.push_back(light);
+        g_tiledLights.push_back(observed);
     }
     g_uploadDirty = true;
 }
@@ -506,19 +718,19 @@ void BindCustomPassResource(
             // raster command ever executes SetupPointLightGeometry. Convert
             // current tiled records to absolute world space and retain them,
             // so a later tiled cutoff cannot remove the only bridge copy.
-            std::vector<GpuLocalLight> transientTiled;
+            std::vector<ObservedLight> transientTiled;
             transientTiled.reserve(g_tiledLights.size());
             for (const auto& tiled : g_tiledLights) {
-                GpuLocalLight canonical{};
+                ObservedLight canonical{};
                 if (!CanonicalizeTiledLight(tiled, canonical)) {
                     transientTiled.push_back(tiled);
                     continue;
                 }
 
                 const DirectX::XMFLOAT3 absolutePosition{
-                    canonical.positionAndRadius.x,
-                    canonical.positionAndRadius.y,
-                    canonical.positionAndRadius.z
+                    canonical.light.positionAndRadius.x,
+                    canonical.light.positionAndRadius.y,
+                    canonical.light.positionAndRadius.z
                 };
                 const auto retained = std::find_if(
                     g_tiledFallbackLights.begin(),
@@ -527,10 +739,10 @@ void BindCustomPassResource(
                         return MatchesAbsoluteLight(
                             canonical,
                             absolutePosition,
-                            entry.light);
+                            entry.observation);
                     });
                 if (retained != g_tiledFallbackLights.end()) {
-                    retained->light = canonical;
+                    retained->observation = canonical;
                     retained->lastSeenFrame = g_frame;
                 } else {
                     g_tiledFallbackLights.push_back({ canonical, g_frame });
@@ -538,8 +750,9 @@ void BindCustomPassResource(
             }
 
             // Build the complete deduplicated CPU candidate set before the
-            // native 625-record publication ceiling. Publication is ordered
-            // by camera distance only for deterministic overflow handling;
+            // native 625-record publication ceiling. Publication favors
+            // strong lights whose influence intersects the camera region,
+            // then uses camera distance and stable attributes to break ties;
             // freshness remains an expiration concern, not a ranking input.
             std::vector<std::pair<std::uintptr_t, RasterLight>> raster;
             raster.reserve(g_rasterLights.size());
@@ -547,15 +760,21 @@ void BindCustomPassResource(
                 raster.push_back(entry);
             }
 
+            // Raster setup carries the authoritative engine shadow-array
+            // classification. A matching tiled observation must not promote
+            // an engine-shadowed raster light back into voxel eligibility.
+            // Tiled-only records remain eligible through their own metadata.
+
             std::vector<PublicationCandidate> candidates;
             candidates.reserve(
                 raster.size() + g_tiledFallbackLights.size() +
                 transientTiled.size());
             for (const auto& entry : raster) {
-                candidates.push_back({ entry.second.light });
+                candidates.push_back({ entry.second.observation });
             }
             for (const auto& entry : g_tiledFallbackLights) {
-                const auto& position = entry.light.positionAndRadius;
+                const auto& position =
+                    entry.observation.light.positionAndRadius;
                 const DirectX::XMFLOAT3 absolutePosition{
                     position.x,
                     position.y,
@@ -566,18 +785,57 @@ void BindCustomPassResource(
                     raster.end(),
                     [&](const auto& rasterEntry) {
                         return MatchesAbsoluteLight(
-                            entry.light,
+                            entry.observation,
                             absolutePosition,
-                            rasterEntry.second.light);
+                            rasterEntry.second.observation);
                     });
                 if (!duplicate) {
-                    candidates.push_back({ entry.light });
+                    candidates.push_back({ entry.observation });
                 }
             }
             // Matrix data is unavailable only during startup. Preserve those
             // current-frame records without attempting persistence.
             for (const auto& entry : transientTiled) {
                 candidates.push_back({ entry });
+            }
+
+            // Shadow-map lights can bypass SetupPointLightGeometry while a
+            // matching tiled observation still reaches the bridge. Snapshot
+            // the engine's authoritative shadow array and correlate by the
+            // same position/radius/color/attenuation identity used for tiled
+            // deduplication. This closes the last double-darkening path.
+            std::array<void*, MAX_LIGHTS> shadowPointers{};
+            const std::size_t shadowPointerCount =
+                LightSorter::CopyShadowLightPointers(
+                    shadowPointers.data(), shadowPointers.size());
+            std::vector<ObservedLight> engineShadowLights;
+            engineShadowLights.reserve(shadowPointerCount);
+            for (std::size_t index = 0; index < shadowPointerCount; ++index) {
+                ObservedLight shadowLight{};
+                if (SnapshotEngineLight(shadowPointers[index], shadowLight)) {
+                    engineShadowLights.push_back(shadowLight);
+                }
+            }
+            CorrelationStats correlationStats{};
+            for (auto& candidate : candidates) {
+                auto& candidateLight = candidate.observation.light;
+                if (candidateLight.attenuation.w < 0.5f ||
+                    candidateLight.colorAndKind.w <= 0.5f) {
+                    continue;
+                }
+                const auto& position = candidateLight.positionAndRadius;
+                const DirectX::XMFLOAT3 absolutePosition{
+                    position.x,
+                    position.y,
+                    position.z
+                };
+                if (CorrelateEngineShadow(
+                        candidate.observation,
+                        absolutePosition,
+                        engineShadowLights,
+                        correlationStats)) {
+                    candidateLight.attenuation.w = 0.0f;
+                }
             }
 
             std::sort(
@@ -597,7 +855,40 @@ void BindCustomPassResource(
                 candidates.size(),
                 upload.size());
             for (std::size_t index = 0; index < count; ++index) {
-                upload[index] = candidates[index].light;
+                upload[index] = candidates[index].observation.light;
+            }
+            if (count > 0 &&
+                (!g_statsLogged || g_frame - g_lastStatsFrame >= 600)) {
+                std::size_t eligibleCount = 0;
+                std::size_t engineShadowedCount = 0;
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (upload[index].attenuation.w >= 0.5f) {
+                        ++eligibleCount;
+                    } else {
+                        ++engineShadowedCount;
+                    }
+                }
+                REX::INFO(
+                    "LocalLightBridge: published {} light(s): {} voxel-eligible, "
+                    "{} protected engine-shadowed; engine shadow-array={}, "
+                    "snapshotted={}, correlated={}, raster cache={}, "
+                    "tiled fallback={}; correlation candidates={}, "
+                    "position={}, radius={}, unique={}, ambiguous={}",
+                    count,
+                    eligibleCount,
+                    engineShadowedCount,
+                    LightSorter::GetShadowLightCount(),
+                    engineShadowLights.size(),
+                    correlationStats.uniqueMatches,
+                    raster.size(),
+                    g_tiledFallbackLights.size(),
+                    correlationStats.eligibleCandidates,
+                    correlationStats.positionMatches,
+                    correlationStats.radiusMatches,
+                    correlationStats.uniqueMatches,
+                    correlationStats.ambiguousMatches);
+                g_lastStatsFrame = g_frame;
+                g_statsLogged = true;
             }
             g_uploadDirty = false;
             update = true;
