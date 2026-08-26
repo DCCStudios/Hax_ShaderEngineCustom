@@ -1179,9 +1179,19 @@ void UpdateCustomBuffer_Internal() {
             if (auto* tes = RE::TES::GetSingleton(); tes && tes->gridCells) {
                 auto* grid = tes->gridCells;
                 const std::uint32_t dim = grid->dimension;
+                // Locality bound: only the 5x5 cells around the grid centre
+                // (the player) may define the view plane. An unbounded scan
+                // adopted a distant cell's plane and classified every piece of
+                // dry ground below it as underwater - visible as dark GI
+                // blotches (mask debug painted them green on dry rock). The
+                // cliff-over-lake case that needed the scan has its lake in
+                // adjacent cells, well inside 5x5.
+                const std::uint32_t centre = dim / 2u;
+                const std::uint32_t loGX = centre >= 2u ? centre - 2u : 0u;
+                const std::uint32_t hiGX = (centre + 2u < dim) ? centre + 2u : dim - 1u;
                 float lowestAny = 1e9f;
-                for (std::uint32_t gy = 0; gy < dim; ++gy) {
-                    for (std::uint32_t gx = 0; gx < dim; ++gx) {
+                for (std::uint32_t gy = loGX; gy <= hiGX; ++gy) {
+                    for (std::uint32_t gx = loGX; gx <= hiGX; ++gx) {
                         RE::GridCell* gridCell = grid->Get(gx, gy);
                         RE::TESObjectCELL* cell =
                             gridCell ? gridCell->cell : nullptr;
